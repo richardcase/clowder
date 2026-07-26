@@ -1,0 +1,14 @@
+[package]
+name = "muxy-daemon"
+version = "0.0.0"
+edition = "2021"
+
+[[bin]]
+name = "muxy-daemon"
+path = "src/main.rs"
+
+[dependencies]
+muxy-proto = { path = "../muxy-proto" }
+tokio = { workspace = true }
+portable-pty = { workspace = true }
+anyhow = { workspace = true }
