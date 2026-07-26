@@ -1,0 +1,12 @@
+[package]
+name = "muxy-proto"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+serde = { workspace = true }
+postcard = { workspace = true }
+bytes = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+anyhow = { workspace = true }
