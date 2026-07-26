@@ -1,20 +1,16 @@
 [package]
-name = "muxy-daemon"
+name = "muxy-hook"
 version = "0.0.0"
 edition = "2021"
 
-[[bin]]
-name = "muxy-daemon"
-path = "src/main.rs"
-
 [dependencies]
 muxy-proto = { path = "../muxy-proto" }
-muxy-workspace = { path = "../muxy-workspace" }
 tokio = { workspace = true }
-portable-pty = { workspace = true }
 anyhow = { workspace = true }
-notify-rust = "4"
-serde_json = "1"
 
 [dev-dependencies]
 tempfile = "3"
+
+[[bin]]
+name = "muxy-hook"
+path = "src/main.rs"

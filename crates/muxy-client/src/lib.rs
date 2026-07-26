@@ -29,6 +29,7 @@ where
                     }
                     Some(DaemonToClient::PaneExited { .. }) | None => break,
                     Some(DaemonToClient::Attached { .. }) => {}
+                    Some(DaemonToClient::AttentionChanged { .. }) => {}
                 }
             }
         }

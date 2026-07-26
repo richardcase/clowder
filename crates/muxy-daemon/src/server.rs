@@ -1,30 +1,137 @@
+use crate::agent::AgentAdapter;
+use crate::notify::{Notifier, OsNotifier};
 use crate::{Pane, PaneCommand};
 use anyhow::Result;
+use muxy_proto::AttentionState;
 use muxy_proto::{ClientToDaemon, DaemonToClient, MsgStream, PaneId};
+use muxy_workspace::{GitWorktreeDriver, Workspace, WorkspaceDriver};
 use std::collections::HashMap;
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::UnixListener;
+use tokio::sync::broadcast;
 
 pub struct Daemon {
     panes: Arc<Mutex<HashMap<PaneId, Arc<Pane>>>>,
     next_id: AtomicU64,
+    attention: Arc<Mutex<HashMap<PaneId, AttentionState>>>,
+    attention_tx: broadcast::Sender<(PaneId, AttentionState)>,
+    workspaces: Arc<Mutex<HashMap<PaneId, Workspace>>>,
+    driver: Arc<dyn WorkspaceDriver>,
+    notifier: Arc<dyn Notifier>,
+    hook_sock: PathBuf,
 }
 
 impl Daemon {
     pub fn new() -> Daemon {
+        Daemon::new_with(
+            Arc::new(GitWorktreeDriver),
+            Arc::new(OsNotifier),
+            PathBuf::from("/tmp/muxy-hook.sock"),
+        )
+    }
+
+    pub fn new_with(
+        driver: Arc<dyn WorkspaceDriver>,
+        notifier: Arc<dyn Notifier>,
+        hook_sock: PathBuf,
+    ) -> Daemon {
+        let (attention_tx, _) = broadcast::channel(256);
         Daemon {
             panes: Arc::new(Mutex::new(HashMap::new())),
             next_id: AtomicU64::new(1),
+            attention: Arc::new(Mutex::new(HashMap::new())),
+            attention_tx,
+            workspaces: Arc::new(Mutex::new(HashMap::new())),
+            driver,
+            notifier,
+            hook_sock,
         }
     }
 
-    pub fn spawn_pane(&self, cmd: PaneCommand, cols: u16, rows: u16) -> Result<PaneId> {
-        let id = PaneId(self.next_id.fetch_add(1, Ordering::Relaxed));
-        let pane = Pane::spawn(id, cmd, cols, rows)?;
+    pub fn set_attention(&self, pane: PaneId, state: AttentionState) {
+        self.attention.lock().unwrap().insert(pane, state);
+        let _ = self.attention_tx.send((pane, state));
+        self.notifier.notify(pane, state);
+    }
+
+    pub fn attention_of(&self, pane: PaneId) -> Option<AttentionState> {
+        self.attention.lock().unwrap().get(&pane).copied()
+    }
+
+    pub fn subscribe_attention(&self) -> broadcast::Receiver<(PaneId, AttentionState)> {
+        self.attention_tx.subscribe()
+    }
+
+    /// Path the daemon injects into agents as MUXY_HOOK_SOCK.
+    pub fn hook_sock(&self) -> &std::path::Path {
+        &self.hook_sock
+    }
+
+    fn alloc_id(&self) -> PaneId {
+        PaneId(self.next_id.fetch_add(1, Ordering::Relaxed))
+    }
+
+    fn register_pane(&self, id: PaneId, pane: Pane) {
         self.panes.lock().unwrap().insert(id, Arc::new(pane));
+    }
+
+    pub fn spawn_pane(&self, cmd: PaneCommand, cols: u16, rows: u16) -> Result<PaneId> {
+        let id = self.alloc_id();
+        let pane = Pane::spawn(id, cmd, cols, rows)?;
+        self.register_pane(id, pane);
         Ok(id)
+    }
+
+    /// Provision an isolated worktree, inject the adapter's hooks, and spawn the agent in it.
+    pub fn spawn_agent(&self, project: &Path, adapter: &dyn AgentAdapter, task: &str) -> Result<PaneId> {
+        let id = self.alloc_id();
+        let ws = self.driver.provision(project, task)?;
+
+        // If any post-provision step fails (e.g. the agent binary isn't on PATH), tear down
+        // the freshly-provisioned worktree/branch instead of leaking it — otherwise a retry
+        // with the same task name fails at `git worktree add`.
+        let pane = match (|| -> Result<Pane> {
+            adapter.provision_hooks(&ws.path, id, &self.hook_sock)?;
+
+            let mut cmd = adapter.launch_command(&ws.path);
+            cmd.cwd = Some(ws.path.clone());
+            cmd.env.push(("MUXY_AGENT_ID".into(), id.0.to_string()));
+            cmd.env.push(("MUXY_HOOK_SOCK".into(), self.hook_sock.to_string_lossy().to_string()));
+
+            Pane::spawn(id, cmd, 80, 24)
+        })() {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = self.driver.teardown(&ws);
+                return Err(e);
+            }
+        };
+        self.register_pane(id, pane);
+        self.workspaces.lock().unwrap().insert(id, ws);
+        self.set_attention(id, AttentionState::Working);
+        Ok(id)
+    }
+
+    pub(crate) fn workspace_of(&self, pane: PaneId) -> Option<Workspace> {
+        self.workspaces.lock().unwrap().get(&pane).cloned()
+    }
+
+    /// Kill the agent's process and remove its worktree; drop all per-pane state.
+    pub fn teardown_agent(&self, pane: PaneId) -> Result<()> {
+        if let Some(p) = self.get(pane) {
+            let _ = p.kill();
+        }
+        if let Some(ws) = self.workspace_of(pane) {
+            self.driver.teardown(&ws)?;
+        }
+        self.workspaces.lock().unwrap().remove(&pane);
+        self.panes.lock().unwrap().remove(&pane);
+        self.attention.lock().unwrap().remove(&pane);
+        Ok(())
     }
 
     fn get(&self, id: PaneId) -> Option<Arc<Pane>> {
@@ -64,6 +171,8 @@ impl Daemon {
         let (snap, mut sub) = pane.snapshot_and_subscribe();
         msgs.send(&DaemonToClient::Output { pane: pane.id(), bytes: snap }).await?;
 
+        let mut att_rx = self.subscribe_attention();
+
         loop {
             tokio::select! {
                 live = sub.recv() => {
@@ -80,6 +189,25 @@ impl Daemon {
                         Some(ClientToDaemon::Detach) | None => break,
                         Some(ClientToDaemon::Attach { .. }) => continue,
                     }
+                }
+                att = att_rx.recv() => {
+                    match att {
+                        Ok((p, state)) if p == pane.id() => {
+                            msgs.send(&DaemonToClient::AttentionChanged { pane: p, state }).await?;
+                        }
+                        Ok(_) => continue,                        // another pane's attention
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(_) => {}                              // attention channel closed; ignore
+                    }
+                }
+                code = pane.wait_exit() => {
+                    // Drain output already buffered before ending the session, so an agent's
+                    // final lines aren't dropped when it exits right after printing.
+                    while let Ok(bytes) = sub.try_recv() {
+                        msgs.send(&DaemonToClient::Output { pane: pane.id(), bytes }).await?;
+                    }
+                    msgs.send(&DaemonToClient::PaneExited { pane: pane.id(), code }).await?;
+                    break;
                 }
             }
         }
@@ -202,5 +330,95 @@ mod tests {
                 String::from_utf8_lossy(&bytes)
             );
         }
+    }
+
+    #[tokio::test]
+    async fn attached_client_gets_attention_changed() {
+        use muxy_proto::AttentionState;
+        let daemon = Arc::new(Daemon::new());
+        let pane = daemon.spawn_pane(sh("sleep 5"), 80, 24).unwrap();
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let d = daemon.clone();
+        tokio::spawn(async move { d.handle_conn(server_io).await.unwrap() });
+
+        let mut client = MsgStream::<_>::new(client_io);
+        client.send(&ClientToDaemon::Attach { pane }).await.unwrap();
+        let _attached: DaemonToClient = client.recv().await.unwrap().unwrap();
+        let _backlog: DaemonToClient = client.recv().await.unwrap().unwrap();
+
+        // Flip attention; the attached client must receive AttentionChanged.
+        daemon.set_attention(pane, AttentionState::NeedsInput);
+
+        let mut got = None;
+        for _ in 0..50 {
+            if let Ok(Ok(Some(msg))) =
+                tokio::time::timeout(Duration::from_millis(50), client.recv::<DaemonToClient>()).await
+            {
+                if let DaemonToClient::AttentionChanged { state, .. } = msg {
+                    got = Some(state);
+                    break;
+                }
+            }
+        }
+        assert_eq!(got, Some(AttentionState::NeedsInput));
+    }
+
+    #[tokio::test]
+    async fn client_gets_pane_exited_when_child_exits() {
+        let daemon = Arc::new(Daemon::new());
+        let pane = daemon.spawn_pane(sh("exit 3"), 80, 24).unwrap();
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let d = daemon.clone();
+        tokio::spawn(async move { d.handle_conn(server_io).await.unwrap() });
+
+        let mut client = MsgStream::<_>::new(client_io);
+        client.send(&ClientToDaemon::Attach { pane }).await.unwrap();
+
+        // Expect a PaneExited to arrive (rather than the session hanging forever).
+        let mut exited = false;
+        for _ in 0..100 {
+            if let Ok(Ok(Some(msg))) =
+                tokio::time::timeout(Duration::from_millis(50), client.recv::<DaemonToClient>()).await
+            {
+                if let DaemonToClient::PaneExited { .. } = msg {
+                    exited = true;
+                    break;
+                }
+            } else {
+                break; // stream closed
+            }
+        }
+        assert!(exited, "client never received PaneExited on child exit");
+    }
+
+    #[tokio::test]
+    async fn client_gets_final_output_then_pane_exited() {
+        let daemon = Arc::new(Daemon::new());
+        let pane = daemon.spawn_pane(sh("printf BYE; sleep 0.3; exit 0"), 80, 24).unwrap();
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let d = daemon.clone();
+        tokio::spawn(async move { d.handle_conn(server_io).await.unwrap() });
+
+        let mut client = MsgStream::<_>::new(client_io);
+        client.send(&ClientToDaemon::Attach { pane }).await.unwrap();
+
+        let mut saw_bye = false;
+        let mut saw_exit = false;
+        for _ in 0..100 {
+            match tokio::time::timeout(Duration::from_millis(100), client.recv::<DaemonToClient>()).await {
+                Ok(Ok(Some(DaemonToClient::Output { bytes, .. }))) => {
+                    if bytes.windows(3).any(|w| w == b"BYE") { saw_bye = true; }
+                }
+                Ok(Ok(Some(DaemonToClient::PaneExited { .. }))) => { saw_exit = true; break; }
+                Ok(Ok(Some(_))) => {}   // Attached / AttentionChanged
+                Ok(Ok(None)) | Ok(Err(_)) => break, // stream closed / recv error
+                Err(_) => continue,     // this iteration's 100ms window elapsed; keep polling
+            }
+        }
+        assert!(saw_bye, "did not receive final output before exit");
+        assert!(saw_exit, "did not receive PaneExited");
     }
 }
