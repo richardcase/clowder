@@ -24,6 +24,7 @@ pub struct Daemon {
     next_id: AtomicU64,
     attention: Arc<Mutex<HashMap<PaneId, AttentionState>>>,
     attention_tx: broadcast::Sender<(PaneId, AttentionState)>,
+    removed_tx: broadcast::Sender<PaneId>,
     workspaces: Arc<Mutex<HashMap<PaneId, Workspace>>>,
     agents: Arc<Mutex<HashMap<PaneId, AgentMeta>>>,
     watchers: Arc<Mutex<HashMap<PaneId, tokio::task::JoinHandle<()>>>>,
@@ -47,11 +48,13 @@ impl Daemon {
         hook_sock: PathBuf,
     ) -> Daemon {
         let (attention_tx, _) = broadcast::channel(256);
+        let (removed_tx, _) = broadcast::channel(256);
         Daemon {
             panes: Arc::new(Mutex::new(HashMap::new())),
             next_id: AtomicU64::new(1),
             attention: Arc::new(Mutex::new(HashMap::new())),
             attention_tx,
+            removed_tx,
             workspaces: Arc::new(Mutex::new(HashMap::new())),
             agents: Arc::new(Mutex::new(HashMap::new())),
             watchers: Arc::new(Mutex::new(HashMap::new())),
@@ -73,6 +76,10 @@ impl Daemon {
 
     pub fn subscribe_attention(&self) -> broadcast::Receiver<(PaneId, AttentionState)> {
         self.attention_tx.subscribe()
+    }
+
+    pub fn subscribe_removed(&self) -> broadcast::Receiver<PaneId> {
+        self.removed_tx.subscribe()
     }
 
     /// Path the daemon injects into agents as MUXY_HOOK_SOCK.
@@ -162,6 +169,7 @@ impl Daemon {
         self.panes.lock().unwrap().remove(&pane);
         self.attention.lock().unwrap().remove(&pane);
         self.agents.lock().unwrap().remove(&pane);
+        let _ = self.removed_tx.send(pane);
         Ok(())
     }
 
@@ -271,6 +279,7 @@ impl Daemon {
     {
         // Snapshot the agent list, then stream every attention change.
         let mut att_rx = self.subscribe_attention();
+        let mut removed_rx = self.subscribe_removed();
         msgs.send(&DaemonToClient::AgentList { agents: self.list_agents() }).await?;
         loop {
             tokio::select! {
@@ -281,6 +290,13 @@ impl Daemon {
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => continue,
                         Err(_) => break, // attention channel closed
+                    }
+                }
+                removed = removed_rx.recv() => {
+                    match removed {
+                        Ok(pane) => { msgs.send(&DaemonToClient::AgentRemoved { pane }).await?; }
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(_) => break,
                     }
                 }
                 incoming = msgs.recv::<ClientToDaemon>() => {
@@ -712,5 +728,61 @@ mod tests {
 
         // The watcher was aborted, so no Exited entry was re-inserted after teardown.
         assert_eq!(daemon.attention_of(pane), None, "watcher left a spurious attention entry after teardown");
+    }
+
+    #[tokio::test]
+    async fn control_conn_gets_agent_removed_on_teardown() {
+        use crate::{FakeNotifier, SyntheticAdapter};
+        use muxy_workspace::GitWorktreeDriver;
+        use std::process::Command as PCommand;
+        use std::time::Duration;
+
+        let repo = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            assert!(PCommand::new("git").arg("-C").arg(repo.path()).args(args).status().unwrap().success());
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@t.test"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(repo.path().join("README.md"), b"hi").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-qm", "init"]);
+
+        let daemon = Arc::new(Daemon::new_with(
+            Arc::new(GitWorktreeDriver),
+            Arc::new(FakeNotifier::new()),
+            std::path::PathBuf::from("/tmp/unused-removed.sock"),
+        ));
+        let adapter = SyntheticAdapter {
+            command: crate::PaneCommand {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), "sleep 30".into()],
+                cwd: None,
+                env: vec![],
+            },
+        };
+        let pane = daemon.spawn_agent(repo.path(), &adapter, "task-a").unwrap();
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let d = daemon.clone();
+        tokio::spawn(async move { let _ = d.handle_conn(server_io).await; });
+
+        let mut client = MsgStream::<_>::new(client_io);
+        client.send(&ClientToDaemon::ListAgents).await.unwrap();
+        // Drain the initial AgentList.
+        let _ = client.recv::<DaemonToClient>().await.unwrap().unwrap();
+
+        daemon.teardown_agent(pane).unwrap();
+
+        let mut removed = None;
+        for _ in 0..40 {
+            if let Ok(Ok(Some(DaemonToClient::AgentRemoved { pane: p }))) =
+                tokio::time::timeout(Duration::from_millis(50), client.recv::<DaemonToClient>()).await
+            {
+                removed = Some(p);
+                break;
+            }
+        }
+        assert_eq!(removed, Some(pane));
     }
 }
