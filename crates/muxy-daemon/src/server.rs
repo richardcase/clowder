@@ -188,6 +188,7 @@ impl Daemon {
                         Some(ClientToDaemon::Resize { cols, rows, .. }) => { let _ = pane.resize(cols, rows); }
                         Some(ClientToDaemon::Detach) | None => break,
                         Some(ClientToDaemon::Attach { .. }) => continue,
+                        Some(ClientToDaemon::ListAgents) => continue,
                     }
                 }
                 att = att_rx.recv() => {

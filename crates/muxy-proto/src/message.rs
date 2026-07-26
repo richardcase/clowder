@@ -9,6 +9,7 @@ pub enum ClientToDaemon {
     Input { pane: PaneId, bytes: Vec<u8> },
     Resize { pane: PaneId, cols: u16, rows: u16 },
     Detach,
+    ListAgents,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -17,6 +18,7 @@ pub enum DaemonToClient {
     Output { pane: PaneId, bytes: Vec<u8> },
     PaneExited { pane: PaneId, code: Option<i32> },
     AttentionChanged { pane: PaneId, state: AttentionState },
+    AgentList { agents: Vec<AgentInfo> },
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,6 +39,14 @@ pub enum AttentionState {
     Working,
     NeedsInput,
     Completed,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AgentInfo {
+    pub pane: PaneId,
+    pub project: String,
+    pub task: String,
+    pub state: AttentionState,
 }
 
 #[cfg(test)]
@@ -69,6 +79,27 @@ mod tests {
     #[test]
     fn attention_changed_roundtrips() {
         let m = DaemonToClient::AttentionChanged { pane: PaneId(9), state: AttentionState::NeedsInput };
+        let bytes = postcard::to_stdvec(&m).unwrap();
+        assert_eq!(m, postcard::from_bytes::<DaemonToClient>(&bytes).unwrap());
+    }
+
+    #[test]
+    fn list_agents_roundtrips() {
+        let m = ClientToDaemon::ListAgents;
+        let bytes = postcard::to_stdvec(&m).unwrap();
+        assert_eq!(m, postcard::from_bytes::<ClientToDaemon>(&bytes).unwrap());
+    }
+
+    #[test]
+    fn agent_list_roundtrips() {
+        let m = DaemonToClient::AgentList {
+            agents: vec![AgentInfo {
+                pane: PaneId(2),
+                project: "muxy".into(),
+                task: "task-a".into(),
+                state: AttentionState::NeedsInput,
+            }],
+        };
         let bytes = postcard::to_stdvec(&m).unwrap();
         assert_eq!(m, postcard::from_bytes::<DaemonToClient>(&bytes).unwrap());
     }
