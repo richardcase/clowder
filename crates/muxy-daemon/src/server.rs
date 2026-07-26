@@ -108,6 +108,20 @@ impl Daemon {
         self.workspaces.lock().unwrap().get(&pane).cloned()
     }
 
+    /// Kill the agent's process and remove its worktree; drop all per-pane state.
+    pub fn teardown_agent(&self, pane: PaneId) -> Result<()> {
+        if let Some(p) = self.get(pane) {
+            let _ = p.kill();
+        }
+        if let Some(ws) = self.workspace_of(pane) {
+            self.driver.teardown(&ws)?;
+        }
+        self.workspaces.lock().unwrap().remove(&pane);
+        self.panes.lock().unwrap().remove(&pane);
+        self.attention.lock().unwrap().remove(&pane);
+        Ok(())
+    }
+
     fn get(&self, id: PaneId) -> Option<Arc<Pane>> {
         self.panes.lock().unwrap().get(&id).cloned()
     }
