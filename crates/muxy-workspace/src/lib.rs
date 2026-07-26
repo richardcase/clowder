@@ -6,6 +6,7 @@ use std::process::Command;
 pub struct Workspace {
     pub path: PathBuf,
     pub branch: String,
+    pub project: PathBuf,
 }
 
 pub trait WorkspaceDriver: Send + Sync {
@@ -43,18 +44,16 @@ impl WorkspaceDriver for GitWorktreeDriver {
         let path_str = path.to_string_lossy().to_string();
         // `git worktree add <path> -b <branch>` creates the dir + a new branch off HEAD.
         Self::git(project, &["worktree", "add", &path_str, "-b", &branch])?;
-        Ok(Workspace { path, branch })
+        Ok(Workspace { path, branch, project: project.to_path_buf() })
     }
 
     fn teardown(&self, ws: &Workspace) -> Result<()> {
-        // project root is two levels up from .muxy/worktrees/<name>? Use git from the worktree itself.
         let path_str = ws.path.to_string_lossy().to_string();
-        // `git -C <worktree> worktree remove <worktree> --force` works from inside the worktree.
-        Self::git(&ws.path, &["worktree", "remove", &path_str, "--force"])?;
+        Self::git(&ws.project, &["worktree", "remove", &path_str, "--force"])?;
         // prune stale registrations from the main repo (best-effort).
         let _ = Command::new("git")
             .arg("-C")
-            .arg(&ws.path)
+            .arg(&ws.project)
             .args(["worktree", "prune"])
             .output();
         Ok(())
