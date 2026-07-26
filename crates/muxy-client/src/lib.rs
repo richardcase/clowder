@@ -1,6 +1,77 @@
 use anyhow::Result;
-use muxy_proto::{ClientToDaemon, DaemonToClient, MsgStream, PaneId};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use muxy_proto::{ClientToDaemon, ControlEvent, ControlRequest, DaemonToClient, MsgStream, PaneId};
+use std::path::Path;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
+
+/// RAII guard that restores the terminal from raw mode when dropped, even on
+/// error paths or panics/unwinds — so a crash in `pump` never leaves the
+/// user's terminal wrecked.
+struct RawModeGuard;
+
+impl RawModeGuard {
+    fn enable() -> Result<Self> {
+        crossterm::terminal::enable_raw_mode()?;
+        Ok(RawModeGuard)
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+}
+
+/// Connect to the daemon's raw-mode socket and attach to `pane_id`, pumping
+/// stdin/stdout until the pane exits or the terminal is detached.
+pub async fn attach(pane_id: u64) -> Result<()> {
+    let sock = std::env::var("MUXY_SOCK").unwrap_or_else(|_| "/tmp/muxy.sock".into());
+    let pane = PaneId(pane_id);
+
+    let stream = UnixStream::connect(&sock).await?;
+
+    // Put the real terminal in raw mode so keystrokes reach the pane unbuffered.
+    let _guard = RawModeGuard::enable()?;
+    let stdin = tokio::io::stdin();
+    let stdout = tokio::io::stdout();
+    pump(stream, pane, stdin, stdout).await
+    // _guard drops here (on any exit path, including unwind), restoring raw mode;
+    // pump's Result is returned directly, unmasked.
+}
+
+/// Connect the JSON control socket, request a spawn, and return the new pane id.
+pub async fn spawn_via_control(
+    control_sock: &Path,
+    project: &str,
+    task: &str,
+    adapter: &str,
+) -> anyhow::Result<PaneId> {
+    let stream = UnixStream::connect(control_sock).await?;
+    let (rd, mut wr) = tokio::io::split(stream);
+    let mut lines = BufReader::new(rd).lines();
+
+    let req = ControlRequest::SpawnAgent {
+        project: project.to_string(),
+        task: task.to_string(),
+        adapter: adapter.to_string(),
+    };
+    let mut line = serde_json::to_string(&req)?;
+    line.push('\n');
+    wr.write_all(line.as_bytes()).await?;
+
+    // Skip the initial AgentList / any streamed events until the spawn result.
+    loop {
+        match lines.next_line().await? {
+            Some(l) => match serde_json::from_str::<ControlEvent>(&l) {
+                Ok(ControlEvent::AgentSpawned { pane }) => return Ok(pane),
+                Ok(ControlEvent::Error { message }) => return Err(anyhow::anyhow!(message)),
+                Ok(_) => continue, // AgentList / AttentionChanged / AgentRemoved
+                Err(_) => continue, // ignore unparseable lines defensively
+            },
+            None => return Err(anyhow::anyhow!("control socket closed before spawn result")),
+        }
+    }
+}
 
 pub async fn pump<S, R, W>(io: S, pane: PaneId, mut input: R, mut output: W) -> Result<()>
 where
@@ -109,5 +180,49 @@ mod tests {
         );
 
         let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn spawn_via_control_returns_pane_id() {
+        use muxy_daemon::server::Daemon;
+        use muxy_daemon::FakeNotifier;
+        use muxy_workspace::GitWorktreeDriver;
+        use std::process::Command as PCommand;
+        use std::sync::Arc;
+
+        // temp git repo
+        let repo = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            assert!(PCommand::new("git").arg("-C").arg(repo.path()).args(args).status().unwrap().success());
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@t.test"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(repo.path().join("README.md"), b"hi").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-qm", "init"]);
+
+        // daemon + control socket on a temp path
+        let sockdir = tempfile::tempdir().unwrap();
+        let sock = sockdir.path().join("control.sock");
+        let daemon = Arc::new(Daemon::new_with(
+            Arc::new(GitWorktreeDriver),
+            Arc::new(FakeNotifier::new()),
+            std::path::PathBuf::from("/tmp/unused-cli.sock"),
+        ));
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        let d = daemon.clone();
+        tokio::spawn(async move { let _ = d.serve_control_json(listener).await; });
+
+        let pane = spawn_via_control(&sock, &repo.path().to_string_lossy(), "demo", "shell")
+            .await
+            .unwrap();
+
+        let agents = daemon.list_agents();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].pane, pane);
+        assert_eq!(agents[0].task, "demo");
+
+        daemon.teardown_agent(pane).unwrap();
     }
 }
