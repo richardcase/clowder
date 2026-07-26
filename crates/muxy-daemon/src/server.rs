@@ -1,23 +1,72 @@
+use crate::notify::{Notifier, OsNotifier};
 use crate::{Pane, PaneCommand};
 use anyhow::Result;
+use muxy_proto::AttentionState;
 use muxy_proto::{ClientToDaemon, DaemonToClient, MsgStream, PaneId};
+use muxy_workspace::{GitWorktreeDriver, Workspace, WorkspaceDriver};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::UnixListener;
+use tokio::sync::broadcast;
 
 pub struct Daemon {
     panes: Arc<Mutex<HashMap<PaneId, Arc<Pane>>>>,
     next_id: AtomicU64,
+    attention: Arc<Mutex<HashMap<PaneId, AttentionState>>>,
+    attention_tx: broadcast::Sender<(PaneId, AttentionState)>,
+    workspaces: Arc<Mutex<HashMap<PaneId, Workspace>>>,
+    driver: Arc<dyn WorkspaceDriver>,
+    notifier: Arc<dyn Notifier>,
+    hook_sock: PathBuf,
 }
 
 impl Daemon {
     pub fn new() -> Daemon {
+        Daemon::new_with(
+            Arc::new(GitWorktreeDriver),
+            Arc::new(OsNotifier),
+            PathBuf::from("/tmp/muxy-hook.sock"),
+        )
+    }
+
+    pub fn new_with(
+        driver: Arc<dyn WorkspaceDriver>,
+        notifier: Arc<dyn Notifier>,
+        hook_sock: PathBuf,
+    ) -> Daemon {
+        let (attention_tx, _) = broadcast::channel(256);
         Daemon {
             panes: Arc::new(Mutex::new(HashMap::new())),
             next_id: AtomicU64::new(1),
+            attention: Arc::new(Mutex::new(HashMap::new())),
+            attention_tx,
+            workspaces: Arc::new(Mutex::new(HashMap::new())),
+            driver,
+            notifier,
+            hook_sock,
         }
+    }
+
+    pub fn set_attention(&self, pane: PaneId, state: AttentionState) {
+        self.attention.lock().unwrap().insert(pane, state);
+        let _ = self.attention_tx.send((pane, state));
+        self.notifier.notify(pane, state);
+    }
+
+    pub fn attention_of(&self, pane: PaneId) -> Option<AttentionState> {
+        self.attention.lock().unwrap().get(&pane).copied()
+    }
+
+    pub fn subscribe_attention(&self) -> broadcast::Receiver<(PaneId, AttentionState)> {
+        self.attention_tx.subscribe()
+    }
+
+    /// Path the daemon injects into agents as MUXY_HOOK_SOCK.
+    pub fn hook_sock(&self) -> &std::path::Path {
+        &self.hook_sock
     }
 
     pub fn spawn_pane(&self, cmd: PaneCommand, cols: u16, rows: u16) -> Result<PaneId> {
