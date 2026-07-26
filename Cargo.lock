@@ -651,6 +651,9 @@ dependencies = [
  "crossterm",
  "muxy-daemon",
  "muxy-proto",
+ "muxy-workspace",
+ "serde_json",
+ "tempfile",
  "tokio",
 ]
 
@@ -687,6 +690,7 @@ dependencies = [
  "futures-util",
  "postcard",
  "serde",
+ "serde_json",
  "tokio",
  "tokio-util",
 ]

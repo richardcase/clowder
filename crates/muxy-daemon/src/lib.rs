@@ -3,6 +3,7 @@ pub mod pane;
 pub mod server;
 pub mod notify;
 pub mod attention;
+pub mod control_json;
 pub use agent::{AgentAdapter, ClaudeAdapter, SyntheticAdapter};
 pub use pane::{Pane, PaneCommand};
 pub use server::Daemon;

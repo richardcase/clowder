@@ -1,43 +1,27 @@
-use anyhow::Result;
-use muxy_client::pump;
-use muxy_proto::PaneId;
-use tokio::net::UnixStream;
-
-/// RAII guard that restores the terminal from raw mode when dropped, even on
-/// error paths or panics/unwinds — so a crash in `pump` never leaves the
-/// user's terminal wrecked.
-struct RawModeGuard;
-
-impl RawModeGuard {
-    fn enable() -> Result<Self> {
-        crossterm::terminal::enable_raw_mode()?;
-        Ok(RawModeGuard)
-    }
-}
-
-impl Drop for RawModeGuard {
-    fn drop(&mut self) {
-        let _ = crossterm::terminal::disable_raw_mode();
-    }
-}
+use anyhow::{anyhow, Result};
+use muxy_client::{attach, spawn_via_control};
+use std::path::Path;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let sock = std::env::var("MUXY_SOCK").unwrap_or_else(|_| "/tmp/muxy.sock".into());
-    let pane = PaneId(
-        std::env::args()
-            .nth(1)
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1),
-    );
-
-    let stream = UnixStream::connect(&sock).await?;
-
-    // Put the real terminal in raw mode so keystrokes reach the pane unbuffered.
-    let _guard = RawModeGuard::enable()?;
-    let stdin = tokio::io::stdin();
-    let stdout = tokio::io::stdout();
-    pump(stream, pane, stdin, stdout).await
-    // _guard drops here (on any exit path, including unwind), restoring raw mode;
-    // pump's Result is returned directly, unmasked.
+    let args: Vec<String> = std::env::args().collect();
+    match args.get(1).map(|s| s.as_str()) {
+        Some("spawn") => {
+            let project = args.get(2).ok_or_else(|| anyhow!("usage: muxy spawn <project> <task> [adapter]"))?;
+            let task = args.get(3).ok_or_else(|| anyhow!("usage: muxy spawn <project> <task> [adapter]"))?;
+            let adapter = args.get(4).map(|s| s.as_str()).unwrap_or("claude");
+            let sock = std::env::var("MUXY_CONTROL_SOCK").unwrap_or_else(|_| "/tmp/muxy-control.sock".into());
+            let pane = spawn_via_control(Path::new(&sock), project, task, adapter).await?;
+            println!("{}", pane.0);
+            Ok(())
+        }
+        Some("attach") => {
+            let pane = args.get(2).and_then(|s| s.parse().ok())
+                .ok_or_else(|| anyhow!("usage: muxy attach <pane-id>"))?;
+            attach(pane).await
+        }
+        // Legacy: `muxy <pane-id>` still attaches.
+        Some(other) if other.parse::<u64>().is_ok() => attach(other.parse().unwrap()).await,
+        _ => Err(anyhow!("usage: muxy <spawn|attach> ...")),
+    }
 }
