@@ -14,12 +14,18 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::UnixListener;
 use tokio::sync::broadcast;
 
+struct AgentMeta {
+    project: String,
+    task: String,
+}
+
 pub struct Daemon {
     panes: Arc<Mutex<HashMap<PaneId, Arc<Pane>>>>,
     next_id: AtomicU64,
     attention: Arc<Mutex<HashMap<PaneId, AttentionState>>>,
     attention_tx: broadcast::Sender<(PaneId, AttentionState)>,
     workspaces: Arc<Mutex<HashMap<PaneId, Workspace>>>,
+    agents: Arc<Mutex<HashMap<PaneId, AgentMeta>>>,
     driver: Arc<dyn WorkspaceDriver>,
     notifier: Arc<dyn Notifier>,
     hook_sock: PathBuf,
@@ -46,6 +52,7 @@ impl Daemon {
             attention: Arc::new(Mutex::new(HashMap::new())),
             attention_tx,
             workspaces: Arc::new(Mutex::new(HashMap::new())),
+            agents: Arc::new(Mutex::new(HashMap::new())),
             driver,
             notifier,
             hook_sock,
@@ -112,6 +119,14 @@ impl Daemon {
         };
         self.register_pane(id, pane);
         self.workspaces.lock().unwrap().insert(id, ws);
+        let project_name = project
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| project.to_string_lossy().to_string());
+        self.agents.lock().unwrap().insert(
+            id,
+            AgentMeta { project: project_name, task: task.to_string() },
+        );
         self.set_attention(id, AttentionState::Working);
         Ok(id)
     }
@@ -131,7 +146,24 @@ impl Daemon {
         self.workspaces.lock().unwrap().remove(&pane);
         self.panes.lock().unwrap().remove(&pane);
         self.attention.lock().unwrap().remove(&pane);
+        self.agents.lock().unwrap().remove(&pane);
         Ok(())
+    }
+
+    pub fn list_agents(&self) -> Vec<muxy_proto::AgentInfo> {
+        let agents = self.agents.lock().unwrap();
+        let attention = self.attention.lock().unwrap();
+        let mut out: Vec<muxy_proto::AgentInfo> = agents
+            .iter()
+            .map(|(pane, meta)| muxy_proto::AgentInfo {
+                pane: *pane,
+                project: meta.project.clone(),
+                task: meta.task.clone(),
+                state: attention.get(pane).copied().unwrap_or(muxy_proto::AttentionState::Working),
+            })
+            .collect();
+        out.sort_by(|a, b| (a.project.as_str(), a.pane.0).cmp(&(b.project.as_str(), b.pane.0)));
+        out
     }
 
     fn get(&self, id: PaneId) -> Option<Arc<Pane>> {
@@ -421,5 +453,54 @@ mod tests {
         }
         assert!(saw_bye, "did not receive final output before exit");
         assert!(saw_exit, "did not receive PaneExited");
+    }
+
+    #[tokio::test]
+    async fn list_agents_reports_project_task_and_state() {
+        use crate::{FakeNotifier, SyntheticAdapter};
+        use muxy_proto::AttentionState;
+        use muxy_workspace::GitWorktreeDriver;
+        use std::process::Command as PCommand;
+        use std::sync::Arc as StdArc;
+
+        // temp git repo
+        let repo = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            assert!(PCommand::new("git").arg("-C").arg(repo.path()).args(args).status().unwrap().success());
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@t.test"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(repo.path().join("README.md"), b"hi").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-qm", "init"]);
+
+        let daemon = StdArc::new(Daemon::new_with(
+            StdArc::new(GitWorktreeDriver),
+            StdArc::new(FakeNotifier::new()),
+            std::path::PathBuf::from("/tmp/unused-listagents.sock"),
+        ));
+        let adapter = SyntheticAdapter {
+            command: crate::PaneCommand {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), "sleep 30".into()],
+                cwd: None,
+                env: vec![],
+            },
+        };
+        let pane = daemon.spawn_agent(repo.path(), &adapter, "task-a").unwrap();
+        daemon.set_attention(pane, AttentionState::NeedsInput);
+
+        let list = daemon.list_agents();
+        assert_eq!(list.len(), 1);
+        let a = &list[0];
+        assert_eq!(a.pane, pane);
+        assert_eq!(a.task, "task-a");
+        // project display name is the repo dir's basename
+        assert_eq!(a.project, repo.path().file_name().unwrap().to_string_lossy());
+        assert_eq!(a.state, AttentionState::NeedsInput);
+
+        daemon.teardown_agent(pane).unwrap();
+        assert!(daemon.list_agents().is_empty());
     }
 }
