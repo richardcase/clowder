@@ -1,3 +1,4 @@
+use crate::agent::AgentAdapter;
 use crate::notify::{Notifier, OsNotifier};
 use crate::{Pane, PaneCommand};
 use anyhow::Result;
@@ -5,6 +6,7 @@ use muxy_proto::AttentionState;
 use muxy_proto::{ClientToDaemon, DaemonToClient, MsgStream, PaneId};
 use muxy_workspace::{GitWorktreeDriver, Workspace, WorkspaceDriver};
 use std::collections::HashMap;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -69,11 +71,41 @@ impl Daemon {
         &self.hook_sock
     }
 
-    pub fn spawn_pane(&self, cmd: PaneCommand, cols: u16, rows: u16) -> Result<PaneId> {
-        let id = PaneId(self.next_id.fetch_add(1, Ordering::Relaxed));
-        let pane = Pane::spawn(id, cmd, cols, rows)?;
+    fn alloc_id(&self) -> PaneId {
+        PaneId(self.next_id.fetch_add(1, Ordering::Relaxed))
+    }
+
+    fn register_pane(&self, id: PaneId, pane: Pane) {
         self.panes.lock().unwrap().insert(id, Arc::new(pane));
+    }
+
+    pub fn spawn_pane(&self, cmd: PaneCommand, cols: u16, rows: u16) -> Result<PaneId> {
+        let id = self.alloc_id();
+        let pane = Pane::spawn(id, cmd, cols, rows)?;
+        self.register_pane(id, pane);
         Ok(id)
+    }
+
+    /// Provision an isolated worktree, inject the adapter's hooks, and spawn the agent in it.
+    pub fn spawn_agent(&self, project: &Path, adapter: &dyn AgentAdapter, task: &str) -> Result<PaneId> {
+        let id = self.alloc_id();
+        let ws = self.driver.provision(project, task)?;
+        adapter.provision_hooks(&ws.path, id, &self.hook_sock)?;
+
+        let mut cmd = adapter.launch_command(&ws.path);
+        cmd.cwd = Some(ws.path.clone());
+        cmd.env.push(("MUXY_AGENT_ID".into(), id.0.to_string()));
+        cmd.env.push(("MUXY_HOOK_SOCK".into(), self.hook_sock.to_string_lossy().to_string()));
+
+        let pane = Pane::spawn(id, cmd, 80, 24)?;
+        self.register_pane(id, pane);
+        self.workspaces.lock().unwrap().insert(id, ws);
+        self.set_attention(id, AttentionState::Working);
+        Ok(id)
+    }
+
+    pub(crate) fn workspace_of(&self, pane: PaneId) -> Option<Workspace> {
+        self.workspaces.lock().unwrap().get(&pane).cloned()
     }
 
     fn get(&self, id: PaneId) -> Option<Arc<Pane>> {

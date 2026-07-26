@@ -14,3 +14,7 @@ tokio = { workspace = true }
 portable-pty = { workspace = true }
 anyhow = { workspace = true }
 notify-rust = "4"
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
