@@ -3,6 +3,9 @@ import PackageDescription
 
 let package = Package(
     name: "MuxyCore",
+    platforms: [
+        .macOS(.v10_15),
+    ],
     products: [
         .library(name: "MuxyCore", targets: ["MuxyCore"]),
     ],
