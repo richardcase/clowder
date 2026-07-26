@@ -1,0 +1,10 @@
+[package]
+name = "muxy-workspace"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
