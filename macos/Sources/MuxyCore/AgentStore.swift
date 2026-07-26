@@ -1,0 +1,42 @@
+import Foundation
+import Combine
+
+/// The client-side agent model. Refresh-driven: events that can't fully hydrate a
+/// row (a pane-only `agentSpawned`, or any event for an unknown pane) set `needsRefresh`,
+/// which the session/UI answers with a `ControlRequest.listAgents`.
+public final class AgentStore: ObservableObject {
+    @Published public private(set) var agents: [UInt64: AgentInfo] = [:]
+    @Published public private(set) var needsRefresh: Bool = false
+
+    public init() {}
+
+    public func apply(_ event: ControlEvent) {
+        switch event {
+        case let .agentList(list):
+            agents = Dictionary(uniqueKeysWithValues: list.map { ($0.pane, $0) })
+            needsRefresh = false
+        case let .attentionChanged(pane, state):
+            if var a = agents[pane] {
+                a.state = state
+                agents[pane] = a
+            } else {
+                needsRefresh = true // unknown pane — re-list to learn about it
+            }
+        case .agentSpawned:
+            needsRefresh = true // pane-only — re-list to hydrate project/task/state
+        case let .agentRemoved(pane):
+            agents[pane] = nil // idempotent
+        case .error:
+            break
+        }
+    }
+
+    public func clearRefresh() { needsRefresh = false }
+
+    /// Agents grouped by project (projects sorted; agents within a project sorted by pane).
+    public var byProject: [(project: String, agents: [AgentInfo])] {
+        Dictionary(grouping: agents.values, by: { $0.project })
+            .map { (project: $0.key, agents: $0.value.sorted { $0.pane < $1.pane }) }
+            .sorted { $0.project < $1.project }
+    }
+}
