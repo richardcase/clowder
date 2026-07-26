@@ -136,4 +136,71 @@ mod tests {
         }
         assert!(seen.windows(2).any(|w| w == b"hi"), "did not receive echoed output");
     }
+
+    #[tokio::test]
+    async fn pane_survives_detach_and_replays_on_reattach() {
+        use std::time::Duration;
+
+        let daemon = Arc::new(Daemon::new());
+        // A shell that appends a line every 100ms to prove it keeps running while detached.
+        let pane = daemon
+            .spawn_pane(sh("i=0; while true; do i=$((i+1)); echo line$i; sleep 0.1; done"), 80, 24)
+            .unwrap();
+
+        // First client attaches, collects some output, then detaches.
+        {
+            let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+            let d = daemon.clone();
+            let h = tokio::spawn(async move { d.handle_conn(server_io).await.unwrap() });
+
+            let mut client = MsgStream::<_>::new(client_io);
+            client.send(&ClientToDaemon::Attach { pane }).await.unwrap();
+            let _attached: DaemonToClient = client.recv().await.unwrap().unwrap();
+            let _backlog: DaemonToClient = client.recv().await.unwrap().unwrap();
+
+            // Read a little live output.
+            let mut seen = Vec::new();
+            for _ in 0..30 {
+                if let Ok(Ok(Some(DaemonToClient::Output { bytes, .. }))) =
+                    tokio::time::timeout(Duration::from_millis(100), client.recv::<DaemonToClient>()).await
+                {
+                    seen.extend_from_slice(&bytes);
+                    if seen.windows(5).any(|w| w == b"line1") {
+                        break;
+                    }
+                }
+            }
+            assert!(seen.windows(5).any(|w| w == b"line1"), "first attach saw no output");
+
+            client.send(&ClientToDaemon::Detach).await.unwrap();
+            let _ = h.await; // session ends; pane must keep running
+        }
+
+        // Let the detached pane run a bit more.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        // Second client reattaches; the backlog replay must contain later lines
+        // that were produced WHILE no client was attached.
+        {
+            let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+            let d = daemon.clone();
+            tokio::spawn(async move { d.handle_conn(server_io).await.unwrap() });
+
+            let mut client = MsgStream::<_>::new(client_io);
+            client.send(&ClientToDaemon::Attach { pane }).await.unwrap();
+            let _attached: DaemonToClient = client.recv().await.unwrap().unwrap();
+            let backlog: DaemonToClient = client.recv().await.unwrap().unwrap();
+
+            let bytes = match backlog {
+                DaemonToClient::Output { bytes, .. } => bytes,
+                other => panic!("expected backlog Output, got {other:?}"),
+            };
+            // At least line4+ should exist, proving the pane produced output while detached.
+            assert!(
+                bytes.windows(5).any(|w| w == b"line4"),
+                "reattach backlog did not include output produced while detached: {:?}",
+                String::from_utf8_lossy(&bytes)
+            );
+        }
+    }
 }
