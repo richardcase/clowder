@@ -65,8 +65,8 @@ impl Pane {
                                 let drop = b.len() - BACKLOG_CAP;
                                 b.drain(0..drop);
                             }
+                            let _ = tx.send(chunk);
                         }
-                        let _ = tx.send(chunk);
                     }
                 }
             }
@@ -119,6 +119,19 @@ impl Pane {
 
     pub fn backlog(&self) -> Vec<u8> {
         self.backlog.lock().unwrap().clone()
+    }
+
+    /// Atomically snapshot the current backlog and subscribe to live output.
+    /// Because the reader thread holds the backlog lock across both the backlog
+    /// append and the broadcast send, taking that same lock here guarantees the
+    /// returned receiver sees exactly the chunks appended AFTER this snapshot —
+    /// none dropped, none duplicated.
+    pub fn snapshot_and_subscribe(&self) -> (Vec<u8>, broadcast::Receiver<Vec<u8>>) {
+        let b = self.backlog.lock().unwrap();
+        let rx = self.output_tx.subscribe();
+        let snap = b.clone();
+        drop(b);
+        (snap, rx)
     }
 
     pub async fn wait_exit(&self) -> Option<i32> {
@@ -185,5 +198,43 @@ mod tests {
             }
         }
         assert!(seen.windows(4).any(|w| w == b"ping"), "child did not echo input");
+    }
+
+    #[tokio::test]
+    async fn snapshot_and_subscribe_is_atomic_with_reader_thread() {
+        // `cat` echoes stdin back to stdout
+        let pane = Pane::spawn(PaneId(3), sh("cat"), 80, 24).unwrap();
+        pane.write_input(b"before\n").unwrap();
+
+        // Wait until "before" has landed in the backlog.
+        for _ in 0..50 {
+            if pane.backlog().windows(6).any(|w| w == b"before") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let (snap, mut sub) = pane.snapshot_and_subscribe();
+        assert!(
+            snap.windows(6).any(|w| w == b"before"),
+            "snapshot missing prior output: {:?}",
+            String::from_utf8_lossy(&snap)
+        );
+
+        pane.write_input(b"after\n").unwrap();
+        let mut seen = Vec::new();
+        for _ in 0..50 {
+            if let Ok(Ok(bytes)) =
+                tokio::time::timeout(Duration::from_millis(50), sub.recv()).await
+            {
+                seen.extend_from_slice(&bytes);
+                if seen.windows(5).any(|w| w == b"after") {
+                    break;
+                }
+            }
+        }
+        assert!(
+            seen.windows(5).any(|w| w == b"after"),
+            "subscriber did not receive post-snapshot output"
+        );
     }
 }

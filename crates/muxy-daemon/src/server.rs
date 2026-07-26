@@ -60,9 +60,10 @@ impl Daemon {
 
         let (cols, rows) = pane.size();
         msgs.send(&DaemonToClient::Attached { pane: pane.id(), cols, rows }).await?;
-        msgs.send(&DaemonToClient::Output { pane: pane.id(), bytes: pane.backlog() }).await?;
 
-        let mut sub = pane.subscribe();
+        let (snap, mut sub) = pane.snapshot_and_subscribe();
+        msgs.send(&DaemonToClient::Output { pane: pane.id(), bytes: snap }).await?;
+
         loop {
             tokio::select! {
                 live = sub.recv() => {
