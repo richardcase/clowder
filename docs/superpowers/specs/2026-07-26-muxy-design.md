@@ -71,6 +71,14 @@ detach/reattach); the client renders the tree and routes focus/input per pane.
 
 ### Two-parser terminal model (resolves the highest-risk decision)
 
+> **⚠️ SUPERSEDED for the client render path (see M0c design,
+> `2026-07-26-muxy-m0c-native-client-design.md`).** A libghostty API research pass found a
+> `ghostty_surface_t` **always owns its own PTY and spawns a command** — you cannot feed it
+> externally-supplied bytes, so the "client-side libghostty renders daemon bytes" idea below does
+> not work. Resolution: libghostty runs `muxy attach <pane>` (the pump) as its PTY command — the
+> tmux client/server pattern — so it renders natively while the daemon (the mux) owns the agent
+> PTYs and survival. The daemon-side grid notes below still stand (snapshots/attention/`muxy-vt`).
+
 libghostty exposes **no supported C ABI to read out its cell grid**, so running it
 headless in the daemon (mosh model) would require forking and maintaining libghostty —
 rejected. Instead:
