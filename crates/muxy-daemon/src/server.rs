@@ -24,8 +24,10 @@ pub struct Daemon {
     next_id: AtomicU64,
     attention: Arc<Mutex<HashMap<PaneId, AttentionState>>>,
     attention_tx: broadcast::Sender<(PaneId, AttentionState)>,
+    removed_tx: broadcast::Sender<PaneId>,
     workspaces: Arc<Mutex<HashMap<PaneId, Workspace>>>,
     agents: Arc<Mutex<HashMap<PaneId, AgentMeta>>>,
+    watchers: Arc<Mutex<HashMap<PaneId, tokio::task::JoinHandle<()>>>>,
     driver: Arc<dyn WorkspaceDriver>,
     notifier: Arc<dyn Notifier>,
     hook_sock: PathBuf,
@@ -46,13 +48,16 @@ impl Daemon {
         hook_sock: PathBuf,
     ) -> Daemon {
         let (attention_tx, _) = broadcast::channel(256);
+        let (removed_tx, _) = broadcast::channel(256);
         Daemon {
             panes: Arc::new(Mutex::new(HashMap::new())),
             next_id: AtomicU64::new(1),
             attention: Arc::new(Mutex::new(HashMap::new())),
             attention_tx,
+            removed_tx,
             workspaces: Arc::new(Mutex::new(HashMap::new())),
             agents: Arc::new(Mutex::new(HashMap::new())),
+            watchers: Arc::new(Mutex::new(HashMap::new())),
             driver,
             notifier,
             hook_sock,
@@ -71,6 +76,10 @@ impl Daemon {
 
     pub fn subscribe_attention(&self) -> broadcast::Receiver<(PaneId, AttentionState)> {
         self.attention_tx.subscribe()
+    }
+
+    pub fn subscribe_removed(&self) -> broadcast::Receiver<PaneId> {
+        self.removed_tx.subscribe()
     }
 
     /// Path the daemon injects into agents as MUXY_HOOK_SOCK.
@@ -94,7 +103,7 @@ impl Daemon {
     }
 
     /// Provision an isolated worktree, inject the adapter's hooks, and spawn the agent in it.
-    pub fn spawn_agent(&self, project: &Path, adapter: &dyn AgentAdapter, task: &str) -> Result<PaneId> {
+    pub fn spawn_agent(self: &Arc<Self>, project: &Path, adapter: &dyn AgentAdapter, task: &str) -> Result<PaneId> {
         let id = self.alloc_id();
         let ws = self.driver.provision(project, task)?;
 
@@ -128,6 +137,16 @@ impl Daemon {
             AgentMeta { project: project_name, task: task.to_string() },
         );
         self.set_attention(id, AttentionState::Working);
+
+        if let Some(pane_arc) = self.panes.lock().unwrap().get(&id).cloned() {
+            let me = Arc::clone(self);
+            let handle = tokio::spawn(async move {
+                pane_arc.wait_exit().await;
+                me.set_attention(id, AttentionState::Exited);
+            });
+            self.watchers.lock().unwrap().insert(id, handle);
+        }
+
         Ok(id)
     }
 
@@ -140,6 +159,9 @@ impl Daemon {
         if let Some(p) = self.get(pane) {
             let _ = p.kill();
         }
+        if let Some(handle) = self.watchers.lock().unwrap().remove(&pane) {
+            handle.abort();
+        }
         if let Some(ws) = self.workspace_of(pane) {
             self.driver.teardown(&ws)?;
         }
@@ -147,6 +169,7 @@ impl Daemon {
         self.panes.lock().unwrap().remove(&pane);
         self.attention.lock().unwrap().remove(&pane);
         self.agents.lock().unwrap().remove(&pane);
+        let _ = self.removed_tx.send(pane);
         Ok(())
     }
 
@@ -256,6 +279,7 @@ impl Daemon {
     {
         // Snapshot the agent list, then stream every attention change.
         let mut att_rx = self.subscribe_attention();
+        let mut removed_rx = self.subscribe_removed();
         msgs.send(&DaemonToClient::AgentList { agents: self.list_agents() }).await?;
         loop {
             tokio::select! {
@@ -266,6 +290,13 @@ impl Daemon {
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => continue,
                         Err(_) => break, // attention channel closed
+                    }
+                }
+                removed = removed_rx.recv() => {
+                    match removed {
+                        Ok(pane) => { msgs.send(&DaemonToClient::AgentRemoved { pane }).await?; }
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(_) => break,
                     }
                 }
                 incoming = msgs.recv::<ClientToDaemon>() => {
@@ -605,5 +636,153 @@ mod tests {
         assert_eq!(saw, Some(AttentionState::NeedsInput));
 
         daemon.teardown_agent(pane).unwrap();
+    }
+
+    #[tokio::test]
+    async fn agent_marked_exited_on_process_exit() {
+        use crate::{FakeNotifier, SyntheticAdapter};
+        use muxy_proto::AttentionState;
+        use muxy_workspace::GitWorktreeDriver;
+        use std::process::Command as PCommand;
+        use std::time::Duration;
+
+        let repo = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            assert!(PCommand::new("git").arg("-C").arg(repo.path()).args(args).status().unwrap().success());
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@t.test"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(repo.path().join("README.md"), b"hi").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-qm", "init"]);
+
+        let daemon = Arc::new(Daemon::new_with(
+            Arc::new(GitWorktreeDriver),
+            Arc::new(FakeNotifier::new()),
+            std::path::PathBuf::from("/tmp/unused-reaper.sock"),
+        ));
+        let adapter = SyntheticAdapter {
+            command: crate::PaneCommand {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), "exit 0".into()],
+                cwd: None,
+                env: vec![],
+            },
+        };
+        let pane = daemon.spawn_agent(repo.path(), &adapter, "task-x").unwrap();
+
+        // No client attached: the daemon-side watcher must still flip attention to Exited.
+        let mut exited = false;
+        for _ in 0..100 {
+            if daemon.attention_of(pane) == Some(AttentionState::Exited) { exited = true; break; }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(exited, "agent was not marked Exited after its process exited");
+        // It stays in the list (mark-exited-and-keep), still reported with Exited state.
+        let list = daemon.list_agents();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].state, AttentionState::Exited);
+
+        daemon.teardown_agent(pane).unwrap();
+    }
+
+    #[tokio::test]
+    async fn teardown_of_running_agent_does_not_leave_spurious_exited() {
+        use crate::{FakeNotifier, SyntheticAdapter};
+        use muxy_workspace::GitWorktreeDriver;
+        use std::process::Command as PCommand;
+        use std::time::Duration;
+
+        let repo = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            assert!(PCommand::new("git").arg("-C").arg(repo.path()).args(args).status().unwrap().success());
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@t.test"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(repo.path().join("README.md"), b"hi").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-qm", "init"]);
+
+        let daemon = Arc::new(Daemon::new_with(
+            Arc::new(GitWorktreeDriver),
+            Arc::new(FakeNotifier::new()),
+            std::path::PathBuf::from("/tmp/unused-teardown-race.sock"),
+        ));
+        let adapter = SyntheticAdapter {
+            command: crate::PaneCommand {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), "sleep 30".into()],
+                cwd: None,
+                env: vec![],
+            },
+        };
+        let pane = daemon.spawn_agent(repo.path(), &adapter, "task-r").unwrap();
+
+        // Tear down while still running (kills the child).
+        daemon.teardown_agent(pane).unwrap();
+
+        // Give the killed child time to die + any un-aborted watcher time to fire.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // The watcher was aborted, so no Exited entry was re-inserted after teardown.
+        assert_eq!(daemon.attention_of(pane), None, "watcher left a spurious attention entry after teardown");
+    }
+
+    #[tokio::test]
+    async fn control_conn_gets_agent_removed_on_teardown() {
+        use crate::{FakeNotifier, SyntheticAdapter};
+        use muxy_workspace::GitWorktreeDriver;
+        use std::process::Command as PCommand;
+        use std::time::Duration;
+
+        let repo = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            assert!(PCommand::new("git").arg("-C").arg(repo.path()).args(args).status().unwrap().success());
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@t.test"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(repo.path().join("README.md"), b"hi").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-qm", "init"]);
+
+        let daemon = Arc::new(Daemon::new_with(
+            Arc::new(GitWorktreeDriver),
+            Arc::new(FakeNotifier::new()),
+            std::path::PathBuf::from("/tmp/unused-removed.sock"),
+        ));
+        let adapter = SyntheticAdapter {
+            command: crate::PaneCommand {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), "sleep 30".into()],
+                cwd: None,
+                env: vec![],
+            },
+        };
+        let pane = daemon.spawn_agent(repo.path(), &adapter, "task-a").unwrap();
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let d = daemon.clone();
+        tokio::spawn(async move { let _ = d.handle_conn(server_io).await; });
+
+        let mut client = MsgStream::<_>::new(client_io);
+        client.send(&ClientToDaemon::ListAgents).await.unwrap();
+        // Drain the initial AgentList.
+        let _ = client.recv::<DaemonToClient>().await.unwrap().unwrap();
+
+        daemon.teardown_agent(pane).unwrap();
+
+        let mut removed = None;
+        for _ in 0..40 {
+            if let Ok(Ok(Some(DaemonToClient::AgentRemoved { pane: p }))) =
+                tokio::time::timeout(Duration::from_millis(50), client.recv::<DaemonToClient>()).await
+            {
+                removed = Some(p);
+                break;
+            }
+        }
+        assert_eq!(removed, Some(pane));
     }
 }

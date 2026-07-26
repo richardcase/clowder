@@ -19,6 +19,7 @@ pub enum DaemonToClient {
     PaneExited { pane: PaneId, code: Option<i32> },
     AttentionChanged { pane: PaneId, state: AttentionState },
     AgentList { agents: Vec<AgentInfo> },
+    AgentRemoved { pane: PaneId },
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,6 +40,7 @@ pub enum AttentionState {
     Working,
     NeedsInput,
     Completed,
+    Exited,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -100,6 +102,20 @@ mod tests {
                 state: AttentionState::NeedsInput,
             }],
         };
+        let bytes = postcard::to_stdvec(&m).unwrap();
+        assert_eq!(m, postcard::from_bytes::<DaemonToClient>(&bytes).unwrap());
+    }
+
+    #[test]
+    fn attention_exited_roundtrips() {
+        let m = DaemonToClient::AttentionChanged { pane: PaneId(1), state: AttentionState::Exited };
+        let bytes = postcard::to_stdvec(&m).unwrap();
+        assert_eq!(m, postcard::from_bytes::<DaemonToClient>(&bytes).unwrap());
+    }
+
+    #[test]
+    fn agent_removed_roundtrips() {
+        let m = DaemonToClient::AgentRemoved { pane: PaneId(5) };
         let bytes = postcard::to_stdvec(&m).unwrap();
         assert_eq!(m, postcard::from_bytes::<DaemonToClient>(&bytes).unwrap());
     }

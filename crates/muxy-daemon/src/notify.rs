@@ -13,6 +13,7 @@ impl Notifier for OsNotifier {
         let body = match state {
             AttentionState::NeedsInput => "needs your input",
             AttentionState::Completed => "finished",
+            AttentionState::Exited => "exited",
             AttentionState::Idle | AttentionState::Working => return, // not interrupt-worthy
         };
         let _ = notify_rust::Notification::new()
