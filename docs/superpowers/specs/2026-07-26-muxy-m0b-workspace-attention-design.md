@@ -111,9 +111,11 @@ existing client protocol. Both use the existing `MsgStream` framing.
     notification. `HookKind::Notification → NeedsInput`; `HookKind::Stop → Completed`.
   - Per-pane `AttentionState` stored on the daemon; a broadcast channel of `AttentionChanged`
     that `handle_conn` forwards to attached clients.
-  - **Pane-exit wiring (resolves the M0a child-exit deferral):** watch each agent pane's
-    `wait_exit()`; on exit, emit `PaneExited` and set attention `Completed` + notify. This closes
-    the M0a gap where an attached client hung forever when the child exited.
+  - **Pane-exit wiring (resolves the M0a child-exit deferral):** `handle_conn` watches the pane's
+    `wait_exit()` and emits `PaneExited` to the attached client, then ends the session — closing the
+    M0a gap where a client hung forever when the child exited. The semantic `Completed` state is
+    driven by the tool's **`Stop` hook** (hooks are the primary signal); raw process death only
+    produces `PaneExited`, not an attention change.
 
 - **`notify.rs`** — `trait Notifier { fn notify(&self, pane: PaneId, state: AttentionState); }`;
   `OsNotifier` (via `notify-rust`) and a `FakeNotifier` (records calls) so tests assert
@@ -142,8 +144,9 @@ never by cwd or session-id (a subagent or a `cd` would break those). `muxy-hook`
   `muxy-hook` call drives the daemon to flip attention to `NeedsInput`, broadcast
   `AttentionChanged` (observed via an attached client / the attention broadcast), and call
   `FakeNotifier` → `teardown_agent` removes the worktree.
-- **Pane-exit:** spawn a synthetic agent that exits; assert `PaneExited` is emitted and attention
-  becomes `Completed` (regression test for the M0a child-exit hang).
+- **Pane-exit:** attach a client to a pane whose child then exits; assert `PaneExited` is emitted
+  (regression test for the M0a child-exit hang). The `Stop`-hook → `Completed` path is covered by
+  the hook-receiver test.
 
 ## Explicitly deferred (later milestones)
 
