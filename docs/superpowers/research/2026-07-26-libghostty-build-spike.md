@@ -1,7 +1,39 @@
 # M0c-2 Spike — Building libghostty on macOS (findings so far)
 
-Status: **build/link de-risk in progress; blocked on full Xcode.** This records what the spike
-established so the work is reproducible when we resume.
+Status: **build/link de-risk COMPLETE** (after installing full Xcode). A Swift binary links
+`ghostty-internal.a` and calls the C ABI. Visual stage (NSView + surface + `muxy attach`) is next.
+This records the reproducible recipe.
+
+## ✅ Build/link de-risk — resolved (with full Xcode)
+
+After installing Xcode + `sudo xcode-select -s /Applications/Xcode.app/Contents/Developer`:
+
+- **Build** (same recipe as before — now the `metal` step passes) →
+  `zig-out/lib/ghostty-internal.a` (**189 MB**, the full GUI core) + `zig-out/include/ghostty.h`.
+- **Link + call from Swift** — a smoke test bridging `ghostty.h` and calling `ghostty_info()`:
+  ```
+  swiftc main.swift \
+    -import-objc-header <inc>/ghostty.h -I <inc> \
+    <lib>/ghostty-internal.a \
+    -framework Metal -framework MetalKit -framework QuartzCore -framework CoreGraphics \
+    -framework CoreText -framework CoreVideo -framework AppKit -framework Foundation \
+    -framework Carbon -framework IOSurface -framework UniformTypeIdentifiers \
+    -lc++ -o smoke
+  ```
+  Output: `libghostty linked OK / build_mode=0 / version=1.3.2-HEAD-+2de5e7d38` (matches the pin).
+  This framework set was sufficient — no undefined symbols (Zig objects carry autolink hints).
+  Retires research risks #2 (alpha ABI callable) and #3 (no-Xcode linking).
+
+Key facts for the SwiftPM/embedding stage: `ghostty.h` has `ghostty_info()`, `ghostty_init()`,
+`ghostty_config_new()`, `ghostty_app_new(runtime_config*, ...)`, `ghostty_surface_new(app, config)`.
+The surface config struct has a `command` field (ghostty.h ~L474) — this is where `muxy attach
+<pane>` goes.
+
+---
+
+## Original findings (build recipe + the Xcode wall)
+
+This records what the spike established so the work is reproducible when we resume.
 
 ## Goal
 
