@@ -22,6 +22,7 @@ pub struct Pane {
     output_tx: broadcast::Sender<Vec<u8>>,
     backlog: Arc<Mutex<Vec<u8>>>,
     exit_rx: tokio::sync::watch::Receiver<Option<Option<i32>>>,
+    size: Mutex<(u16, u16)>,
 }
 
 impl Pane {
@@ -85,6 +86,7 @@ impl Pane {
             output_tx,
             backlog,
             exit_rx,
+            size: Mutex::new((cols, rows)),
         })
     }
 
@@ -103,7 +105,12 @@ impl Pane {
     pub fn resize(&self, cols: u16, rows: u16) -> Result<()> {
         let m = self.master.lock().map_err(|_| anyhow!("master poisoned"))?;
         m.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })?;
+        *self.size.lock().unwrap() = (cols, rows);
         Ok(())
+    }
+
+    pub fn size(&self) -> (u16, u16) {
+        *self.size.lock().unwrap()
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<Vec<u8>> {
