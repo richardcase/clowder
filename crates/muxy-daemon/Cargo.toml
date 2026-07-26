@@ -12,3 +12,4 @@ muxy-proto = { path = "../muxy-proto" }
 tokio = { workspace = true }
 portable-pty = { workspace = true }
 anyhow = { workspace = true }
+notify-rust = "4"
