@@ -1,0 +1,16 @@
+[package]
+name = "muxy-hook"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+muxy-proto = { path = "../muxy-proto" }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "muxy-hook"
+path = "src/main.rs"
