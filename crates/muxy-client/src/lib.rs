@@ -31,6 +31,7 @@ where
                     Some(DaemonToClient::Attached { .. }) => {}
                     Some(DaemonToClient::AttentionChanged { .. }) => {}
                     Some(DaemonToClient::AgentList { .. }) => {}
+                    Some(DaemonToClient::AgentRemoved { .. }) => {}
                 }
             }
         }
