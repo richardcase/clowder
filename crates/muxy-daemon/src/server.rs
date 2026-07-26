@@ -90,14 +90,26 @@ impl Daemon {
     pub fn spawn_agent(&self, project: &Path, adapter: &dyn AgentAdapter, task: &str) -> Result<PaneId> {
         let id = self.alloc_id();
         let ws = self.driver.provision(project, task)?;
-        adapter.provision_hooks(&ws.path, id, &self.hook_sock)?;
 
-        let mut cmd = adapter.launch_command(&ws.path);
-        cmd.cwd = Some(ws.path.clone());
-        cmd.env.push(("MUXY_AGENT_ID".into(), id.0.to_string()));
-        cmd.env.push(("MUXY_HOOK_SOCK".into(), self.hook_sock.to_string_lossy().to_string()));
+        // If any post-provision step fails (e.g. the agent binary isn't on PATH), tear down
+        // the freshly-provisioned worktree/branch instead of leaking it — otherwise a retry
+        // with the same task name fails at `git worktree add`.
+        let pane = match (|| -> Result<Pane> {
+            adapter.provision_hooks(&ws.path, id, &self.hook_sock)?;
 
-        let pane = Pane::spawn(id, cmd, 80, 24)?;
+            let mut cmd = adapter.launch_command(&ws.path);
+            cmd.cwd = Some(ws.path.clone());
+            cmd.env.push(("MUXY_AGENT_ID".into(), id.0.to_string()));
+            cmd.env.push(("MUXY_HOOK_SOCK".into(), self.hook_sock.to_string_lossy().to_string()));
+
+            Pane::spawn(id, cmd, 80, 24)
+        })() {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = self.driver.teardown(&ws);
+                return Err(e);
+            }
+        };
         self.register_pane(id, pane);
         self.workspaces.lock().unwrap().insert(id, ws);
         self.set_attention(id, AttentionState::Working);

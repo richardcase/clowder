@@ -76,3 +76,34 @@ async fn provision_spawn_hook_teardown_end_to_end() {
     assert!(!ws_path.exists(), "worktree not removed on teardown");
     assert_eq!(daemon.attention_of(pane), None);
 }
+
+#[tokio::test]
+async fn spawn_agent_tears_down_worktree_on_launch_failure() {
+    let repo = init_repo();
+    let hook_dir = tempfile::tempdir().unwrap();
+    let hook_sock = hook_dir.path().join("hook.sock");
+
+    let notifier = Arc::new(FakeNotifier::new());
+    let daemon = Arc::new(Daemon::new_with(
+        Arc::new(muxy_workspace::GitWorktreeDriver),
+        notifier.clone(),
+        hook_sock.clone(),
+    ));
+
+    // Adapter launches a binary that doesn't exist, simulating the common first-run case
+    // where the agent CLI isn't on PATH. Pane::spawn should fail after the worktree has
+    // already been provisioned.
+    let adapter = SyntheticAdapter {
+        command: PaneCommand {
+            program: "/nonexistent/muxy-bogus-xyz".into(),
+            args: vec![],
+            cwd: None,
+            env: vec![],
+        },
+    };
+    let result = daemon.spawn_agent(repo.path(), &adapter, "task-fail");
+    assert!(result.is_err(), "spawn_agent should fail when the agent binary is missing");
+
+    let ws_path = repo.path().join(".muxy").join("worktrees").join("task-fail");
+    assert!(!ws_path.exists(), "worktree should be torn down after spawn_agent failure");
+}

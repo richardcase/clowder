@@ -11,8 +11,9 @@ pub trait AgentAdapter: Send + Sync {
     fn launch_command(&self, worktree: &Path) -> PaneCommand;
 }
 
-/// Real Claude Code adapter: writes a git-ignored .claude/settings.local.json whose
-/// Notification/Stop hooks invoke `muxy-hook`.
+/// Real Claude Code adapter: writes .claude/settings.local.json whose Notification/Stop
+/// hooks invoke `muxy-hook`, plus a .claude/.gitignore so that hook config isn't committed
+/// into the agent's own branch.
 pub struct ClaudeAdapter;
 
 impl AgentAdapter for ClaudeAdapter {
@@ -23,6 +24,7 @@ impl AgentAdapter for ClaudeAdapter {
     fn provision_hooks(&self, worktree: &Path, _agent_id: PaneId, _hook_sock: &Path) -> Result<()> {
         let dir = worktree.join(".claude");
         std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join(".gitignore"), "settings.local.json\n")?;
         let hook = |event: &str| {
             serde_json::json!([{ "hooks": [{ "type": "command", "command": format!("muxy-hook --event {event}") }] }])
         };
@@ -76,5 +78,13 @@ mod tests {
         let stop = v["hooks"]["Stop"][0]["hooks"][0]["command"].as_str().unwrap();
         assert_eq!(notif, "muxy-hook --event notification");
         assert_eq!(stop, "muxy-hook --event stop");
+
+        // The hook settings themselves must be git-ignored so they don't get committed
+        // into the agent's own branch.
+        let gitignore = std::fs::read_to_string(dir.path().join(".claude/.gitignore")).unwrap();
+        assert!(
+            gitignore.lines().any(|l| l.trim() == "settings.local.json"),
+            "expected .claude/.gitignore to contain settings.local.json, got: {gitignore:?}"
+        );
     }
 }
