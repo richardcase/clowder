@@ -26,6 +26,7 @@ pub struct Daemon {
     attention_tx: broadcast::Sender<(PaneId, AttentionState)>,
     workspaces: Arc<Mutex<HashMap<PaneId, Workspace>>>,
     agents: Arc<Mutex<HashMap<PaneId, AgentMeta>>>,
+    watchers: Arc<Mutex<HashMap<PaneId, tokio::task::JoinHandle<()>>>>,
     driver: Arc<dyn WorkspaceDriver>,
     notifier: Arc<dyn Notifier>,
     hook_sock: PathBuf,
@@ -53,6 +54,7 @@ impl Daemon {
             attention_tx,
             workspaces: Arc::new(Mutex::new(HashMap::new())),
             agents: Arc::new(Mutex::new(HashMap::new())),
+            watchers: Arc::new(Mutex::new(HashMap::new())),
             driver,
             notifier,
             hook_sock,
@@ -129,12 +131,13 @@ impl Daemon {
         );
         self.set_attention(id, AttentionState::Working);
 
-        let me = Arc::clone(self);
         if let Some(pane_arc) = self.panes.lock().unwrap().get(&id).cloned() {
-            tokio::spawn(async move {
+            let me = Arc::clone(self);
+            let handle = tokio::spawn(async move {
                 pane_arc.wait_exit().await;
                 me.set_attention(id, AttentionState::Exited);
             });
+            self.watchers.lock().unwrap().insert(id, handle);
         }
 
         Ok(id)
@@ -148,6 +151,9 @@ impl Daemon {
     pub fn teardown_agent(&self, pane: PaneId) -> Result<()> {
         if let Some(p) = self.get(pane) {
             let _ = p.kill();
+        }
+        if let Some(handle) = self.watchers.lock().unwrap().remove(&pane) {
+            handle.abort();
         }
         if let Some(ws) = self.workspace_of(pane) {
             self.driver.teardown(&ws)?;
@@ -663,5 +669,48 @@ mod tests {
         assert_eq!(list[0].state, AttentionState::Exited);
 
         daemon.teardown_agent(pane).unwrap();
+    }
+
+    #[tokio::test]
+    async fn teardown_of_running_agent_does_not_leave_spurious_exited() {
+        use crate::{FakeNotifier, SyntheticAdapter};
+        use muxy_workspace::GitWorktreeDriver;
+        use std::process::Command as PCommand;
+        use std::time::Duration;
+
+        let repo = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            assert!(PCommand::new("git").arg("-C").arg(repo.path()).args(args).status().unwrap().success());
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@t.test"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(repo.path().join("README.md"), b"hi").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-qm", "init"]);
+
+        let daemon = Arc::new(Daemon::new_with(
+            Arc::new(GitWorktreeDriver),
+            Arc::new(FakeNotifier::new()),
+            std::path::PathBuf::from("/tmp/unused-teardown-race.sock"),
+        ));
+        let adapter = SyntheticAdapter {
+            command: crate::PaneCommand {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), "sleep 30".into()],
+                cwd: None,
+                env: vec![],
+            },
+        };
+        let pane = daemon.spawn_agent(repo.path(), &adapter, "task-r").unwrap();
+
+        // Tear down while still running (kills the child).
+        daemon.teardown_agent(pane).unwrap();
+
+        // Give the killed child time to die + any un-aborted watcher time to fire.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // The watcher was aborted, so no Exited entry was re-inserted after teardown.
+        assert_eq!(daemon.attention_of(pane), None, "watcher left a spurious attention entry after teardown");
     }
 }
