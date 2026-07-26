@@ -1,0 +1,4 @@
+module GhosttyKit {
+    header "include/ghostty.h"
+    export *
+}
