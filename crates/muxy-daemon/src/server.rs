@@ -192,6 +192,9 @@ impl Daemon {
                     Some(p) => break p,
                     None => return Ok(()), // unknown pane: end session
                 },
+                Some(ClientToDaemon::ListAgents) => {
+                    return self.handle_control(msgs).await;
+                }
                 Some(_) => continue, // ignore until attached
                 None => return Ok(()),
             }
@@ -241,6 +244,39 @@ impl Daemon {
                     }
                     msgs.send(&DaemonToClient::PaneExited { pane: pane.id(), code }).await?;
                     break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn handle_control<S>(self: Arc<Self>, mut msgs: MsgStream<S>) -> Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send,
+    {
+        // Snapshot the agent list, then stream every attention change.
+        let mut att_rx = self.subscribe_attention();
+        msgs.send(&DaemonToClient::AgentList { agents: self.list_agents() }).await?;
+        loop {
+            tokio::select! {
+                att = att_rx.recv() => {
+                    match att {
+                        Ok((pane, state)) => {
+                            msgs.send(&DaemonToClient::AttentionChanged { pane, state }).await?;
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(_) => break, // attention channel closed
+                    }
+                }
+                incoming = msgs.recv::<ClientToDaemon>() => {
+                    match incoming? {
+                        Some(ClientToDaemon::ListAgents) => {
+                            // Client asked to refresh the list.
+                            msgs.send(&DaemonToClient::AgentList { agents: self.list_agents() }).await?;
+                        }
+                        Some(_) => continue,     // control conn ignores pane ops
+                        None => break,           // client disconnected
+                    }
                 }
             }
         }
@@ -502,5 +538,72 @@ mod tests {
 
         daemon.teardown_agent(pane).unwrap();
         assert!(daemon.list_agents().is_empty());
+    }
+
+    #[tokio::test]
+    async fn control_conn_lists_agents_and_streams_attention() {
+        use crate::{FakeNotifier, SyntheticAdapter};
+        use muxy_proto::AttentionState;
+        use muxy_workspace::GitWorktreeDriver;
+        use std::process::Command as PCommand;
+        use std::time::Duration;
+
+        let repo = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            assert!(PCommand::new("git").arg("-C").arg(repo.path()).args(args).status().unwrap().success());
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@t.test"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(repo.path().join("README.md"), b"hi").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-qm", "init"]);
+
+        let daemon = Arc::new(Daemon::new_with(
+            Arc::new(GitWorktreeDriver),
+            Arc::new(FakeNotifier::new()),
+            std::path::PathBuf::from("/tmp/unused-control.sock"),
+        ));
+        let adapter = SyntheticAdapter {
+            command: crate::PaneCommand {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), "sleep 30".into()],
+                cwd: None,
+                env: vec![],
+            },
+        };
+        let pane = daemon.spawn_agent(repo.path(), &adapter, "task-a").unwrap();
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let d = daemon.clone();
+        tokio::spawn(async move { let _ = d.handle_conn(server_io).await; });
+
+        let mut client = MsgStream::<_>::new(client_io);
+        client.send(&ClientToDaemon::ListAgents).await.unwrap();
+
+        // First reply is the agent list.
+        match client.recv::<DaemonToClient>().await.unwrap().unwrap() {
+            DaemonToClient::AgentList { agents } => {
+                assert_eq!(agents.len(), 1);
+                assert_eq!(agents[0].pane, pane);
+                assert_eq!(agents[0].task, "task-a");
+            }
+            other => panic!("expected AgentList, got {other:?}"),
+        }
+
+        // A later attention change streams over the SAME control connection,
+        // even though this client is not "attached" to the pane.
+        daemon.set_attention(pane, AttentionState::NeedsInput);
+        let mut saw = None;
+        for _ in 0..40 {
+            if let Ok(Ok(Some(DaemonToClient::AttentionChanged { pane: p, state }))) =
+                tokio::time::timeout(Duration::from_millis(50), client.recv::<DaemonToClient>()).await
+            {
+                if p == pane { saw = Some(state); break; }
+            }
+        }
+        assert_eq!(saw, Some(AttentionState::NeedsInput));
+
+        daemon.teardown_agent(pane).unwrap();
     }
 }
