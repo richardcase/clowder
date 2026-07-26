@@ -94,7 +94,7 @@ impl Daemon {
     }
 
     /// Provision an isolated worktree, inject the adapter's hooks, and spawn the agent in it.
-    pub fn spawn_agent(&self, project: &Path, adapter: &dyn AgentAdapter, task: &str) -> Result<PaneId> {
+    pub fn spawn_agent(self: &Arc<Self>, project: &Path, adapter: &dyn AgentAdapter, task: &str) -> Result<PaneId> {
         let id = self.alloc_id();
         let ws = self.driver.provision(project, task)?;
 
@@ -128,6 +128,15 @@ impl Daemon {
             AgentMeta { project: project_name, task: task.to_string() },
         );
         self.set_attention(id, AttentionState::Working);
+
+        let me = Arc::clone(self);
+        if let Some(pane_arc) = self.panes.lock().unwrap().get(&id).cloned() {
+            tokio::spawn(async move {
+                pane_arc.wait_exit().await;
+                me.set_attention(id, AttentionState::Exited);
+            });
+        }
+
         Ok(id)
     }
 
@@ -603,6 +612,55 @@ mod tests {
             }
         }
         assert_eq!(saw, Some(AttentionState::NeedsInput));
+
+        daemon.teardown_agent(pane).unwrap();
+    }
+
+    #[tokio::test]
+    async fn agent_marked_exited_on_process_exit() {
+        use crate::{FakeNotifier, SyntheticAdapter};
+        use muxy_proto::AttentionState;
+        use muxy_workspace::GitWorktreeDriver;
+        use std::process::Command as PCommand;
+        use std::time::Duration;
+
+        let repo = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            assert!(PCommand::new("git").arg("-C").arg(repo.path()).args(args).status().unwrap().success());
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@t.test"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(repo.path().join("README.md"), b"hi").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-qm", "init"]);
+
+        let daemon = Arc::new(Daemon::new_with(
+            Arc::new(GitWorktreeDriver),
+            Arc::new(FakeNotifier::new()),
+            std::path::PathBuf::from("/tmp/unused-reaper.sock"),
+        ));
+        let adapter = SyntheticAdapter {
+            command: crate::PaneCommand {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), "exit 0".into()],
+                cwd: None,
+                env: vec![],
+            },
+        };
+        let pane = daemon.spawn_agent(repo.path(), &adapter, "task-x").unwrap();
+
+        // No client attached: the daemon-side watcher must still flip attention to Exited.
+        let mut exited = false;
+        for _ in 0..100 {
+            if daemon.attention_of(pane) == Some(AttentionState::Exited) { exited = true; break; }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(exited, "agent was not marked Exited after its process exited");
+        // It stays in the list (mark-exited-and-keep), still reported with Exited state.
+        let list = daemon.list_agents();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].state, AttentionState::Exited);
 
         daemon.teardown_agent(pane).unwrap();
     }
