@@ -23,6 +23,7 @@ pub struct Pane {
     backlog: Arc<Mutex<Vec<u8>>>,
     exit_rx: tokio::sync::watch::Receiver<Option<Option<i32>>>,
     size: Mutex<(u16, u16)>,
+    killer: Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>,
 }
 
 impl Pane {
@@ -39,6 +40,7 @@ impl Pane {
             builder.env(k, v);
         }
         let mut child = pair.slave.spawn_command(builder)?;
+        let killer = child.clone_killer();
         drop(pair.slave);
 
         let writer = pair.master.take_writer()?;
@@ -87,6 +89,7 @@ impl Pane {
             backlog,
             exit_rx,
             size: Mutex::new((cols, rows)),
+            killer: Mutex::new(killer),
         })
     }
 
@@ -132,6 +135,11 @@ impl Pane {
         let snap = b.clone();
         drop(b);
         (snap, rx)
+    }
+
+    pub fn kill(&self) -> anyhow::Result<()> {
+        self.killer.lock().map_err(|_| anyhow!("killer poisoned"))?.kill()?;
+        Ok(())
     }
 
     pub async fn wait_exit(&self) -> Option<i32> {

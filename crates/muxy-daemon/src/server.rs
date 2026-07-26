@@ -145,6 +145,8 @@ impl Daemon {
         let (snap, mut sub) = pane.snapshot_and_subscribe();
         msgs.send(&DaemonToClient::Output { pane: pane.id(), bytes: snap }).await?;
 
+        let mut att_rx = self.subscribe_attention();
+
         loop {
             tokio::select! {
                 live = sub.recv() => {
@@ -161,6 +163,20 @@ impl Daemon {
                         Some(ClientToDaemon::Detach) | None => break,
                         Some(ClientToDaemon::Attach { .. }) => continue,
                     }
+                }
+                att = att_rx.recv() => {
+                    match att {
+                        Ok((p, state)) if p == pane.id() => {
+                            msgs.send(&DaemonToClient::AttentionChanged { pane: p, state }).await?;
+                        }
+                        Ok(_) => continue,                        // another pane's attention
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(_) => {}                              // attention channel closed; ignore
+                    }
+                }
+                code = pane.wait_exit() => {
+                    msgs.send(&DaemonToClient::PaneExited { pane: pane.id(), code }).await?;
+                    break;
                 }
             }
         }
@@ -283,5 +299,66 @@ mod tests {
                 String::from_utf8_lossy(&bytes)
             );
         }
+    }
+
+    #[tokio::test]
+    async fn attached_client_gets_attention_changed() {
+        use muxy_proto::AttentionState;
+        let daemon = Arc::new(Daemon::new());
+        let pane = daemon.spawn_pane(sh("sleep 5"), 80, 24).unwrap();
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let d = daemon.clone();
+        tokio::spawn(async move { d.handle_conn(server_io).await.unwrap() });
+
+        let mut client = MsgStream::<_>::new(client_io);
+        client.send(&ClientToDaemon::Attach { pane }).await.unwrap();
+        let _attached: DaemonToClient = client.recv().await.unwrap().unwrap();
+        let _backlog: DaemonToClient = client.recv().await.unwrap().unwrap();
+
+        // Flip attention; the attached client must receive AttentionChanged.
+        daemon.set_attention(pane, AttentionState::NeedsInput);
+
+        let mut got = None;
+        for _ in 0..50 {
+            if let Ok(Ok(Some(msg))) =
+                tokio::time::timeout(Duration::from_millis(50), client.recv::<DaemonToClient>()).await
+            {
+                if let DaemonToClient::AttentionChanged { state, .. } = msg {
+                    got = Some(state);
+                    break;
+                }
+            }
+        }
+        assert_eq!(got, Some(AttentionState::NeedsInput));
+    }
+
+    #[tokio::test]
+    async fn client_gets_pane_exited_when_child_exits() {
+        let daemon = Arc::new(Daemon::new());
+        let pane = daemon.spawn_pane(sh("exit 3"), 80, 24).unwrap();
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let d = daemon.clone();
+        tokio::spawn(async move { d.handle_conn(server_io).await.unwrap() });
+
+        let mut client = MsgStream::<_>::new(client_io);
+        client.send(&ClientToDaemon::Attach { pane }).await.unwrap();
+
+        // Expect a PaneExited to arrive (rather than the session hanging forever).
+        let mut exited = false;
+        for _ in 0..100 {
+            if let Ok(Ok(Some(msg))) =
+                tokio::time::timeout(Duration::from_millis(50), client.recv::<DaemonToClient>()).await
+            {
+                if let DaemonToClient::PaneExited { .. } = msg {
+                    exited = true;
+                    break;
+                }
+            } else {
+                break; // stream closed
+            }
+        }
+        assert!(exited, "client never received PaneExited on child exit");
     }
 }
