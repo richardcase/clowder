@@ -10,3 +10,4 @@ bytes = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 anyhow = { workspace = true }
+futures-util = { version = "0.3", features = ["sink"] }
