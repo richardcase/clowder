@@ -175,6 +175,11 @@ impl Daemon {
                     }
                 }
                 code = pane.wait_exit() => {
+                    // Drain output already buffered before ending the session, so an agent's
+                    // final lines aren't dropped when it exits right after printing.
+                    while let Ok(bytes) = sub.try_recv() {
+                        msgs.send(&DaemonToClient::Output { pane: pane.id(), bytes }).await?;
+                    }
                     msgs.send(&DaemonToClient::PaneExited { pane: pane.id(), code }).await?;
                     break;
                 }
@@ -360,5 +365,34 @@ mod tests {
             }
         }
         assert!(exited, "client never received PaneExited on child exit");
+    }
+
+    #[tokio::test]
+    async fn client_gets_final_output_then_pane_exited() {
+        let daemon = Arc::new(Daemon::new());
+        let pane = daemon.spawn_pane(sh("printf BYE; sleep 0.3; exit 0"), 80, 24).unwrap();
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let d = daemon.clone();
+        tokio::spawn(async move { d.handle_conn(server_io).await.unwrap() });
+
+        let mut client = MsgStream::<_>::new(client_io);
+        client.send(&ClientToDaemon::Attach { pane }).await.unwrap();
+
+        let mut saw_bye = false;
+        let mut saw_exit = false;
+        for _ in 0..100 {
+            match tokio::time::timeout(Duration::from_millis(100), client.recv::<DaemonToClient>()).await {
+                Ok(Ok(Some(DaemonToClient::Output { bytes, .. }))) => {
+                    if bytes.windows(3).any(|w| w == b"BYE") { saw_bye = true; }
+                }
+                Ok(Ok(Some(DaemonToClient::PaneExited { .. }))) => { saw_exit = true; break; }
+                Ok(Ok(Some(_))) => {}   // Attached / AttentionChanged
+                Ok(Ok(None)) | Ok(Err(_)) => break, // stream closed / recv error
+                Err(_) => continue,     // this iteration's 100ms window elapsed; keep polling
+            }
+        }
+        assert!(saw_bye, "did not receive final output before exit");
+        assert!(saw_exit, "did not receive PaneExited");
     }
 }
