@@ -53,48 +53,58 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pump_forwards_input_and_renders_output() {
+    async fn pump_forwards_input_renders_output_and_shuts_down_on_eof() {
         let daemon = Arc::new(Daemon::new());
         let pane = daemon.spawn_pane(sh("cat"), 80, 24).unwrap();
 
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let d = daemon.clone();
-        // The client end may be dropped by the timeout below before a graceful
-        // Detach; that surfaces as a broken-pipe Err here, which is expected.
-        tokio::spawn(async move { let _ = d.handle_conn(server_io).await; });
+        let server = tokio::spawn(async move { let _ = d.handle_conn(server_io).await; });
 
-        // Feed "hello\n" via a duplex pipe rather than `std::io::Cursor`: a
-        // Cursor reports EOF on the very next poll (always Ready), so pump's
-        // `input.read` branch would win the `select!` race and send Detach
-        // (closing the socket) before the daemon's echoed `cat` output ever
-        // arrives. Keeping the write half alive holds the read half open so
-        // `input.read` parks between polls, giving the real client<->daemon
-        // round trip time to land. Capture rendered output into a Vec via a
-        // recoverable Cursor writer, exactly as originally intended.
-        let (mut input_tx, input_rx) = tokio::io::duplex(64);
-        input_tx.write_all(b"hello\n").await.unwrap();
+        // pump reads `input_reader`; test writes into `input_writer`.
+        let (input_reader, mut input_writer) = tokio::io::duplex(1024);
+        // pump writes into `out_writer`; test reads `out_reader`.
+        let (mut out_reader, out_writer) = tokio::io::duplex(64 * 1024);
 
-        let output = Vec::new();
-        // Wrap output so we can read it back after pump returns.
-        let output = std::io::Cursor::new(output);
-
-        // Run pump with a timeout so the test can't hang.
-        let handle = tokio::spawn(async move {
-            let mut out = output;
-            let _ = tokio::time::timeout(
-                Duration::from_secs(2),
-                pump(client_io, pane, input_rx, &mut out),
-            )
-            .await;
-            drop(input_tx);
-            out.into_inner()
+        let pump_task = tokio::spawn(async move {
+            pump(client_io, pane, input_reader, out_writer).await
         });
 
-        let rendered = handle.await.unwrap();
+        input_writer.write_all(b"hello\n").await.unwrap();
+        input_writer.flush().await.unwrap();
+
+        // Read rendered output until we see the echo (bounded).
+        let mut seen = Vec::new();
+        let mut buf = [0u8; 1024];
+        let got = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let n = out_reader.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                seen.extend_from_slice(&buf[..n]);
+                if seen.windows(5).any(|w| w == b"hello") {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(got.is_ok(), "did not render echoed output in time");
         assert!(
-            rendered.windows(5).any(|w| w == b"hello"),
-            "pump did not render echoed output: {:?}",
-            String::from_utf8_lossy(&rendered)
+            seen.windows(5).any(|w| w == b"hello"),
+            "output missing 'hello': {:?}",
+            String::from_utf8_lossy(&seen)
         );
+
+        // Close pump's input -> pump must send Detach and return cleanly & promptly.
+        drop(input_writer);
+        let pump_result = tokio::time::timeout(Duration::from_secs(5), pump_task).await;
+        assert!(pump_result.is_ok(), "pump did not return after input EOF (it hung)");
+        assert!(
+            pump_result.unwrap().unwrap().is_ok(),
+            "pump returned an error on EOF shutdown"
+        );
+
+        let _ = server.await;
     }
 }
