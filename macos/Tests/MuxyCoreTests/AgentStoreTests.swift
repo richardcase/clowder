@@ -47,4 +47,11 @@ final class AgentStoreTests: XCTestCase {
         XCTAssertEqual(bp.map { $0.project }, ["a", "b"])
         XCTAssertEqual(bp[0].agents.map { $0.pane }, [1, 2])
     }
+
+    func testErrorEventSetsLastError() {
+        let s = AgentStore()
+        XCTAssertNil(s.lastError)
+        s.apply(.error(message: "boom"))
+        XCTAssertEqual(s.lastError, "boom")
+    }
 }

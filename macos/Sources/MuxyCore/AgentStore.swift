@@ -7,6 +7,7 @@ import Combine
 public final class AgentStore: ObservableObject {
     @Published public private(set) var agents: [UInt64: AgentInfo] = [:]
     @Published public private(set) var needsRefresh: Bool = false
+    @Published public private(set) var lastError: String?
 
     public init() {}
 
@@ -26,8 +27,8 @@ public final class AgentStore: ObservableObject {
             needsRefresh = true // pane-only — re-list to hydrate project/task/state
         case let .agentRemoved(pane):
             agents[pane] = nil // idempotent
-        case .error:
-            break
+        case let .error(message):
+            lastError = message
         }
     }
 
