@@ -75,12 +75,40 @@ final class SurfaceView: NSView {
         pushSize()
     }
 
-    override func keyDown(with event: NSEvent) {
-        // Best-effort text forwarding for the spike (rendering is the primary proof).
-        guard let surface, let chars = event.characters, !chars.isEmpty else { return }
-        chars.withCString { ptr in
-            ghostty_surface_text(surface, ptr, UInt(strlen(ptr)))
+    override func keyDown(with event: NSEvent) { sendKey(event, GHOSTTY_ACTION_PRESS) }
+    override func keyUp(with event: NSEvent) { sendKey(event, GHOSTTY_ACTION_RELEASE) }
+
+    /// Forward a key via `ghostty_surface_key` (libghostty encodes Enter/Backspace/
+    /// Ctrl-* itself from the keycode/mods; `text` is set only for printable input).
+    private func sendKey(_ event: NSEvent, _ action: ghostty_input_action_e) {
+        guard let surface else { return }
+        var key = ghostty_input_key_s()
+        key.action = action
+        key.keycode = UInt32(event.keyCode)
+        key.mods = ghosttyMods(event.modifierFlags)
+        key.consumed_mods = ghosttyMods(event.modifierFlags.subtracting([.control, .command]))
+        key.composing = false
+        key.unshifted_codepoint =
+            event.charactersIgnoringModifiers?.unicodeScalars.first?.value ?? 0
+
+        let text = event.characters ?? ""
+        if let first = text.utf8.first, first >= 0x20 {
+            text.withCString { ptr in
+                key.text = ptr
+                _ = ghostty_surface_key(surface, key)
+            }
+        } else {
+            _ = ghostty_surface_key(surface, key)
         }
+    }
+
+    private func ghosttyMods(_ flags: NSEvent.ModifierFlags) -> ghostty_input_mods_e {
+        var raw: UInt32 = 0
+        if flags.contains(.shift) { raw |= GHOSTTY_MODS_SHIFT.rawValue }
+        if flags.contains(.control) { raw |= GHOSTTY_MODS_CTRL.rawValue }
+        if flags.contains(.option) { raw |= GHOSTTY_MODS_ALT.rawValue }
+        if flags.contains(.command) { raw |= GHOSTTY_MODS_SUPER.rawValue }
+        return ghostty_input_mods_e(raw)
     }
 
     deinit {
