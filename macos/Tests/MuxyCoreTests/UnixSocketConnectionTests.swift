@@ -59,4 +59,16 @@ final class UnixSocketConnectionTests: XCTestCase {
         let path = NSTemporaryDirectory() + "muxy-nope-\(UUID().uuidString).sock"
         XCTAssertThrowsError(try UnixSocketConnection(path: path))
     }
+
+    func testDisconnectClosesSocket() throws {
+        let path = NSTemporaryDirectory() + "muxy-dc-\(UUID().uuidString).sock"
+        let serverFd = listenSocket(at: path)
+        defer { Darwin.close(serverFd); unlink(path) }
+        DispatchQueue.global().async { _ = accept(serverFd, nil, nil) }
+
+        let conn = try UnixSocketConnection(path: path)
+        conn.disconnect()
+        // fd is closed → a subsequent write must fail.
+        XCTAssertThrowsError(try conn.send(line: "x"))
+    }
 }

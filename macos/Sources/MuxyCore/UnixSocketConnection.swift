@@ -8,6 +8,7 @@ public final class UnixSocketConnection: ControlTransport {
     private var receiver: ((String) -> Void)?
     private let readQueue = DispatchQueue(label: "muxy.control.read")
     private var isRunning = true
+    private var isClosed = false
 
     public init(path: String) throws {
         fd = socket(AF_UNIX, SOCK_STREAM, 0)
@@ -31,8 +32,9 @@ public final class UnixSocketConnection: ControlTransport {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, len) }
         }
         guard rc == 0 else {
+            let err = errno
             close(fd)
-            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .ECONNREFUSED)
+            throw POSIXError(POSIXErrorCode(rawValue: err) ?? .ECONNREFUSED)
         }
     }
 
@@ -54,7 +56,22 @@ public final class UnixSocketConnection: ControlTransport {
         }
     }
 
+    /// Proactively close the connection: unblocks the read loop and closes the fd.
+    /// Idempotent; also called from deinit.
+    public func disconnect() {
+        guard !isClosed else { return }
+        isClosed = true
+        isRunning = false
+        shutdown(fd, SHUT_RDWR)   // unblocks a blocked read() so readLoop() can exit
+        close(fd)
+    }
+
     public func send(line: String) throws {
+        // Never touch `fd` once disconnected: the OS may have already reused that
+        // integer for an unrelated descriptor elsewhere in the process, and writing
+        // to it could hit a broken pipe on someone else's socket (SIGPIPE, fatal by
+        // default) instead of failing cleanly here.
+        guard !isClosed else { throw POSIXError(.EBADF) }
         let bytes = Array((line + "\n").utf8)
         try bytes.withUnsafeBytes { raw in
             var off = 0
@@ -66,8 +83,5 @@ public final class UnixSocketConnection: ControlTransport {
         }
     }
 
-    deinit {
-        isRunning = false
-        close(fd)
-    }
+    deinit { disconnect() }
 }
