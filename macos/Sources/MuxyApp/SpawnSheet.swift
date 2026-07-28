@@ -7,21 +7,38 @@ struct SpawnSheet: View {
     @State private var task = ""
     @State private var adapter = "claude"
 
+    private var isValid: Bool {
+        !project.trimmingCharacters(in: .whitespaces).isEmpty &&
+        !task.trimmingCharacters(in: .whitespaces).isEmpty
+    }
+
     var body: some View {
-        Form {
-            TextField("Project path", text: $project)
-            TextField("Task", text: $task)
-            TextField("Adapter", text: $adapter)
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Spawn Agent").font(.headline)
+            Form {
+                TextField("Project path", text: $project)
+                    .textFieldStyle(.roundedBorder)
+                TextField("Task", text: $task)
+                    .textFieldStyle(.roundedBorder)
+                TextField("Adapter", text: $adapter)
+                    .textFieldStyle(.roundedBorder)
+            }
             HStack {
                 Button("Cancel") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
                 Spacer()
                 Button("Spawn") {
-                    onSpawn(project, task, adapter.isEmpty ? "claude" : adapter)
+                    let a = adapter.trimmingCharacters(in: .whitespaces)
+                    onSpawn(project.trimmingCharacters(in: .whitespaces),
+                            task.trimmingCharacters(in: .whitespaces),
+                            a.isEmpty ? "claude" : a)
                     dismiss()
                 }
+                .keyboardShortcut(.defaultAction)
+                .disabled(!isValid)
             }
         }
-        .padding()
-        .frame(width: 420)
+        .padding(20)
+        .frame(width: 440)
     }
 }
