@@ -94,6 +94,10 @@ struct MuxyApp: App {
                 .frame(minWidth: 900, minHeight: 560)
         }
         .commands {
+            // muxy is a single-window app; remove the default File > New Window (frees ⌘N
+            // for Spawn Agent instead of opening a second window).
+            CommandGroup(replacing: .newItem) { }
+
             CommandMenu("muxy") {
                 menuItem("Command Palette", .openPalette)
                 menuItem("Spawn Agent", .spawnAgent)
