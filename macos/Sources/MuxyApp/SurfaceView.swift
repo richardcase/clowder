@@ -24,6 +24,15 @@ final class SurfaceView: NSView {
 
     override var acceptsFirstResponder: Bool { true }
 
+    /// Called when this surface becomes first responder (e.g. the user clicks it).
+    var onFocus: (() -> Void)?
+
+    override func becomeFirstResponder() -> Bool {
+        let ok = super.becomeFirstResponder()
+        if ok { onFocus?() }
+        return ok
+    }
+
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         guard window != nil, surface == nil else { return }

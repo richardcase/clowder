@@ -69,8 +69,10 @@ struct ContentView: View {
                 // placeholder instead — and never re-attach to a dead pane on re-select.
                 exitedPlaceholder(agent)
             } else {
-                TerminalContainer(pane: pane, surfaceHost: surfaceHost)
-                    .id(pane)
+                SplitContainer(node: model.currentTree ?? .leaf(pane: pane),
+                               surfaceHost: surfaceHost,
+                               focusedPane: $model.focusedPane)
+                    .id(pane)   // rebuild when switching agents; same agent's tree changes diff in place
             }
         } else {
             Text("Select an agent").foregroundStyle(.secondary)
