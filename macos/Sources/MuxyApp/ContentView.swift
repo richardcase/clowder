@@ -25,6 +25,16 @@ struct ContentView: View {
             }
         }
         .safeAreaInset(edge: .bottom) { statusBar }
+        .overlay {
+            if model.showingPalette {
+                ZStack(alignment: .top) {
+                    Color.black.opacity(0.2).ignoresSafeArea()
+                        .onTapGesture { model.showingPalette = false }
+                    CommandPaletteView()
+                        .padding(.top, 80)
+                }
+            }
+        }
     }
 
     private var sidebar: some View {
