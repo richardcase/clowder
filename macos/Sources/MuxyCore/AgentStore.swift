@@ -8,6 +8,7 @@ public final class AgentStore: ObservableObject {
     @Published public private(set) var agents: [UInt64: AgentInfo] = [:]
     @Published public private(set) var needsRefresh: Bool = false
     @Published public private(set) var lastError: String?
+    @Published public private(set) var trees: [UInt64: PaneTree] = [:]
 
     public init() {}
 
@@ -26,12 +27,12 @@ public final class AgentStore: ObservableObject {
         case .agentSpawned:
             needsRefresh = true // pane-only — re-list to hydrate project/task/state
         case let .agentRemoved(pane):
-            agents[pane] = nil // idempotent
+            agents[pane] = nil
+            trees[pane] = nil          // no per-companion AgentRemoved; drop the agent's tree
         case let .error(message):
             lastError = message
-        case .splitTreeChanged:
-            // Split tree changes are handled by PaneTreeStore, not by AgentStore
-            break
+        case let .splitTreeChanged(agent, tree):
+            trees[agent] = tree        // idempotent replace (carry-forward #1)
         }
     }
 
