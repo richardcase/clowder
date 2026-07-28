@@ -37,6 +37,7 @@ impl Daemon {
         let mut lines = BufReader::new(rd).lines();
         let mut att_rx = self.subscribe_attention();
         let mut removed_rx = self.subscribe_removed();
+        let mut split_rx = self.subscribe_splits();
 
         write_event(&mut wr, &ControlEvent::AgentList { agents: self.list_agents() }).await?;
 
@@ -54,7 +55,28 @@ impl Daemon {
                                         Ok(pane) => ControlEvent::AgentSpawned { pane },
                                         Err(e) => ControlEvent::Error { message: e.to_string() },
                                     },
-                                Ok(_) => ControlEvent::Error { message: "request type not yet implemented".to_string() },
+                                Ok(ControlRequest::SplitPane { pane, direction }) =>
+                                    match self.split_pane(pane, direction) {
+                                        Ok(companion) => {
+                                            match self.owner_of(companion) {
+                                                Some(agent) => self.tree_event(agent),
+                                                None => ControlEvent::Error { message: "split produced no owner".into() },
+                                            }
+                                        }
+                                        Err(e) => ControlEvent::Error { message: e.to_string() },
+                                    },
+                                Ok(ControlRequest::ClosePane { pane }) =>
+                                    match self.close_pane(pane) {
+                                        Ok(Some(agent)) => self.tree_event(agent),
+                                        Ok(None) => ControlEvent::AgentRemoved { pane },
+                                        Err(e) => ControlEvent::Error { message: e.to_string() },
+                                    },
+                                Ok(ControlRequest::SetSplitRatio { split, ratio }) =>
+                                    match self.set_split_ratio(split, ratio) {
+                                        Ok(agent) => self.tree_event(agent),
+                                        Err(e) => ControlEvent::Error { message: e.to_string() },
+                                    },
+                                Ok(ControlRequest::GetSplitTree { agent }) => self.tree_event(agent),
                                 Err(e) => ControlEvent::Error { message: format!("bad request: {e}") },
                             };
                             write_event(&mut wr, &ev).await?;
@@ -73,6 +95,14 @@ impl Daemon {
                 removed = removed_rx.recv() => {
                     match removed {
                         Ok(pane) => write_event(&mut wr, &ControlEvent::AgentRemoved { pane }).await?,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(_) => break,
+                    }
+                }
+                sp = split_rx.recv() => {
+                    match sp {
+                        Ok((agent, tree)) =>
+                            write_event(&mut wr, &ControlEvent::SplitTreeChanged { agent, tree }).await?,
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                         Err(_) => break,
                     }
@@ -190,6 +220,64 @@ mod tests {
         assert!(saw, "did not receive attentionChanged over the control JSON stream");
 
         daemon.teardown_agent(pane).unwrap();
+    }
+
+    #[tokio::test]
+    async fn split_pane_over_control_stream_yields_split_tree_changed() {
+        let repo = init_repo();
+        let daemon = Arc::new(Daemon::new_with(
+            Arc::new(GitWorktreeDriver),
+            Arc::new(FakeNotifier::new()),
+            std::path::PathBuf::from("/tmp/unused-cjson3.sock"),
+        ));
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let d = daemon.clone();
+        tokio::spawn(async move { let _ = d.handle_control_json(server_io).await; });
+
+        let (crd, mut cwr) = tokio::io::split(client_io);
+        let mut clines = BufReader::new(crd).lines();
+
+        // Initial snapshot: empty AgentList.
+        let first = clines.next_line().await.unwrap().unwrap();
+        assert!(first.contains(r#""type":"agentList""#), "{first}");
+
+        // Spawn a shell agent.
+        let req = ControlRequest::SpawnAgent {
+            project: repo.path().to_string_lossy().to_string(),
+            task: "demo".into(),
+            adapter: "shell".into(),
+        };
+        let mut line = serde_json::to_string(&req).unwrap();
+        line.push('\n');
+        cwr.write_all(line.as_bytes()).await.unwrap();
+
+        let agent = loop {
+            let l = clines.next_line().await.unwrap().unwrap();
+            if let Ok(ControlEvent::AgentSpawned { pane }) = serde_json::from_str::<ControlEvent>(&l) {
+                break pane;
+            }
+        };
+
+        // Send SplitPane and read events until SplitTreeChanged arrives.
+        let req = ControlRequest::SplitPane { pane: agent, direction: muxy_proto::SplitDirection::Right };
+        let mut line = serde_json::to_string(&req).unwrap();
+        line.push('\n');
+        cwr.write_all(line.as_bytes()).await.unwrap();
+
+        let tree = loop {
+            let l = clines.next_line().await.unwrap().unwrap();
+            if let Ok(ControlEvent::SplitTreeChanged { agent: a, tree }) =
+                serde_json::from_str::<ControlEvent>(&l)
+            {
+                if a == agent {
+                    break tree;
+                }
+            }
+        };
+        assert_eq!(crate::split_tree::leaves(&tree).len(), 2, "{tree:?}");
+
+        daemon.teardown_agent(agent).unwrap();
     }
 
     #[tokio::test]
