@@ -1,4 +1,5 @@
 import XCTest
+import Combine
 @testable import MuxyCore
 
 final class FakeControlTransport: ControlTransport {
@@ -70,5 +71,17 @@ final class AppModelTests: XCTestCase {
         model.connect()
         fake.deliver(#"{"type":"agentList","agents":[{"pane":1,"project":"/p","task":"t","state":"Working"}]}"#)
         XCTAssertEqual(model.store.agents[1]?.task, "t")
+    }
+
+    func testStoreMutationRepublishesThroughModel() {
+        let fake = FakeControlTransport()
+        let model = AppModel(makeTransport: { fake })
+        model.connect()
+        let exp = expectation(description: "model republished on store mutation")
+        exp.assertForOverFulfill = false
+        let c = model.objectWillChange.sink { _ in exp.fulfill() }
+        fake.deliver(#"{"type":"agentList","agents":[{"pane":1,"project":"/p","task":"t","state":"Working"}]}"#)
+        wait(for: [exp], timeout: 1.0)
+        c.cancel()
     }
 }

@@ -18,11 +18,18 @@ public final class AppModel: ObservableObject {
     private let makeTransport: () throws -> ControlTransport
     private var connection: ControlTransport?
     private var session: ControlSession?
+    private var storeSubscription: AnyCancellable?
 
     public init(store: AgentStore = AgentStore(),
                 makeTransport: @escaping () throws -> ControlTransport) {
         self.store = store
         self.makeTransport = makeTransport
+        // Republish nested store changes so SwiftUI views observing AppModel refresh
+        // when agents/attention/lastError mutate (nested ObservableObject changes do
+        // not cascade to the parent automatically under Combine).
+        self.storeSubscription = store.objectWillChange.sink { [weak self] _ in
+            self?.objectWillChange.send()
+        }
     }
 
     /// Build the transport + session and hydrate. On any failure, land in `.closed`.

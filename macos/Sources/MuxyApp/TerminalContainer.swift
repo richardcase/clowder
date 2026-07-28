@@ -13,7 +13,5 @@ struct TerminalContainer: NSViewRepresentable {
         return view
     }
 
-    func updateNSView(_ nsView: SurfaceView, context: Context) {
-        DispatchQueue.main.async { nsView.window?.makeFirstResponder(nsView) }
-    }
+    func updateNSView(_ nsView: SurfaceView, context: Context) {}
 }
