@@ -8,6 +8,16 @@ public protocol ControlTransport: AnyObject {
     func setReceiver(_ receiver: @escaping (String) -> Void)
     /// Send one request line (the implementation appends the newline).
     func send(line: String) throws
+    /// Register a handler invoked once, on the main thread, when the channel closes
+    /// (peer close, read error, or `disconnect()`).
+    func setOnClose(_ handler: @escaping () -> Void)
+    /// Proactively close the channel. Idempotent.
+    func disconnect()
+}
+
+public extension ControlTransport {
+    func setOnClose(_ handler: @escaping () -> Void) {}
+    func disconnect() {}
 }
 
 /// Drives the control channel: inbound lines → decode → AgentStore; auto-refreshes

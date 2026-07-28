@@ -71,4 +71,49 @@ final class UnixSocketConnectionTests: XCTestCase {
         // fd is closed → a subsequent write must fail.
         XCTAssertThrowsError(try conn.send(line: "x"))
     }
+
+    func testOnCloseFiresOnMainThreadWhenPeerCloses() throws {
+        let path = NSTemporaryDirectory() + "muxy-onclose-\(UUID().uuidString).sock"
+        let serverFd = listenSocket(at: path)
+        defer { Darwin.close(serverFd); unlink(path) }
+
+        let conn = try UnixSocketConnection(path: path)
+
+        let closed = expectation(description: "onClose fired")
+        var firedOnMain = false
+        conn.setOnClose {
+            firedOnMain = Thread.isMainThread
+            closed.fulfill()
+        }
+        conn.setReceiver { _ in }          // starts the read loop
+        let clientFd = accept(serverFd, nil, nil)    // ensure the connection is established
+        precondition(clientFd >= 0)
+        Darwin.close(clientFd)                // peer closes -> read() returns 0 -> loop exits
+
+        wait(for: [closed], timeout: 2.0)
+        XCTAssertTrue(firedOnMain, "onClose must be delivered on the main thread")
+        conn.disconnect()
+    }
+
+    func testOnCloseFiresAtMostOnce() throws {
+        let path = NSTemporaryDirectory() + "muxy-once-\(UUID().uuidString).sock"
+        let serverFd = listenSocket(at: path)
+        defer { Darwin.close(serverFd); unlink(path) }
+
+        let conn = try UnixSocketConnection(path: path)
+        var count = 0
+        let fired = expectation(description: "onClose fired once")
+        fired.assertForOverFulfill = false
+        conn.setOnClose { count += 1; fired.fulfill() }
+        conn.setReceiver { _ in }
+        let clientFd = accept(serverFd, nil, nil)
+        precondition(clientFd >= 0)
+        Darwin.close(clientFd)
+
+        conn.disconnect()                   // triggers loop exit
+        wait(for: [fired], timeout: 2.0)
+        conn.disconnect()                   // idempotent, must not fire again
+        RunLoop.main.run(until: Date().addingTimeInterval(0.2))
+        XCTAssertEqual(count, 1)
+    }
 }

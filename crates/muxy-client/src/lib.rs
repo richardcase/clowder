@@ -22,6 +22,11 @@ impl Drop for RawModeGuard {
     }
 }
 
+/// Build a Resize message for the pane (pure; unit-tested).
+pub fn resize_msg(pane: PaneId, cols: u16, rows: u16) -> ClientToDaemon {
+    ClientToDaemon::Resize { pane, cols, rows }
+}
+
 /// Connect to the daemon's raw-mode socket and attach to `pane_id`, pumping
 /// stdin/stdout until the pane exits or the terminal is detached.
 pub async fn attach(pane_id: u64) -> Result<()> {
@@ -34,9 +39,29 @@ pub async fn attach(pane_id: u64) -> Result<()> {
     let _guard = RawModeGuard::enable()?;
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
-    pump(stream, pane, stdin, stdout).await
-    // _guard drops here (on any exit path, including unwind), restoring raw mode;
-    // pump's Result is returned directly, unmasked.
+
+    // Resize source: send the current size immediately, then on each SIGWINCH.
+    let (tx, rx) = tokio::sync::mpsc::channel::<(u16, u16)>(8);
+    if let Ok((cols, rows)) = crossterm::terminal::size() {
+        let _ = tx.send((cols, rows)).await;
+    }
+    let winch_tx = tx.clone();
+    tokio::spawn(async move {
+        if let Ok(mut sig) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
+        {
+            while sig.recv().await.is_some() {
+                if let Ok((cols, rows)) = crossterm::terminal::size() {
+                    if winch_tx.send((cols, rows)).await.is_err() {
+                        break; // pump gone
+                    }
+                }
+            }
+        }
+    });
+
+    pump(stream, pane, stdin, stdout, rx).await
+    // _guard drops here, restoring raw mode; pump's Result is returned unmasked.
 }
 
 /// Connect the JSON control socket, request a spawn, and return the new pane id.
@@ -73,7 +98,13 @@ pub async fn spawn_via_control(
     }
 }
 
-pub async fn pump<S, R, W>(io: S, pane: PaneId, mut input: R, mut output: W) -> Result<()>
+pub async fn pump<S, R, W>(
+    io: S,
+    pane: PaneId,
+    mut input: R,
+    mut output: W,
+    mut resizes: tokio::sync::mpsc::Receiver<(u16, u16)>,
+) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
     R: AsyncRead + Unpin + Send,
@@ -91,6 +122,9 @@ where
                     Ok(n) => msgs.send(&ClientToDaemon::Input { pane, bytes: buf[..n].to_vec() }).await?,
                     Err(_) => break,
                 }
+            }
+            Some((cols, rows)) = resizes.recv() => {
+                msgs.send(&resize_msg(pane, cols, rows)).await?;
             }
             msg = msgs.recv::<DaemonToClient>() => {
                 match msg? {
@@ -117,6 +151,40 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    #[test]
+    fn resize_msg_builds_resize_variant() {
+        let m = resize_msg(PaneId(7), 120, 40);
+        assert_eq!(m, ClientToDaemon::Resize { pane: PaneId(7), cols: 120, rows: 40 });
+    }
+
+    #[tokio::test]
+    async fn pump_forwards_resize_from_channel() {
+        use muxy_proto::MsgStream;
+        let pane = PaneId(3);
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (tx, rx) = tokio::sync::mpsc::channel::<(u16, u16)>(8);
+
+        // Empty stdin (never yields) and a sink stdout.
+        let (input_reader, _input_writer) = tokio::io::duplex(64);
+        let (_out_reader, out_writer) = tokio::io::duplex(64);
+
+        let pump_task = tokio::spawn(async move {
+            pump(client_io, pane, input_reader, out_writer, rx).await
+        });
+
+        tx.send((100, 40)).await.unwrap();
+
+        let mut server = MsgStream::new(server_io);
+        // First frame is Attach, then our Resize.
+        let first: ClientToDaemon = server.recv().await.unwrap().unwrap();
+        assert_eq!(first, ClientToDaemon::Attach { pane });
+        let second: ClientToDaemon = server.recv().await.unwrap().unwrap();
+        assert_eq!(second, ClientToDaemon::Resize { pane, cols: 100, rows: 40 });
+
+        drop(tx);
+        pump_task.abort();
+    }
+
     fn sh(script: &str) -> PaneCommand {
         PaneCommand {
             program: "/bin/sh".into(),
@@ -140,8 +208,9 @@ mod tests {
         // pump writes into `out_writer`; test reads `out_reader`.
         let (mut out_reader, out_writer) = tokio::io::duplex(64 * 1024);
 
+        let (_resize_tx, resize_rx) = tokio::sync::mpsc::channel::<(u16, u16)>(8);
         let pump_task = tokio::spawn(async move {
-            pump(client_io, pane, input_reader, out_writer).await
+            pump(client_io, pane, input_reader, out_writer, resize_rx).await
         });
 
         input_writer.write_all(b"hello\n").await.unwrap();

@@ -75,8 +75,39 @@ final class SurfaceView: NSView {
         pushSize()
     }
 
-    override func keyDown(with event: NSEvent) { sendKey(event, GHOSTTY_ACTION_PRESS) }
+    // Accumulates text the IME commits during interpretKeyEvents/handleEvent.
+    private var keyTextAccumulator: [String]?
+    private var markedText = ""
+
+    override func keyDown(with event: NSEvent) {
+        keyTextAccumulator = []
+        let handledByIME = inputContext?.handleEvent(event) ?? false
+        let commits = keyTextAccumulator ?? []
+        keyTextAccumulator = nil
+
+        // IME committed text -> send it as text and stop.
+        if !commits.isEmpty {
+            for t in commits { sendText(t) }
+            return
+        }
+        // Still composing: setMarkedText already pushed preedit. Stop.
+        if handledByIME && hasMarkedText() { return }
+        // Not consumed by IME: encode normally (Enter, Ctrl-*, arrows, plain char).
+        sendKey(event, GHOSTTY_ACTION_PRESS)
+    }
+
     override func keyUp(with event: NSEvent) { sendKey(event, GHOSTTY_ACTION_RELEASE) }
+
+    private func sendText(_ text: String) {
+        guard let surface, !text.isEmpty else { return }
+        text.withCString { ghostty_surface_text(surface, $0, UInt(strlen($0))) }
+    }
+
+    private func asString(_ any: Any) -> String? {
+        if let s = any as? String { return s }
+        if let a = any as? NSAttributedString { return a.string }
+        return nil
+    }
 
     /// Forward a key via `ghostty_surface_key` (libghostty encodes Enter/Backspace/
     /// Ctrl-* itself from the keycode/mods; `text` is set only for printable input).
@@ -102,6 +133,43 @@ final class SurfaceView: NSView {
         }
     }
 
+    // MARK: - Mouse
+
+    private func mousePoint(_ event: NSEvent) -> (Double, Double) {
+        let p = convert(event.locationInWindow, from: nil)
+        // libghostty wants a top-left origin; AppKit's is bottom-left.
+        return (Double(p.x), Double(bounds.height - p.y))
+    }
+
+    private func sendMousePos(_ event: NSEvent) {
+        guard let surface else { return }
+        let (x, y) = mousePoint(event)
+        ghostty_surface_mouse_pos(surface, x, y, ghosttyMods(event.modifierFlags))
+    }
+
+    private func sendMouseButton(_ event: NSEvent,
+                                 _ state: ghostty_input_mouse_state_e,
+                                 _ button: ghostty_input_mouse_button_e) {
+        guard let surface else { return }
+        sendMousePos(event)
+        _ = ghostty_surface_mouse_button(surface, state, button, ghosttyMods(event.modifierFlags))
+    }
+
+    override func mouseDown(with e: NSEvent)  { sendMouseButton(e, GHOSTTY_MOUSE_PRESS,   GHOSTTY_MOUSE_LEFT) }
+    override func mouseUp(with e: NSEvent)    { sendMouseButton(e, GHOSTTY_MOUSE_RELEASE, GHOSTTY_MOUSE_LEFT) }
+    override func mouseDragged(with e: NSEvent) { sendMousePos(e) }
+    override func rightMouseDown(with e: NSEvent)  { sendMouseButton(e, GHOSTTY_MOUSE_PRESS,   GHOSTTY_MOUSE_RIGHT) }
+    override func rightMouseUp(with e: NSEvent)    { sendMouseButton(e, GHOSTTY_MOUSE_RELEASE, GHOSTTY_MOUSE_RIGHT) }
+    override func rightMouseDragged(with e: NSEvent) { sendMousePos(e) }
+    override func otherMouseDown(with e: NSEvent)  { sendMouseButton(e, GHOSTTY_MOUSE_PRESS,   GHOSTTY_MOUSE_MIDDLE) }
+    override func otherMouseUp(with e: NSEvent)    { sendMouseButton(e, GHOSTTY_MOUSE_RELEASE, GHOSTTY_MOUSE_MIDDLE) }
+    override func otherMouseDragged(with e: NSEvent) { sendMousePos(e) }
+
+    override func scrollWheel(with e: NSEvent) {
+        guard let surface else { return }
+        ghostty_surface_mouse_scroll(surface, Double(e.scrollingDeltaX), Double(e.scrollingDeltaY), 0)
+    }
+
     private func ghosttyMods(_ flags: NSEvent.ModifierFlags) -> ghostty_input_mods_e {
         var raw: UInt32 = 0
         if flags.contains(.shift) { raw |= GHOSTTY_MODS_SHIFT.rawValue }
@@ -113,5 +181,63 @@ final class SurfaceView: NSView {
 
     deinit {
         if let surface { ghostty_surface_free(surface) }
+    }
+}
+
+extension SurfaceView: NSTextInputClient {
+    func insertText(_ string: Any, replacementRange: NSRange) {
+        guard let s = asString(string) else { return }
+        if keyTextAccumulator != nil {
+            keyTextAccumulator?.append(s)      // committed during keyDown
+        } else {
+            sendText(s)
+        }
+        markedText = ""
+        if let surface { ghostty_surface_preedit(surface, nil, 0) }  // clear preedit
+    }
+
+    func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {
+        markedText = asString(string) ?? ""
+        guard let surface else { return }
+        if markedText.isEmpty {
+            ghostty_surface_preedit(surface, nil, 0)
+        } else {
+            markedText.withCString { ghostty_surface_preedit(surface, $0, UInt(strlen($0))) }
+        }
+    }
+
+    func unmarkText() {
+        markedText = ""
+        if let surface { ghostty_surface_preedit(surface, nil, 0) }
+    }
+
+    func hasMarkedText() -> Bool { !markedText.isEmpty }
+
+    func markedRange() -> NSRange {
+        markedText.isEmpty ? NSRange(location: NSNotFound, length: 0)
+                           : NSRange(location: 0, length: markedText.utf16.count)
+    }
+
+    func selectedRange() -> NSRange { NSRange(location: NSNotFound, length: 0) }
+
+    func attributedSubstring(forProposedRange range: NSRange,
+                             actualRange: NSRangePointer?) -> NSAttributedString? { nil }
+
+    func validAttributesForMarkedText() -> [NSAttributedString.Key] { [] }
+
+    func characterIndex(for point: NSPoint) -> Int { 0 }
+
+    func firstRect(forCharacterRange range: NSRange, actualRange: NSRangePointer?) -> NSRect {
+        guard let surface, let window else { return .zero }
+        var x = 0.0, y = 0.0, w = 0.0, h = 0.0
+        ghostty_surface_ime_point(surface, &x, &y, &w, &h)   // top-left origin, points
+        let local = NSRect(x: x, y: bounds.height - y, width: max(w, 1), height: max(h, 1))
+        let inWindow = convert(local, to: nil)
+        return window.convertToScreen(inWindow)
+    }
+
+    override func doCommand(by selector: Selector) {
+        // Intentionally empty: keyDown's fallback path encodes command keys
+        // (Enter, Backspace, arrows) via ghostty_surface_key.
     }
 }
