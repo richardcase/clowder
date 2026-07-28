@@ -17,6 +17,7 @@ struct SplitContainer: View {
                 .overlay(
                     RoundedRectangle(cornerRadius: 3)
                         .strokeBorder(focusedPane == pane ? Color.accentColor : Color.clear, lineWidth: 2)
+                        .allowsHitTesting(false)
                 )
         case let .split(_, axis, ratio, first, second):
             GeometryReader { geo in
