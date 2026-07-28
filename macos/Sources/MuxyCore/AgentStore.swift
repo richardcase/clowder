@@ -29,6 +29,9 @@ public final class AgentStore: ObservableObject {
             agents[pane] = nil // idempotent
         case let .error(message):
             lastError = message
+        case .splitTreeChanged:
+            // Split tree changes are handled by PaneTreeStore, not by AgentStore
+            break
         }
     }
 

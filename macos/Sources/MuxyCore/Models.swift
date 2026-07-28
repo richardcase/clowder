@@ -29,8 +29,12 @@ public struct AgentInfo: Codable, Identifiable, Equatable, Sendable {
 public enum ControlRequest: Encodable, Equatable, Sendable {
     case listAgents
     case spawnAgent(project: String, task: String, adapter: String)
+    case splitPane(pane: UInt64, direction: SplitDirection)
+    case closePane(pane: UInt64)
+    case setSplitRatio(split: UInt64, ratio: Double)
+    case getSplitTree(agent: UInt64)
 
-    private enum CodingKeys: String, CodingKey { case type, project, task, adapter }
+    private enum CodingKeys: String, CodingKey { case type, project, task, adapter, pane, direction, split, ratio, agent }
 
     public func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
@@ -42,6 +46,20 @@ public enum ControlRequest: Encodable, Equatable, Sendable {
             try c.encode(project, forKey: .project)
             try c.encode(task, forKey: .task)
             try c.encode(adapter, forKey: .adapter)
+        case let .splitPane(pane, direction):
+            try c.encode("splitPane", forKey: .type)
+            try c.encode(pane, forKey: .pane)
+            try c.encode(direction, forKey: .direction)
+        case let .closePane(pane):
+            try c.encode("closePane", forKey: .type)
+            try c.encode(pane, forKey: .pane)
+        case let .setSplitRatio(split, ratio):
+            try c.encode("setSplitRatio", forKey: .type)
+            try c.encode(split, forKey: .split)
+            try c.encode(ratio, forKey: .ratio)
+        case let .getSplitTree(agent):
+            try c.encode("getSplitTree", forKey: .type)
+            try c.encode(agent, forKey: .agent)
         }
     }
 }
@@ -53,8 +71,9 @@ public enum ControlEvent: Decodable, Equatable, Sendable {
     case agentRemoved(pane: UInt64)
     case agentSpawned(pane: UInt64)
     case error(message: String)
+    case splitTreeChanged(agent: UInt64, tree: PaneTree)
 
-    private enum CodingKeys: String, CodingKey { case type, agents, pane, state, message }
+    private enum CodingKeys: String, CodingKey { case type, agents, pane, state, message, agent, tree }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -72,6 +91,10 @@ public enum ControlEvent: Decodable, Equatable, Sendable {
             self = .agentSpawned(pane: try c.decode(UInt64.self, forKey: .pane))
         case "error":
             self = .error(message: try c.decode(String.self, forKey: .message))
+        case "splitTreeChanged":
+            self = .splitTreeChanged(
+                agent: try c.decode(UInt64.self, forKey: .agent),
+                tree: try c.decode(PaneTree.self, forKey: .tree))
         default:
             throw DecodingError.dataCorruptedError(
                 forKey: .type, in: c, debugDescription: "unknown control event type: \(type)")
