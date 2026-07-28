@@ -14,6 +14,8 @@ public final class AppModel: ObservableObject {
     public let store: AgentStore
     @Published public var selectedPane: UInt64?
     @Published public private(set) var connectionState: ConnectionState = .connecting
+    @Published public var showingPalette: Bool = false
+    @Published public var showingSpawn: Bool = false
 
     private let makeTransport: () throws -> ControlTransport
     private var connection: ControlTransport?
@@ -57,6 +59,35 @@ public final class AppModel: ObservableObject {
             try session.send(.spawnAgent(project: project, task: task, adapter: adapter))
         } catch {
             connectionState = .closed(reason: "Send failed: \(error)")
+        }
+    }
+
+    /// Select the 1-based Nth agent in the ordered list (Cmd-N). No-op if out of range.
+    public func selectAgent(atIndex index: Int) {
+        let ordered = store.orderedAgents
+        guard index >= 1, index <= ordered.count else { return }
+        selectedPane = ordered[index - 1].pane
+    }
+
+    /// Select the next agent needing input after the current selection, cycling. If the
+    /// current selection isn't needy, select the first needy one; no-op if none need input.
+    public func selectNextAttention() {
+        let needy = store.orderedAgents.filter { $0.state == .needsInput }
+        guard !needy.isEmpty else { return }
+        if let cur = selectedPane, let idx = needy.firstIndex(where: { $0.pane == cur }) {
+            selectedPane = needy[(idx + 1) % needy.count].pane
+        } else {
+            selectedPane = needy[0].pane
+        }
+    }
+
+    /// Dispatch a command by id.
+    public func run(_ id: CommandID) {
+        switch id {
+        case .openPalette: showingPalette.toggle()
+        case .spawnAgent: showingSpawn = true
+        case .nextAttention: selectNextAttention()
+        case let .switchToAgent(i): selectAgent(atIndex: i)
         }
     }
 
