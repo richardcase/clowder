@@ -4,6 +4,7 @@ use crate::{Pane, PaneCommand};
 use anyhow::Result;
 use muxy_proto::AttentionState;
 use muxy_proto::{ClientToDaemon, DaemonToClient, MsgStream, PaneId};
+use muxy_proto::{PaneTree, SplitDirection, SplitId};
 use muxy_workspace::{GitWorktreeDriver, Workspace, WorkspaceDriver};
 use std::collections::HashMap;
 use std::path::Path;
@@ -19,6 +20,11 @@ struct AgentMeta {
     task: String,
 }
 
+/// The command for a companion pane: the login shell, rooted in the worktree, with no hook env.
+pub(crate) fn companion_command(shell: String, cwd: std::path::PathBuf) -> PaneCommand {
+    PaneCommand { program: shell, args: vec![], cwd: Some(cwd), env: vec![] }
+}
+
 pub struct Daemon {
     panes: Arc<Mutex<HashMap<PaneId, Arc<Pane>>>>,
     next_id: AtomicU64,
@@ -31,6 +37,10 @@ pub struct Daemon {
     driver: Arc<dyn WorkspaceDriver>,
     notifier: Arc<dyn Notifier>,
     hook_sock: PathBuf,
+    trees: Arc<Mutex<HashMap<PaneId, PaneTree>>>, // agent pane -> split tree
+    owner: Arc<Mutex<HashMap<PaneId, PaneId>>>,   // any leaf pane -> its agent
+    next_split_id: AtomicU64,
+    split_tx: broadcast::Sender<(PaneId, PaneTree)>,
 }
 
 impl Daemon {
@@ -49,6 +59,7 @@ impl Daemon {
     ) -> Daemon {
         let (attention_tx, _) = broadcast::channel(256);
         let (removed_tx, _) = broadcast::channel(256);
+        let (split_tx, _) = broadcast::channel(256);
         Daemon {
             panes: Arc::new(Mutex::new(HashMap::new())),
             next_id: AtomicU64::new(1),
@@ -61,6 +72,10 @@ impl Daemon {
             driver,
             notifier,
             hook_sock,
+            trees: Arc::new(Mutex::new(HashMap::new())),
+            owner: Arc::new(Mutex::new(HashMap::new())),
+            next_split_id: AtomicU64::new(1),
+            split_tx,
         }
     }
 
@@ -137,6 +152,8 @@ impl Daemon {
             AgentMeta { project: project_name, task: task.to_string() },
         );
         self.set_attention(id, AttentionState::Working);
+        self.trees.lock().unwrap().insert(id, PaneTree::Leaf { pane: id });
+        self.owner.lock().unwrap().insert(id, id);
 
         if let Some(pane_arc) = self.panes.lock().unwrap().get(&id).cloned() {
             let me = Arc::clone(self);
@@ -156,6 +173,24 @@ impl Daemon {
 
     /// Kill the agent's process and remove its worktree; drop all per-pane state.
     pub fn teardown_agent(&self, pane: PaneId) -> Result<()> {
+        // Cascade: kill every companion pane in this agent's tree.
+        let companions: Vec<PaneId> = self
+            .trees
+            .lock()
+            .unwrap()
+            .get(&pane)
+            .map(|t| crate::split_tree::leaves(t).into_iter().filter(|p| *p != pane).collect())
+            .unwrap_or_default();
+        for c in &companions {
+            if let Some(p) = self.get(*c) {
+                let _ = p.kill();
+            }
+            self.panes.lock().unwrap().remove(c);
+            self.owner.lock().unwrap().remove(c);
+        }
+        self.trees.lock().unwrap().remove(&pane);
+        self.owner.lock().unwrap().remove(&pane);
+
         if let Some(p) = self.get(pane) {
             let _ = p.kill();
         }
@@ -171,6 +206,110 @@ impl Daemon {
         self.agents.lock().unwrap().remove(&pane);
         let _ = self.removed_tx.send(pane);
         Ok(())
+    }
+
+    pub fn subscribe_splits(&self) -> broadcast::Receiver<(PaneId, PaneTree)> {
+        self.split_tx.subscribe()
+    }
+
+    pub fn split_tree_of(&self, agent: PaneId) -> Option<PaneTree> {
+        self.trees.lock().unwrap().get(&agent).cloned()
+    }
+
+    /// SplitTreeChanged for `agent`, or an Error event if it has no tree.
+    pub fn tree_event(&self, agent: PaneId) -> muxy_proto::ControlEvent {
+        match self.split_tree_of(agent) {
+            Some(tree) => muxy_proto::ControlEvent::SplitTreeChanged { agent, tree },
+            None => muxy_proto::ControlEvent::Error { message: format!("no split tree for {agent:?}") },
+        }
+    }
+
+    fn broadcast_tree(&self, agent: PaneId) {
+        if let Some(tree) = self.split_tree_of(agent) {
+            let _ = self.split_tx.send((agent, tree));
+        }
+    }
+
+    fn alloc_split_id(&self) -> SplitId {
+        SplitId(self.next_split_id.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Split `target` (a leaf) by spawning a companion shell in its agent's worktree.
+    pub fn split_pane(&self, target: PaneId, direction: SplitDirection) -> Result<PaneId> {
+        let agent = *self
+            .owner
+            .lock()
+            .unwrap()
+            .get(&target)
+            .ok_or_else(|| anyhow::anyhow!("unknown pane {target:?}"))?;
+        let path = self
+            .workspaces
+            .lock()
+            .unwrap()
+            .get(&agent)
+            .map(|w| w.path.clone())
+            .ok_or_else(|| anyhow::anyhow!("no workspace for agent {agent:?}"))?;
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+        let companion = self.spawn_pane(companion_command(shell, path), 80, 24)?;
+        let sid = self.alloc_split_id();
+        {
+            let mut trees = self.trees.lock().unwrap();
+            let tree = trees
+                .get_mut(&agent)
+                .ok_or_else(|| anyhow::anyhow!("no split tree for {agent:?}"))?;
+            crate::split_tree::split_leaf(tree, target, companion, direction, sid);
+        }
+        self.owner.lock().unwrap().insert(companion, agent);
+        self.broadcast_tree(agent);
+        Ok(companion)
+    }
+
+    /// Close a companion pane (collapsing the tree), or teardown the agent if `pane` is one.
+    /// Returns Some(agent) if a companion was closed, None if an agent was torn down.
+    pub fn close_pane(&self, pane: PaneId) -> Result<Option<PaneId>> {
+        let is_agent = self.trees.lock().unwrap().contains_key(&pane);
+        if is_agent {
+            self.teardown_agent(pane)?;
+            return Ok(None);
+        }
+        let agent = *self
+            .owner
+            .lock()
+            .unwrap()
+            .get(&pane)
+            .ok_or_else(|| anyhow::anyhow!("unknown pane {pane:?}"))?;
+        if let Some(p) = self.get(pane) {
+            let _ = p.kill();
+        }
+        self.panes.lock().unwrap().remove(&pane);
+        if let Some(tree) = self.trees.lock().unwrap().get_mut(&agent) {
+            crate::split_tree::remove_leaf(tree, pane);
+        }
+        self.owner.lock().unwrap().remove(&pane);
+        self.broadcast_tree(agent);
+        Ok(Some(agent))
+    }
+
+    /// Move a divider. Returns the owning agent so callers can emit its tree.
+    pub fn set_split_ratio(&self, split: SplitId, ratio: f32) -> Result<PaneId> {
+        let mut found = None;
+        {
+            let mut trees = self.trees.lock().unwrap();
+            for (agent, tree) in trees.iter_mut() {
+                if crate::split_tree::set_ratio(tree, split, ratio) {
+                    found = Some(*agent);
+                    break;
+                }
+            }
+        }
+        let agent = found.ok_or_else(|| anyhow::anyhow!("unknown split {split:?}"))?;
+        self.broadcast_tree(agent);
+        Ok(agent)
+    }
+
+    /// The agent owning any leaf (or the agent itself).
+    pub fn owner_of(&self, pane: PaneId) -> Option<PaneId> {
+        self.owner.lock().unwrap().get(&pane).copied()
     }
 
     pub fn list_agents(&self) -> Vec<muxy_proto::AgentInfo> {
@@ -784,5 +923,114 @@ mod tests {
             }
         }
         assert_eq!(removed, Some(pane));
+    }
+
+    /// Temp git repo + a daemon wired up the same way the other integration tests build one.
+    fn daemon_with_repo() -> (Arc<Daemon>, tempfile::TempDir) {
+        use crate::FakeNotifier;
+        use muxy_workspace::GitWorktreeDriver;
+        use std::process::Command as PCommand;
+
+        let repo = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            assert!(PCommand::new("git").arg("-C").arg(repo.path()).args(args).status().unwrap().success());
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@t.test"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(repo.path().join("README.md"), b"hi").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-qm", "init"]);
+
+        let daemon = Arc::new(Daemon::new_with(
+            Arc::new(GitWorktreeDriver),
+            Arc::new(FakeNotifier::new()),
+            std::path::PathBuf::from("/tmp/unused-split-tree.sock"),
+        ));
+        (daemon, repo)
+    }
+
+    #[test]
+    fn companion_command_uses_shell_and_worktree_cwd() {
+        let cmd = companion_command("/bin/zsh".into(), std::path::PathBuf::from("/tmp/wt"));
+        assert_eq!(cmd.program, "/bin/zsh");
+        assert_eq!(cmd.cwd, Some(std::path::PathBuf::from("/tmp/wt")));
+        assert!(cmd.args.is_empty());
+        assert!(cmd.env.is_empty()); // no hook env on a companion
+    }
+
+    #[tokio::test]
+    async fn split_close_and_teardown_manage_the_tree() {
+        use crate::split_tree;
+
+        // temp git repo + daemon with the shell adapter (reuse the existing helpers/pattern)
+        let (daemon, repo) = daemon_with_repo();
+        let agent = daemon
+            .spawn_agent(
+                repo.path(),
+                &crate::agent::SyntheticAdapter {
+                    command: PaneCommand {
+                        program: "/bin/sh".into(),
+                        args: vec!["-c".into(), "sleep 30".into()],
+                        cwd: None,
+                        env: vec![],
+                    },
+                },
+                "task",
+            )
+            .unwrap();
+
+        // fresh tree is a lone leaf
+        assert_eq!(daemon.split_tree_of(agent), Some(PaneTree::Leaf { pane: agent }));
+
+        // split → companion pane exists, tree is a split with two leaves
+        let mut rx = daemon.subscribe_splits();
+        let comp = daemon.split_pane(agent, SplitDirection::Right).unwrap();
+        assert!(daemon.get(comp).is_some(), "companion pane must exist");
+        let tree = daemon.split_tree_of(agent).unwrap();
+        assert_eq!(split_tree::leaves(&tree), vec![agent, comp]);
+        let (bagent, _btree) = rx.try_recv().expect("SplitTreeChanged broadcast");
+        assert_eq!(bagent, agent);
+
+        // nested split on the companion → 3 leaves
+        let comp2 = daemon.split_pane(comp, SplitDirection::Down).unwrap();
+        assert_eq!(split_tree::leaves(&daemon.split_tree_of(agent).unwrap()).len(), 3);
+
+        // close one companion → collapses, pane gone
+        daemon.close_pane(comp2).unwrap();
+        assert!(daemon.get(comp2).is_none());
+        assert_eq!(split_tree::leaves(&daemon.split_tree_of(agent).unwrap()), vec![agent, comp]);
+
+        // teardown the agent → all companions gone, tree dropped
+        daemon.teardown_agent(agent).unwrap();
+        assert!(daemon.get(comp).is_none(), "companion must be killed on teardown");
+        assert!(daemon.split_tree_of(agent).is_none());
+    }
+
+    #[tokio::test]
+    async fn set_ratio_updates_and_broadcasts() {
+        let (daemon, repo) = daemon_with_repo();
+        let agent = daemon
+            .spawn_agent(
+                repo.path(),
+                &crate::agent::SyntheticAdapter {
+                    command: PaneCommand {
+                        program: "/bin/sh".into(),
+                        args: vec!["-c".into(), "sleep 30".into()],
+                        cwd: None,
+                        env: vec![],
+                    },
+                },
+                "t",
+            )
+            .unwrap();
+        let _comp = daemon.split_pane(agent, SplitDirection::Right).unwrap();
+        // the split created has id 1 (first split allocated)
+        daemon.set_split_ratio(SplitId(1), 0.7).unwrap();
+        if let Some(PaneTree::Split { ratio, .. }) = daemon.split_tree_of(agent) {
+            assert!((ratio - 0.7).abs() < 1e-6);
+        } else {
+            panic!("expected a split")
+        }
     }
 }
