@@ -1,0 +1,73 @@
+import Foundation
+
+public enum CommandID: Hashable, Sendable {
+    case openPalette
+    case spawnAgent
+    case nextAttention
+    case switchToAgent(Int)   // 1-based position in the ordered agent list
+}
+
+public struct KeyModifiers: OptionSet, Hashable, Sendable {
+    public let rawValue: Int
+    public init(rawValue: Int) { self.rawValue = rawValue }
+    public static let command = KeyModifiers(rawValue: 1 << 0)
+    public static let shift   = KeyModifiers(rawValue: 1 << 1)
+    public static let option  = KeyModifiers(rawValue: 1 << 2)
+    public static let control = KeyModifiers(rawValue: 1 << 3)
+}
+
+public struct KeyBinding: Hashable, Sendable {
+    public let key: Character
+    public let modifiers: KeyModifiers
+    public init(_ key: Character, _ modifiers: KeyModifiers) {
+        self.key = key
+        self.modifiers = modifiers
+    }
+}
+
+public struct Command: Identifiable, Sendable {
+    public let id: CommandID
+    public let title: String
+    public let subtitle: String?
+    public var defaultShortcut: KeyBinding?
+    public init(id: CommandID, title: String, subtitle: String? = nil, defaultShortcut: KeyBinding? = nil) {
+        self.id = id
+        self.title = title
+        self.subtitle = subtitle
+        self.defaultShortcut = defaultShortcut
+    }
+}
+
+public struct Keymap: Sendable {
+    private let overrides: [CommandID: KeyBinding]
+    public init(overrides: [CommandID: KeyBinding] = [:]) { self.overrides = overrides }
+
+    public static let defaults: [CommandID: KeyBinding] = {
+        var m: [CommandID: KeyBinding] = [
+            .openPalette:   KeyBinding("k", .command),
+            .spawnAgent:    KeyBinding("n", .command),
+            .nextAttention: KeyBinding("a", [.command, .shift]),
+        ]
+        for i in 1...9 { m[.switchToAgent(i)] = KeyBinding(Character("\(i)"), .command) }
+        return m
+    }()
+
+    public func binding(for id: CommandID) -> KeyBinding? {
+        overrides[id] ?? Keymap.defaults[id]
+    }
+}
+
+public enum CommandRegistry {
+    /// Palette-visible commands (rows). `switchToAgent`/`openPalette` are bindings, not
+    /// rows — agent-switching lives in the palette's agent section.
+    public static func all(keymap: Keymap) -> [Command] {
+        [
+            Command(id: .spawnAgent, title: "Spawn Agent",
+                    subtitle: "Start a new agent",
+                    defaultShortcut: keymap.binding(for: .spawnAgent)),
+            Command(id: .nextAttention, title: "Next Attention",
+                    subtitle: "Jump to the next agent needing input",
+                    defaultShortcut: keymap.binding(for: .nextAttention)),
+        ]
+    }
+}

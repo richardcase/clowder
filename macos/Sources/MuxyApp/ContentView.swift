@@ -4,7 +4,6 @@ import MuxyCore
 struct ContentView: View {
     @EnvironmentObject var model: AppModel
     let surfaceHost: SurfaceHost
-    @State private var showingSpawn = false
 
     var body: some View {
         NavigationSplitView {
@@ -15,17 +14,27 @@ struct ContentView: View {
         }
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
-                Button { showingSpawn = true } label: { Image(systemName: "plus") }
+                Button { model.showingSpawn = true } label: { Image(systemName: "plus") }
                     .disabled(model.connectionState != .live)
                     .help("Spawn a new agent")
             }
         }
-        .sheet(isPresented: $showingSpawn) {
+        .sheet(isPresented: $model.showingSpawn) {
             SpawnSheet { project, task, adapter in
                 model.spawn(project: project, task: task, adapter: adapter)
             }
         }
         .safeAreaInset(edge: .bottom) { statusBar }
+        .overlay {
+            if model.showingPalette {
+                ZStack(alignment: .top) {
+                    Color.black.opacity(0.2).ignoresSafeArea()
+                        .onTapGesture { model.showingPalette = false }
+                    CommandPaletteView()
+                        .padding(.top, 80)
+                }
+            }
+        }
     }
 
     private var sidebar: some View {

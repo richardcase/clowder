@@ -43,4 +43,8 @@ public final class AgentStore: ObservableObject {
             .map { (project: $0.key, agents: $0.value.sorted { $0.pane < $1.pane }) }
             .sorted { $0.project < $1.project }
     }
+
+    /// The sidebar order flattened: agents grouped by project, projects sorted, agents by pane.
+    /// The stable index order used by Cmd-1…9 and the palette.
+    public var orderedAgents: [AgentInfo] { byProject.flatMap { $0.agents } }
 }

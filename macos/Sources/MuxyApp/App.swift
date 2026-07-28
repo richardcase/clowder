@@ -82,6 +82,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 @main
 struct MuxyApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
+    private let keymap = Keymap()
 
     var body: some Scene {
         WindowGroup {
@@ -92,5 +93,41 @@ struct MuxyApp: App {
                 .environmentObject(boot.appModel)
                 .frame(minWidth: 900, minHeight: 560)
         }
+        .commands {
+            // muxy is a single-window app; remove the default File > New Window (frees ⌘N
+            // for Spawn Agent instead of opening a second window).
+            CommandGroup(replacing: .newItem) { }
+
+            CommandMenu("muxy") {
+                menuItem("Command Palette", .openPalette)
+                menuItem("Spawn Agent", .spawnAgent)
+                menuItem("Next Attention", .nextAttention)
+                Divider()
+                ForEach(1...9, id: \.self) { i in
+                    menuItem("Switch to Agent \(i)", .switchToAgent(i))
+                }
+            }
+        }
+    }
+
+    // A menu button that runs a command via the shared AppModel and carries its shortcut.
+    @ViewBuilder
+    private func menuItem(_ title: String, _ id: CommandID) -> some View {
+        Button(title) { delegate.appModel?.run(id) }
+            .keyboardShortcut(shortcut(id))
+    }
+
+    private func shortcut(_ id: CommandID) -> KeyboardShortcut {
+        guard let b = keymap.binding(for: id) else { return KeyboardShortcut("?", modifiers: []) }
+        return KeyboardShortcut(KeyEquivalent(b.key), modifiers: eventModifiers(b.modifiers))
+    }
+
+    private func eventModifiers(_ m: KeyModifiers) -> EventModifiers {
+        var e: EventModifiers = []
+        if m.contains(.command) { e.insert(.command) }
+        if m.contains(.shift)   { e.insert(.shift) }
+        if m.contains(.option)  { e.insert(.option) }
+        if m.contains(.control) { e.insert(.control) }
+        return e
     }
 }
