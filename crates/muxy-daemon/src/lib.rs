@@ -4,6 +4,7 @@ pub mod server;
 pub mod notify;
 pub mod attention;
 pub mod control_json;
+mod split_tree;
 pub use agent::{AgentAdapter, ClaudeAdapter, SyntheticAdapter};
 pub use pane::{Pane, PaneCommand};
 pub use server::Daemon;
