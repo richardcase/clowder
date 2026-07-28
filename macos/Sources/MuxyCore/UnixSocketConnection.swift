@@ -9,6 +9,8 @@ public final class UnixSocketConnection: ControlTransport {
     private let readQueue = DispatchQueue(label: "muxy.control.read")
     private var isRunning = true
     private var isClosed = false
+    private var onClose: (() -> Void)?
+    private var didFireClose = false   // read/written only on the main queue
 
     public init(path: String) throws {
         fd = socket(AF_UNIX, SOCK_STREAM, 0)
@@ -43,6 +45,16 @@ public final class UnixSocketConnection: ControlTransport {
         readQueue.async { [weak self] in self?.readLoop() }
     }
 
+    public func setOnClose(_ handler: @escaping () -> Void) {
+        self.onClose = handler
+    }
+
+    private func fireClose() {          // always invoked on the main queue
+        guard !didFireClose else { return }
+        didFireClose = true
+        onClose?()
+    }
+
     private func readLoop() {
         var buf = [UInt8](repeating: 0, count: 4096)
         var lineBuffer = LineBuffer()
@@ -54,10 +66,13 @@ public final class UnixSocketConnection: ControlTransport {
                 DispatchQueue.main.async { [weak self] in self?.receiver?(line) }
             }
         }
+        DispatchQueue.main.async { [weak self] in self?.fireClose() }
     }
 
     /// Proactively close the connection: unblocks the read loop and closes the fd.
     /// Idempotent; also called from deinit.
+    /// Note: if called before `setReceiver` ever starts the loop, no close fires — the handler
+    /// is about an established channel dying, which is the F2 case.
     public func disconnect() {
         guard !isClosed else { return }
         isClosed = true
