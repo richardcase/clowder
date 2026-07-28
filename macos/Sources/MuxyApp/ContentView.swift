@@ -65,18 +65,27 @@ struct ContentView: View {
     @ViewBuilder private var statusBar: some View {
         VStack(spacing: 0) {
             if case let .closed(reason) = model.connectionState {
+                // Live connection state — persists until reconnect, so not dismissable.
                 banner(reason, color: .red)
             } else if let err = model.store.lastError {
-                banner(err, color: .orange)
+                // A one-shot error — dismissable.
+                banner(err, color: .orange, onDismiss: { model.dismissError() })
             }
         }
     }
 
-    private func banner(_ text: String, color: Color) -> some View {
+    private func banner(_ text: String, color: Color, onDismiss: (() -> Void)? = nil) -> some View {
         HStack {
             Image(systemName: "exclamationmark.triangle.fill")
             Text(text).lineLimit(2)
             Spacer()
+            if let onDismiss {
+                Button(action: onDismiss) {
+                    Image(systemName: "xmark.circle.fill")
+                }
+                .buttonStyle(.plain)
+                .help("Dismiss")
+            }
         }
         .font(.callout)
         .padding(8)

@@ -60,6 +60,9 @@ public final class AppModel: ObservableObject {
         }
     }
 
+    /// Dismiss the current error banner.
+    public func dismissError() { store.clearLastError() }
+
     /// Explicit teardown (F1): never rely on deinit — the read loop keeps the
     /// connection alive while parked in read().
     public func shutdown() {

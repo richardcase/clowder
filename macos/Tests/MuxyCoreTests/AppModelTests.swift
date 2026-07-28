@@ -84,4 +84,14 @@ final class AppModelTests: XCTestCase {
         wait(for: [exp], timeout: 1.0)
         c.cancel()
     }
+
+    func testDismissErrorClearsLastError() {
+        let fake = FakeControlTransport()
+        let model = AppModel(makeTransport: { fake })
+        model.connect()
+        fake.deliver(#"{"type":"error","message":"boom"}"#)
+        XCTAssertEqual(model.store.lastError, "boom")
+        model.dismissError()
+        XCTAssertNil(model.store.lastError)
+    }
 }

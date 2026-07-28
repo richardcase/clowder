@@ -34,6 +34,9 @@ public final class AgentStore: ObservableObject {
 
     public func clearRefresh() { needsRefresh = false }
 
+    /// Dismiss the current error (clears the error banner).
+    public func clearLastError() { lastError = nil }
+
     /// Agents grouped by project (projects sorted; agents within a project sorted by pane).
     public var byProject: [(project: String, agents: [AgentInfo])] {
         Dictionary(grouping: agents.values, by: { $0.project })
