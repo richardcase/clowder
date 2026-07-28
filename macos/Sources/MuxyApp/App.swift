@@ -64,6 +64,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         bootstrap()
+        // Launched as a bare executable (not a .app bundle), a SwiftUI app does not
+        // become the frontmost/active app on its own, so keystrokes go to whatever was
+        // in front. Claim regular-app status and activate — restoring what the old
+        // hand-rolled main.swift did (setActivationPolicy(.regular) + activate).
+        NSApp.setActivationPolicy(.regular)
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     func applicationWillTerminate(_ notification: Notification) {
