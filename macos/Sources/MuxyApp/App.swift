@@ -106,6 +106,11 @@ struct MuxyApp: App {
                 ForEach(1...9, id: \.self) { i in
                     menuItem("Switch to Agent \(i)", .switchToAgent(i))
                 }
+                Divider()
+                menuItem("Split Right", .splitRight)
+                menuItem("Split Down", .splitDown)
+                menuItem("Close Pane", .closePane)
+                menuItem("Focus Next Pane", .focusNextPane)
             }
         }
     }

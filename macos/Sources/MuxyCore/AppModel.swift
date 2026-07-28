@@ -12,7 +12,13 @@ public final class AppModel: ObservableObject {
     }
 
     public let store: AgentStore
-    @Published public var selectedPane: UInt64?
+    @Published public var selectedPane: UInt64? {
+        didSet {
+            focusedPane = selectedPane            // focus the agent pane on (re)select
+            if let agent = selectedPane { try? session?.send(.getSplitTree(agent: agent)) }
+        }
+    }
+    @Published public var focusedPane: UInt64?
     @Published public private(set) var connectionState: ConnectionState = .connecting
     @Published public var showingPalette: Bool = false
     @Published public var showingSpawn: Bool = false
@@ -81,6 +87,30 @@ public final class AppModel: ObservableObject {
         }
     }
 
+    /// The selected agent's split tree, or nil (the detail falls back to a lone leaf).
+    public var currentTree: PaneTree? { selectedPane.flatMap { store.trees[$0] } }
+
+    public func splitFocused(_ direction: SplitDirection) {
+        guard let target = focusedPane ?? selectedPane, session != nil else { return }
+        try? session?.send(.splitPane(pane: target, direction: direction))
+    }
+
+    public func closeFocused() {
+        // Only companions are closable here; closing the agent pane is teardown (out of scope).
+        guard let f = focusedPane, f != selectedPane, session != nil else { return }
+        try? session?.send(.closePane(pane: f))
+        focusedPane = selectedPane            // optimistic: the leaf is going away
+    }
+
+    public func focusNextPane() {
+        guard let leaves = currentTree?.leaves, !leaves.isEmpty else { return }
+        if let f = focusedPane, let i = leaves.firstIndex(of: f) {
+            focusedPane = leaves[(i + 1) % leaves.count]
+        } else {
+            focusedPane = leaves.first
+        }
+    }
+
     /// Dispatch a command by id.
     public func run(_ id: CommandID) {
         switch id {
@@ -88,6 +118,10 @@ public final class AppModel: ObservableObject {
         case .spawnAgent: showingSpawn = true
         case .nextAttention: selectNextAttention()
         case let .switchToAgent(i): selectAgent(atIndex: i)
+        case .splitRight: splitFocused(.right)
+        case .splitDown: splitFocused(.down)
+        case .closePane: closeFocused()
+        case .focusNextPane: focusNextPane()
         }
     }
 

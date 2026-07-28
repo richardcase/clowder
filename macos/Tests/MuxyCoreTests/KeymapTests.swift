@@ -19,7 +19,7 @@ final class KeymapTests: XCTestCase {
 
     func testRegistryRows() {
         let rows = CommandRegistry.all(keymap: Keymap())
-        XCTAssertEqual(rows.map(\.id), [.spawnAgent, .nextAttention])
+        XCTAssertEqual(rows.map(\.id), [.spawnAgent, .nextAttention, .splitRight, .splitDown, .closePane, .focusNextPane])
         XCTAssertEqual(rows[0].title, "Spawn Agent")
         XCTAssertEqual(rows[0].defaultShortcut, KeyBinding("n", .command))
     }

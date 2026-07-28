@@ -5,6 +5,10 @@ public enum CommandID: Hashable, Sendable {
     case spawnAgent
     case nextAttention
     case switchToAgent(Int)   // 1-based position in the ordered agent list
+    case splitRight
+    case splitDown
+    case closePane
+    case focusNextPane
 }
 
 public struct KeyModifiers: OptionSet, Hashable, Sendable {
@@ -47,6 +51,10 @@ public struct Keymap: Sendable {
             .openPalette:   KeyBinding("k", .command),
             .spawnAgent:    KeyBinding("n", .command),
             .nextAttention: KeyBinding("a", [.command, .shift]),
+            .splitRight:    KeyBinding("d", .command),
+            .splitDown:     KeyBinding("d", [.command, .shift]),
+            .closePane:     KeyBinding("w", [.command, .shift]),
+            .focusNextPane: KeyBinding("]", .command),
         ]
         for i in 1...9 { m[.switchToAgent(i)] = KeyBinding(Character("\(i)"), .command) }
         return m
@@ -68,6 +76,14 @@ public enum CommandRegistry {
             Command(id: .nextAttention, title: "Next Attention",
                     subtitle: "Jump to the next agent needing input",
                     defaultShortcut: keymap.binding(for: .nextAttention)),
+            Command(id: .splitRight, title: "Split Right", subtitle: "Split the focused pane rightward",
+                    defaultShortcut: keymap.binding(for: .splitRight)),
+            Command(id: .splitDown, title: "Split Down", subtitle: "Split the focused pane downward",
+                    defaultShortcut: keymap.binding(for: .splitDown)),
+            Command(id: .closePane, title: "Close Pane", subtitle: "Close the focused companion pane",
+                    defaultShortcut: keymap.binding(for: .closePane)),
+            Command(id: .focusNextPane, title: "Focus Next Pane", subtitle: "Move focus to the next pane",
+                    defaultShortcut: keymap.binding(for: .focusNextPane)),
         ]
     }
 }
