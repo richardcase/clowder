@@ -14,9 +14,9 @@ final class PaletteSearchTests: XCTestCase {
 
     func testEmptyQueryReturnsAllCommandsThenAgents() {
         let r = paletteResults(query: "", commands: cmds, agents: agents())
-        XCTAssertEqual(r.count, 4)
-        XCTAssertTrue(isCommand(r[0]) && isCommand(r[1]))
-        XCTAssertTrue(!isCommand(r[2]) && !isCommand(r[3]))
+        XCTAssertEqual(r.count, cmds.count + 2)
+        XCTAssertTrue(r.prefix(cmds.count).allSatisfy(isCommand))
+        XCTAssertTrue(r.suffix(2).allSatisfy { !isCommand($0) })
     }
 
     func testCommandQueryRanksCommandFirst() {
