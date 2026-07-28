@@ -43,17 +43,17 @@ final class AppModelTests: XCTestCase {
         }
     }
 
-    func testSpawnSendsSpawnAgent() {
+    func testSpawnSendsSpawnAgent() throws {
         let fake = FakeControlTransport()
         let model = AppModel(makeTransport: { fake })
         model.connect()
         model.spawn(project: "/tmp/repo", task: "demo", adapter: "claude")
-        XCTAssertTrue(fake.sentLines.contains {
-            $0.contains("\"type\":\"spawnAgent\"") &&
-            $0.contains("\"project\":\"/tmp/repo\"") &&
-            $0.contains("\"task\":\"demo\"") &&
-            $0.contains("\"adapter\":\"claude\"")
-        })
+        let spawnLine = try XCTUnwrap(fake.sentLines.last)
+        let obj = try JSONSerialization.jsonObject(with: Data(spawnLine.utf8)) as? [String: Any]
+        XCTAssertEqual(obj?["type"] as? String, "spawnAgent")
+        XCTAssertEqual(obj?["project"] as? String, "/tmp/repo")
+        XCTAssertEqual(obj?["task"] as? String, "demo")
+        XCTAssertEqual(obj?["adapter"] as? String, "claude")
     }
 
     func testShutdownDisconnectsTransport() {

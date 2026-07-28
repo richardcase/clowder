@@ -45,9 +45,7 @@ public final class ControlSession {
     }
 
     public func send(_ request: ControlRequest) throws {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.withoutEscapingSlashes]
-        let data = try encoder.encode(request)
+        let data = try JSONEncoder().encode(request)
         try transport.send(line: String(decoding: data, as: UTF8.self))
     }
 }
