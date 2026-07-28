@@ -53,13 +53,31 @@ struct ContentView: View {
     }
 
     @ViewBuilder private var detail: some View {
-        if let pane = model.selectedPane, model.store.agents[pane] != nil {
-            TerminalContainer(pane: pane, surfaceHost: surfaceHost)
-                .id(pane)
+        if let pane = model.selectedPane, let agent = model.store.agents[pane] {
+            if agent.state == .exited {
+                // The agent's process is gone: its `muxy attach` has exited and libghostty
+                // would otherwise sit on "Process exited. Press any key to close." Show a
+                // placeholder instead — and never re-attach to a dead pane on re-select.
+                exitedPlaceholder(agent)
+            } else {
+                TerminalContainer(pane: pane, surfaceHost: surfaceHost)
+                    .id(pane)
+            }
         } else {
             Text("Select an agent").foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
+    }
+
+    private func exitedPlaceholder(_ agent: AgentInfo) -> some View {
+        VStack(spacing: 8) {
+            Image(systemName: "moon.zzz.fill")
+                .font(.largeTitle)
+                .foregroundStyle(.secondary)
+            Text("Agent exited").font(.title3)
+            Text(agent.task).foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     @ViewBuilder private var statusBar: some View {
