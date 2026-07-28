@@ -54,6 +54,7 @@ impl Daemon {
                                         Ok(pane) => ControlEvent::AgentSpawned { pane },
                                         Err(e) => ControlEvent::Error { message: e.to_string() },
                                     },
+                                Ok(_) => ControlEvent::Error { message: "request type not yet implemented".to_string() },
                                 Err(e) => ControlEvent::Error { message: format!("bad request: {e}") },
                             };
                             write_event(&mut wr, &ev).await?;
