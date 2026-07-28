@@ -10,7 +10,7 @@ let ghosttyLib = "\(pkgDir)/vendor/libghostty/ghostty-internal.a"
 let package = Package(
     name: "Muxy",
     platforms: [
-        .macOS(.v13),
+        .macOS(.v14),
     ],
     products: [
         .library(name: "MuxyCore", targets: ["MuxyCore"]),
