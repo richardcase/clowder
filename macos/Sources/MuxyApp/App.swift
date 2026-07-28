@@ -6,11 +6,22 @@ import MuxyCore
 // Read by the C wakeup callback (which can't capture Swift context).
 var gApp: ghostty_app_t?
 
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    var appModel: AppModel!
-    var surfaceHost: SurfaceHost!
+    // Optionals, not implicitly-unwrapped: SwiftUI can evaluate the scene body BEFORE
+    // applicationDidFinishLaunching on some macOS versions, so nothing may force-unwrap these.
+    private(set) var appModel: AppModel?
+    private(set) var surfaceHost: SurfaceHost?
 
-    func applicationDidFinishLaunching(_ notification: Notification) {
+    /// One-time libghostty + model initialization. Idempotent and main-thread-only; runs on
+    /// whichever fires first — the SwiftUI scene body or `applicationDidFinishLaunching` — so
+    /// the app never depends on that ordering (the launch-order dependency was crashing at
+    /// startup). Creating the ghostty app object here is run-loop-independent; the wakeup tick
+    /// is queued via DispatchQueue.main and serviced once the run loop is up.
+    @discardableResult
+    func bootstrap() -> (appModel: AppModel, surfaceHost: SurfaceHost) {
+        if let appModel, let surfaceHost { return (appModel, surfaceHost) }
+
         let muxyBinary = ProcessInfo.processInfo.environment["MUXY_BIN"]
             ?? FileManager.default.currentDirectoryPath + "/../target/debug/muxy"
         let socketPath = ProcessInfo.processInfo.environment["MUXY_SOCK"] ?? "/tmp/muxy.sock"
@@ -43,9 +54,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ghostty_app_set_focus(app, true)
 
         // --- model + surface registry ---
-        surfaceHost = SurfaceHost(app: app, muxyBinary: muxyBinary, socketPath: socketPath)
-        appModel = AppModel(makeTransport: { try UnixSocketConnection(path: controlPath) })
-        appModel.connect()
+        let host = SurfaceHost(app: app, muxyBinary: muxyBinary, socketPath: socketPath)
+        let model = AppModel(makeTransport: { try UnixSocketConnection(path: controlPath) })
+        surfaceHost = host
+        appModel = model
+        model.connect()
+        return (model, host)
+    }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        bootstrap()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -61,8 +79,11 @@ struct MuxyApp: App {
 
     var body: some Scene {
         WindowGroup {
-            ContentView(surfaceHost: delegate.surfaceHost)
-                .environmentObject(delegate.appModel)
+            // Bootstrap on first body evaluation if the launch callback hasn't run yet;
+            // idempotent, so a later applicationDidFinishLaunching is a no-op.
+            let boot = delegate.bootstrap()
+            ContentView(surfaceHost: boot.surfaceHost)
+                .environmentObject(boot.appModel)
                 .frame(minWidth: 900, minHeight: 560)
         }
     }
