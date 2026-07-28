@@ -37,6 +37,7 @@ public final class AppModel: ObservableObject {
         // not cascade to the parent automatically under Combine).
         self.storeSubscription = store.objectWillChange.sink { [weak self] _ in
             self?.objectWillChange.send()
+            DispatchQueue.main.async { self?.reconcileFocus() }
         }
     }
 
@@ -108,6 +109,22 @@ public final class AppModel: ObservableObject {
             focusedPane = leaves[(i + 1) % leaves.count]
         } else {
             focusedPane = leaves.first
+        }
+    }
+
+    /// Send a new divider ratio (clamped to [0.05, 0.95], matching the daemon) to the daemon.
+    public func setDividerRatio(split: UInt64, ratio: Double) {
+        guard session != nil else { return }
+        let r = min(0.95, max(0.05, ratio))
+        try? session?.send(.setSplitRatio(split: split, ratio: r))
+    }
+
+    /// If the focused pane is no longer a leaf of the current tree (a companion closed, or an
+    /// external tree change), move focus back to the agent pane.
+    func reconcileFocus() {
+        guard let leaves = currentTree?.leaves else { return }   // no tree → leave focus as-is
+        if let f = focusedPane, !leaves.contains(f) {
+            focusedPane = selectedPane
         }
     }
 
