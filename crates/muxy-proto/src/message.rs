@@ -26,6 +26,9 @@ pub enum DaemonToClient {
 pub enum HookKind {
     Notification,
     Stop,
+    /// The agent is actively working (e.g. Claude's UserPromptSubmit / PreToolUse) —
+    /// clears a prior NeedsInput/Completed back to Working.
+    Active,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

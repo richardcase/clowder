@@ -27,6 +27,7 @@ impl Daemon {
             let state = match event.kind {
                 HookKind::Notification => AttentionState::NeedsInput,
                 HookKind::Stop => AttentionState::Completed,
+                HookKind::Active => AttentionState::Working,
             };
             self.set_attention(event.agent_id, state);
         }
@@ -75,5 +76,37 @@ mod tests {
         assert_eq!(daemon.attention_of(PaneId(7)), Some(AttentionState::NeedsInput));
         // Notifier called.
         assert_eq!(notifier.calls(), vec![(PaneId(7), AttentionState::NeedsInput)]);
+    }
+
+    #[tokio::test]
+    async fn active_hook_clears_attention_back_to_working() {
+        let notifier = Arc::new(FakeNotifier::new());
+        let daemon = Arc::new(Daemon::new_with(
+            Arc::new(GitWorktreeDriver),
+            notifier.clone(),
+            PathBuf::from("/tmp/unused.sock"),
+        ));
+
+        // Deliver each hook over its own connection, awaiting the handler so the
+        // transitions apply in order (handle_hook_conn applies the event then returns).
+        let deliver = |kind: HookKind| {
+            let d = daemon.clone();
+            async move {
+                let (client_io, server_io) = tokio::io::duplex(4096);
+                let handler = tokio::spawn(async move { d.handle_hook_conn(server_io).await.unwrap() });
+                MsgStream::new(client_io)
+                    .send(&HookEvent { agent_id: PaneId(9), kind })
+                    .await
+                    .unwrap();
+                handler.await.unwrap();
+            }
+        };
+
+        // First a Notification puts the agent in NeedsInput...
+        deliver(HookKind::Notification).await;
+        assert_eq!(daemon.attention_of(PaneId(9)), Some(AttentionState::NeedsInput));
+        // ...then an Active hook flips it back to Working.
+        deliver(HookKind::Active).await;
+        assert_eq!(daemon.attention_of(PaneId(9)), Some(AttentionState::Working));
     }
 }

@@ -14,6 +14,7 @@ async fn main() -> Result<()> {
             kind = match args.next().as_deref() {
                 Some("notification") => Some(HookKind::Notification),
                 Some("stop") => Some(HookKind::Stop),
+                Some("active") => Some(HookKind::Active),
                 other => return Err(anyhow!("unknown --event value: {other:?}")),
             };
         }

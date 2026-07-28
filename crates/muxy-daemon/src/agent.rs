@@ -52,8 +52,16 @@ impl AgentAdapter for ClaudeAdapter {
         let hook = |event: &str| {
             serde_json::json!([{ "hooks": [{ "type": "command", "command": format!("'{bin}' --event {event}") }] }])
         };
+        // Notification → NeedsInput, Stop → Completed, and UserPromptSubmit/PreToolUse →
+        // Active (Working) so the attention indicator clears back to green once the agent
+        // resumes work after the user deals with a prompt (or approves a tool).
         let settings = serde_json::json!({
-            "hooks": { "Notification": hook("notification"), "Stop": hook("stop") }
+            "hooks": {
+                "Notification": hook("notification"),
+                "Stop": hook("stop"),
+                "UserPromptSubmit": hook("active"),
+                "PreToolUse": hook("active"),
+            }
         });
         std::fs::write(dir.join("settings.local.json"), serde_json::to_vec_pretty(&settings)?)?;
         Ok(())
@@ -104,6 +112,12 @@ mod tests {
         let stop = v["hooks"]["Stop"][0]["hooks"][0]["command"].as_str().unwrap();
         assert!(notif.contains("muxy-hook") && notif.ends_with("--event notification"), "got: {notif}");
         assert!(stop.contains("muxy-hook") && stop.ends_with("--event stop"), "got: {stop}");
+
+        // UserPromptSubmit + PreToolUse both emit `active` so the indicator returns to Working.
+        let prompt = v["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"].as_str().unwrap();
+        let pretool = v["hooks"]["PreToolUse"][0]["hooks"][0]["command"].as_str().unwrap();
+        assert!(prompt.ends_with("--event active"), "got: {prompt}");
+        assert!(pretool.ends_with("--event active"), "got: {pretool}");
 
         // The hook settings themselves must be git-ignored so they don't get committed
         // into the agent's own branch.
