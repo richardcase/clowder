@@ -11,6 +11,27 @@ pub trait AgentAdapter: Send + Sync {
     fn launch_command(&self, worktree: &Path) -> PaneCommand;
 }
 
+/// Resolve the `muxy-hook` binary the injected hooks should invoke. The agent process
+/// (e.g. `claude`) runs these hooks and does not necessarily have `muxy-hook` on its PATH
+/// — a dev running the daemon from `cargo`/`target/debug` certainly won't — so prefer an
+/// absolute path. Order: `$MUXY_HOOK_BIN`, then a sibling of the running daemon executable
+/// (`target/debug/muxy-hook` next to `muxy-daemon`), then a bare `muxy-hook` (assume PATH).
+pub(crate) fn muxy_hook_bin() -> String {
+    if let Ok(p) = std::env::var("MUXY_HOOK_BIN") {
+        if !p.is_empty() {
+            return p;
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(sibling) = exe.parent().map(|d| d.join("muxy-hook")) {
+            if sibling.exists() {
+                return sibling.to_string_lossy().into_owned();
+            }
+        }
+    }
+    "muxy-hook".to_string()
+}
+
 /// Real Claude Code adapter: writes .claude/settings.local.json whose Notification/Stop
 /// hooks invoke `muxy-hook`, plus a .claude/.gitignore so that hook config isn't committed
 /// into the agent's own branch.
@@ -25,8 +46,11 @@ impl AgentAdapter for ClaudeAdapter {
         let dir = worktree.join(".claude");
         std::fs::create_dir_all(&dir)?;
         std::fs::write(dir.join(".gitignore"), "settings.local.json\n")?;
+        // Single-quote the resolved path so a binary path containing spaces still runs when
+        // the tool executes the hook command through a shell.
+        let bin = muxy_hook_bin();
         let hook = |event: &str| {
-            serde_json::json!([{ "hooks": [{ "type": "command", "command": format!("muxy-hook --event {event}") }] }])
+            serde_json::json!([{ "hooks": [{ "type": "command", "command": format!("'{bin}' --event {event}") }] }])
         };
         let settings = serde_json::json!({
             "hooks": { "Notification": hook("notification"), "Stop": hook("stop") }
@@ -73,11 +97,13 @@ mod tests {
             .unwrap();
         let raw = std::fs::read_to_string(dir.path().join(".claude/settings.local.json")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        // Notification + Stop hooks both call muxy-hook with the right event.
+        // Notification + Stop hooks both invoke muxy-hook with the right event. The binary
+        // is now a resolved (usually absolute) path, so assert on content/suffix, not an
+        // exact bare string.
         let notif = v["hooks"]["Notification"][0]["hooks"][0]["command"].as_str().unwrap();
         let stop = v["hooks"]["Stop"][0]["hooks"][0]["command"].as_str().unwrap();
-        assert_eq!(notif, "muxy-hook --event notification");
-        assert_eq!(stop, "muxy-hook --event stop");
+        assert!(notif.contains("muxy-hook") && notif.ends_with("--event notification"), "got: {notif}");
+        assert!(stop.contains("muxy-hook") && stop.ends_with("--event stop"), "got: {stop}");
 
         // The hook settings themselves must be git-ignored so they don't get committed
         // into the agent's own branch.
