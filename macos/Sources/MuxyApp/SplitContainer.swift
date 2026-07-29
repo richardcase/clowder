@@ -24,6 +24,7 @@ struct SplitContainer: View {
         case let .split(id, axis, ratio, first, second):
             SplitNode(id: id, axis: axis, ratio: ratio, first: first, second: second,
                       surfaceHost: surfaceHost, focusedPane: $focusedPane)
+                .id(id)
         }
     }
 }

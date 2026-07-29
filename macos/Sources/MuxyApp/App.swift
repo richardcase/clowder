@@ -126,7 +126,7 @@ struct MuxyApp: App {
             ContentView(surfaceHost: boot.surfaceHost)
                 .environmentObject(boot.appModel)
                 .frame(minWidth: 900, minHeight: 560)
-                .background(WindowAccessor { window in delegate.adoptWindow(window) })
+                .background(WindowAccessor { [weak d = delegate] window in d?.adoptWindow(window) })
         }
         .commands {
             // muxy is a single-window app; remove the default File > New Window (frees ⌘N
@@ -158,7 +158,10 @@ struct MuxyApp: App {
     }
 
     private func shortcut(_ id: CommandID) -> KeyboardShortcut {
-        guard let b = keymap.binding(for: id) else { return KeyboardShortcut("?", modifiers: []) }
+        guard let b = keymap.binding(for: id) else {
+            assertionFailure("no key binding for \(id)")
+            return KeyboardShortcut("?", modifiers: [])
+        }
         return KeyboardShortcut(KeyEquivalent(b.key), modifiers: eventModifiers(b.modifiers))
     }
 
