@@ -40,7 +40,6 @@ mod tests {
     use super::*;
     use crate::notify::FakeNotifier;
     use muxy_proto::PaneId;
-    use muxy_workspace::GitWorktreeDriver;
     use std::path::PathBuf;
     use std::time::Duration;
 
@@ -48,7 +47,6 @@ mod tests {
     async fn hook_event_updates_attention_broadcasts_and_notifies() {
         let notifier = Arc::new(FakeNotifier::new());
         let daemon = Arc::new(Daemon::new_with(
-            Arc::new(GitWorktreeDriver),
             notifier.clone(),
             PathBuf::from("/tmp/unused.sock"),
         ));
@@ -82,7 +80,6 @@ mod tests {
     async fn active_hook_clears_attention_back_to_working() {
         let notifier = Arc::new(FakeNotifier::new());
         let daemon = Arc::new(Daemon::new_with(
-            Arc::new(GitWorktreeDriver),
             notifier.clone(),
             PathBuf::from("/tmp/unused.sock"),
         ));

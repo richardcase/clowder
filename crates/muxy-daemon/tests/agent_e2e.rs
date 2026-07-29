@@ -27,11 +27,7 @@ async fn provision_spawn_hook_teardown_end_to_end() {
     let hook_sock = hook_dir.path().join("hook.sock");
 
     let notifier = Arc::new(FakeNotifier::new());
-    let daemon = Arc::new(Daemon::new_with(
-        Arc::new(muxy_workspace::GitWorktreeDriver),
-        notifier.clone(),
-        hook_sock.clone(),
-    ));
+    let daemon = Arc::new(Daemon::new_with(notifier.clone(), hook_sock.clone()));
 
     // Serve the hook socket so a simulated agent (below) can post a HookEvent.
     let hook_listener = tokio::net::UnixListener::bind(&hook_sock).unwrap();
@@ -84,11 +80,7 @@ async fn spawn_agent_tears_down_worktree_on_launch_failure() {
     let hook_sock = hook_dir.path().join("hook.sock");
 
     let notifier = Arc::new(FakeNotifier::new());
-    let daemon = Arc::new(Daemon::new_with(
-        Arc::new(muxy_workspace::GitWorktreeDriver),
-        notifier.clone(),
-        hook_sock.clone(),
-    ));
+    let daemon = Arc::new(Daemon::new_with(notifier.clone(), hook_sock.clone()));
 
     // Adapter launches a binary that doesn't exist, simulating the common first-run case
     // where the agent CLI isn't on PATH. Pane::spawn should fail after the worktree has
