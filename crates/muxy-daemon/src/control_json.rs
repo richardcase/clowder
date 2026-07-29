@@ -77,6 +77,14 @@ impl Daemon {
                                         Err(e) => ControlEvent::Error { message: e.to_string() },
                                     },
                                 Ok(ControlRequest::GetSplitTree { agent }) => self.tree_event(agent),
+                                Ok(ControlRequest::LandAgent { pane }) => match self.land_agent(pane) {
+                                    Ok(()) => ControlEvent::AgentRemoved { pane },
+                                    Err(e) => ControlEvent::Error { message: e.to_string() },
+                                },
+                                Ok(ControlRequest::DiscardAgent { pane }) => match self.discard_agent(pane) {
+                                    Ok(()) => ControlEvent::AgentRemoved { pane },
+                                    Err(e) => ControlEvent::Error { message: e.to_string() },
+                                },
                                 Err(e) => ControlEvent::Error { message: format!("bad request: {e}") },
                             };
                             write_event(&mut wr, &ev).await?;

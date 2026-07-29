@@ -141,7 +141,9 @@ impl Daemon {
         })() {
             Ok(p) => p,
             Err(e) => {
-                let _ = self.driver.teardown(&ws);
+                // Nothing was ever landed here; fully clean up (worktree + freshly-created
+                // branch) so a retry with the same task name doesn't collide.
+                let _ = self.driver.discard(&ws);
                 return Err(e);
             }
         };
@@ -207,8 +209,9 @@ impl Daemon {
         self.workspaces.lock().unwrap().get(&pane).cloned()
     }
 
-    /// Kill the agent's process and remove its worktree; drop all per-pane state.
-    pub fn teardown_agent(&self, pane: PaneId) -> Result<()> {
+    /// Kill the agent's process and finalize its workspace (land or discard); drop all
+    /// per-pane state.
+    fn finish_agent(&self, pane: PaneId, land: bool) -> Result<()> {
         // Cascade: kill every companion pane in this agent's tree.
         let companions: Vec<PaneId> = self
             .trees
@@ -238,7 +241,11 @@ impl Daemon {
         }
         self.hookless.lock().unwrap().remove(&pane);
         if let Some(ws) = self.workspace_of(pane) {
-            self.driver.teardown(&ws)?;
+            if land {
+                self.driver.land(&ws)?;
+            } else {
+                self.driver.discard(&ws)?;
+            }
         }
         self.workspaces.lock().unwrap().remove(&pane);
         self.panes.lock().unwrap().remove(&pane);
@@ -246,6 +253,21 @@ impl Daemon {
         self.agents.lock().unwrap().remove(&pane);
         let _ = self.removed_tx.send(pane);
         Ok(())
+    }
+
+    /// Kill the agent's process and remove its worktree without keeping the branch.
+    pub fn teardown_agent(&self, pane: PaneId) -> Result<()> {
+        self.finish_agent(pane, false)
+    }
+
+    /// Finalize the agent's work: commit any dirty changes, remove the worktree, keep the branch.
+    pub fn land_agent(&self, pane: PaneId) -> Result<()> {
+        self.finish_agent(pane, true)
+    }
+
+    /// Throw away the agent's work: remove the worktree and delete its branch.
+    pub fn discard_agent(&self, pane: PaneId) -> Result<()> {
+        self.finish_agent(pane, false)
     }
 
     pub fn subscribe_splits(&self) -> broadcast::Receiver<(PaneId, PaneTree)> {
@@ -1155,6 +1177,39 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         assert_eq!(daemon.attention_of(agent), Some(AttentionState::Working), "input should clear NeedsInput");
+    }
+
+    fn branch_exists(repo: &std::path::Path, name: &str) -> bool {
+        let out = std::process::Command::new("git").arg("-C").arg(repo).args(["branch", "--list", name]).output().unwrap();
+        !out.stdout.is_empty()
+    }
+
+    #[tokio::test]
+    async fn land_agent_keeps_branch_and_removes_agent() {
+        let (daemon, repo) = daemon_with_repo();
+        let agent = daemon.spawn_agent(repo.path(), &crate::agent::SyntheticAdapter {
+            command: PaneCommand { program: "/bin/sh".into(), args: vec!["-c".into(), "sleep 30".into()], cwd: None, env: vec![] },
+        }, "task-a").unwrap();
+        // write some work into the worktree
+        let ws = daemon.workspace_of(agent).unwrap();
+        std::fs::write(ws.path.join("out.txt"), b"work").unwrap();
+
+        daemon.land_agent(agent).unwrap();
+        assert!(daemon.workspace_of(agent).is_none(), "agent workspace removed");
+        assert!(daemon.get(agent).is_none(), "agent pane removed");
+        assert!(branch_exists(repo.path(), "muxy/task-a"), "land keeps the branch");
+    }
+
+    #[tokio::test]
+    async fn discard_agent_deletes_branch_and_removes_agent() {
+        let (daemon, repo) = daemon_with_repo();
+        let agent = daemon.spawn_agent(repo.path(), &crate::agent::SyntheticAdapter {
+            command: PaneCommand { program: "/bin/sh".into(), args: vec!["-c".into(), "sleep 30".into()], cwd: None, env: vec![] },
+        }, "task-b").unwrap();
+        daemon.discard_agent(agent).unwrap();
+        assert!(daemon.workspace_of(agent).is_none());
+        assert!(daemon.get(agent).is_none());
+        assert!(!branch_exists(repo.path(), "muxy/task-b"), "discard deletes the branch");
     }
 
     #[tokio::test]
