@@ -21,8 +21,6 @@ pub trait WorkspaceDriver: Send + Sync {
     fn land(&self, ws: &Workspace) -> Result<()>;
     /// Throw away: remove the working copy and DELETE the branch.
     fn discard(&self, ws: &Workspace) -> Result<()>;
-    /// DEPRECATED (removed in M3a Task 3): remove the working copy, keep the branch.
-    fn teardown(&self, ws: &Workspace) -> Result<()>;
 }
 
 pub struct GitWorktreeDriver;
@@ -81,18 +79,6 @@ impl WorkspaceDriver for GitWorktreeDriver {
         Self::git(&ws.project, &["branch", "-D", &ws.branch])?;   // force-delete the unmerged branch
         Ok(())
     }
-
-    fn teardown(&self, ws: &Workspace) -> Result<()> {
-        let path_str = ws.path.to_string_lossy().to_string();
-        Self::git(&ws.project, &["worktree", "remove", &path_str, "--force"])?;
-        // prune stale registrations from the main repo (best-effort).
-        let _ = Command::new("git")
-            .arg("-C")
-            .arg(&ws.project)
-            .args(["worktree", "prune"])
-            .output();
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -129,16 +115,6 @@ mod tests {
         // A file created only in the worktree is NOT in the main working copy.
         std::fs::write(ws.path.join("only_here.txt"), b"x").unwrap();
         assert!(!repo.path().join("only_here.txt").exists());
-    }
-
-    #[test]
-    fn teardown_removes_worktree() {
-        let repo = init_repo();
-        let driver = GitWorktreeDriver;
-        let ws = driver.provision(repo.path(), "task-b").unwrap();
-        assert!(ws.path.is_dir());
-        driver.teardown(&ws).unwrap();
-        assert!(!ws.path.exists(), "worktree dir still present after teardown");
     }
 
     fn branch_exists(repo: &Path, name: &str) -> bool {
