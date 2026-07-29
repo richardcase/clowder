@@ -33,6 +33,8 @@ public enum ControlRequest: Encodable, Equatable, Sendable {
     case closePane(pane: UInt64)
     case setSplitRatio(split: UInt64, ratio: Double)
     case getSplitTree(agent: UInt64)
+    case landAgent(pane: UInt64)
+    case discardAgent(pane: UInt64)
 
     private enum CodingKeys: String, CodingKey { case type, project, task, adapter, pane, direction, split, ratio, agent }
 
@@ -60,6 +62,12 @@ public enum ControlRequest: Encodable, Equatable, Sendable {
         case let .getSplitTree(agent):
             try c.encode("getSplitTree", forKey: .type)
             try c.encode(agent, forKey: .agent)
+        case let .landAgent(pane):
+            try c.encode("landAgent", forKey: .type)
+            try c.encode(pane, forKey: .pane)
+        case let .discardAgent(pane):
+            try c.encode("discardAgent", forKey: .type)
+            try c.encode(pane, forKey: .pane)
         }
     }
 }
