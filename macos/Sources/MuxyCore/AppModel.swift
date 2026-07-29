@@ -1,6 +1,21 @@
 import Foundation
 import Combine
 
+public enum LifecycleAction: Equatable, Sendable { case land, discard }
+
+/// A Land/Discard awaiting user confirmation (captured at request time so the confirmation
+/// UI can show which agent + task is affected, even if selection changes before confirming).
+public struct PendingLifecycle: Equatable, Sendable {
+    public let action: LifecycleAction
+    public let pane: UInt64
+    public let task: String
+    public init(action: LifecycleAction, pane: UInt64, task: String) {
+        self.action = action
+        self.pane = pane
+        self.task = task
+    }
+}
+
 /// Owns the control channel and the app's selection. Libghostty-free so it is unit-testable.
 /// Retaining `session` is what keeps ControlSession's `[weak self]` receiver alive.
 @MainActor
@@ -22,6 +37,7 @@ public final class AppModel: ObservableObject {
     @Published public private(set) var connectionState: ConnectionState = .connecting
     @Published public var showingPalette: Bool = false
     @Published public var showingSpawn: Bool = false
+    @Published public var pendingLifecycle: PendingLifecycle?
 
     private let makeTransport: () throws -> ControlTransport
     private var connection: ControlTransport?
@@ -139,8 +155,28 @@ public final class AppModel: ObservableObject {
         case .splitDown: splitFocused(.down)
         case .closePane: closeFocused()
         case .focusNextPane: focusNextPane()
+        case .landAgent: requestLifecycle(.land)
+        case .discardAgent: requestLifecycle(.discard)
         }
     }
+
+    /// Begin a Land/Discard: capture the selected agent + task and await confirmation.
+    public func requestLifecycle(_ action: LifecycleAction) {
+        guard let pane = selectedPane, let agent = store.agents[pane] else { return }
+        pendingLifecycle = PendingLifecycle(action: action, pane: pane, task: agent.task)
+    }
+
+    /// Confirmed: send the request and clear.
+    public func confirmLifecycle() {
+        guard let p = pendingLifecycle else { return }
+        switch p.action {
+        case .land: try? session?.send(.landAgent(pane: p.pane))
+        case .discard: try? session?.send(.discardAgent(pane: p.pane))
+        }
+        pendingLifecycle = nil
+    }
+
+    public func cancelLifecycle() { pendingLifecycle = nil }
 
     /// Dismiss the current error banner.
     public func dismissError() { store.clearLastError() }

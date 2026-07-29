@@ -9,6 +9,8 @@ public enum CommandID: Hashable, Sendable {
     case splitDown
     case closePane
     case focusNextPane
+    case landAgent
+    case discardAgent
 }
 
 public struct KeyModifiers: OptionSet, Hashable, Sendable {
@@ -55,6 +57,7 @@ public struct Keymap: Sendable {
             .splitDown:     KeyBinding("d", [.command, .shift]),
             .closePane:     KeyBinding("w", [.command, .shift]),
             .focusNextPane: KeyBinding("]", .command),
+            .landAgent:     KeyBinding("l", .command),
         ]
         for i in 1...9 { m[.switchToAgent(i)] = KeyBinding(Character("\(i)"), .command) }
         return m
@@ -84,6 +87,12 @@ public enum CommandRegistry {
                     defaultShortcut: keymap.binding(for: .closePane)),
             Command(id: .focusNextPane, title: "Focus Next Pane", subtitle: "Move focus to the next pane",
                     defaultShortcut: keymap.binding(for: .focusNextPane)),
+            Command(id: .landAgent, title: "Land Agent",
+                    subtitle: "Finalize the selected agent's work onto its branch",
+                    defaultShortcut: keymap.binding(for: .landAgent)),
+            Command(id: .discardAgent, title: "Discard Agent",
+                    subtitle: "Throw away the selected agent's work + delete its branch",
+                    defaultShortcut: keymap.binding(for: .discardAgent)),
         ]
     }
 }

@@ -35,6 +35,32 @@ struct ContentView: View {
                 }
             }
         }
+        .confirmationDialog(
+            lifecycleTitle,
+            isPresented: Binding(
+                get: { model.pendingLifecycle != nil },
+                set: { if !$0 { model.cancelLifecycle() } }
+            ),
+            presenting: model.pendingLifecycle
+        ) { pending in
+            Button(pending.action == .discard ? "Discard" : "Land",
+                   role: pending.action == .discard ? .destructive : nil) {
+                model.confirmLifecycle()
+            }
+            Button("Cancel", role: .cancel) { model.cancelLifecycle() }
+        } message: { pending in
+            Text(pending.action == .discard
+                 ? "Deletes branch muxy/\(pending.task) and its work. This can't be undone."
+                 : "Finalizes the work onto branch muxy/\(pending.task) and removes the agent.")
+        }
+    }
+
+    private var lifecycleTitle: String {
+        switch model.pendingLifecycle?.action {
+        case .discard: return "Discard this agent?"
+        case .land: return "Land this agent?"
+        case nil: return ""
+        }
     }
 
     private var sidebar: some View {
