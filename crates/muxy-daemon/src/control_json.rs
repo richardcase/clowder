@@ -1,5 +1,5 @@
+use crate::build_adapter;
 use crate::server::Daemon;
-use crate::{ClaudeAdapter, PaneCommand, SyntheticAdapter};
 use anyhow::{anyhow, Result};
 use muxy_proto::{ControlEvent, ControlRequest, PaneId};
 use std::path::Path;
@@ -122,17 +122,8 @@ impl Daemon {
 
     fn spawn_from_control(self: &Arc<Self>, project: &str, task: &str, adapter: &str) -> Result<PaneId> {
         let project_path = Path::new(project);
-        match adapter {
-            "claude" => self.spawn_agent(project_path, &ClaudeAdapter, task),
-            "shell" => {
-                let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-                let a = SyntheticAdapter {
-                    command: PaneCommand { program: shell, args: vec![], cwd: None, env: vec![] },
-                };
-                self.spawn_agent(project_path, &a, task)
-            }
-            other => Err(anyhow!("unknown adapter: {other}")),
-        }
+        let a = build_adapter(adapter).ok_or_else(|| anyhow!("unknown adapter: {adapter}"))?;
+        self.spawn_agent(project_path, a.as_ref(), task)
     }
 }
 

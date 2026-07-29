@@ -79,6 +79,36 @@ impl AgentAdapter for ClaudeAdapter {
     }
 }
 
+/// OpenAI Codex adapter. Codex's legacy `notify` fires only on `agent-turn-complete`,
+/// invoking an arbitrary program with a JSON string as the trailing argv arg. A project
+/// `.codex/config.toml` cannot set `notify` (a machine-local key), so we wire it at launch
+/// via `-c`. muxy-hook self-IDs from the MUXY_AGENT_ID/MUXY_HOOK_SOCK env the daemon injects
+/// and ignores the trailing JSON, so turn-complete → `--event stop` → Completed.
+pub struct CodexAdapter;
+
+impl AgentAdapter for CodexAdapter {
+    fn id(&self) -> &'static str {
+        "codex"
+    }
+
+    fn provision_hooks(&self, _worktree: &Path, _agent_id: PaneId, _hook_sock: &Path) -> Result<()> {
+        // No file to write: the notify hook is a launch argument, not provisioned config.
+        Ok(())
+    }
+
+    fn launch_command(&self, _worktree: &Path) -> PaneCommand {
+        let bin = muxy_hook_bin();
+        // TOML array-of-argv value for the `-c notify=` override. Quote the resolved
+        // muxy-hook path so a path containing spaces still parses.
+        let notify = format!("notify=[\"{bin}\",\"--event\",\"stop\"]");
+        PaneCommand { program: "codex".into(), args: vec!["-c".into(), notify], cwd: None, env: vec![] }
+    }
+
+    fn provides_hooks(&self) -> bool {
+        true
+    }
+}
+
 /// Test adapter: runs a caller-supplied benign command in the worktree and drops a marker
 /// file instead of real hooks. No live agent, no network.
 pub struct SyntheticAdapter {
@@ -101,6 +131,36 @@ impl AgentAdapter for SyntheticAdapter {
 
     fn provides_hooks(&self) -> bool {
         false
+    }
+}
+
+/// A spawnable adapter's stable id + human label (single source of truth for spawn + M4b discovery).
+pub struct AdapterDescriptor {
+    pub id: &'static str,
+    pub display_name: &'static str,
+}
+
+/// The adapters a client may spawn.
+pub fn adapter_descriptors() -> &'static [AdapterDescriptor] {
+    &[
+        AdapterDescriptor { id: "claude", display_name: "Claude Code" },
+        AdapterDescriptor { id: "codex", display_name: "OpenAI Codex" },
+        AdapterDescriptor { id: "shell", display_name: "Shell" },
+    ]
+}
+
+/// Construct an adapter by id, or `None` for an unknown id.
+pub fn build_adapter(id: &str) -> Option<Box<dyn AgentAdapter>> {
+    match id {
+        "claude" => Some(Box::new(ClaudeAdapter)),
+        "codex" => Some(Box::new(CodexAdapter)),
+        "shell" => {
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+            Some(Box::new(SyntheticAdapter {
+                command: PaneCommand { program: shell, args: vec![], cwd: None, env: vec![] },
+            }))
+        }
+        _ => None,
     }
 }
 
@@ -146,5 +206,38 @@ mod tests {
             gitignore.lines().any(|l| l.trim() == "settings.local.json"),
             "expected .claude/.gitignore to contain settings.local.json, got: {gitignore:?}"
         );
+    }
+
+    #[test]
+    fn codex_launch_command_wires_notify_to_muxy_hook() {
+        let cmd = CodexAdapter.launch_command(std::path::Path::new("/tmp/ws"));
+        assert_eq!(cmd.program, "codex");
+        let bin = crate::agent::muxy_hook_bin();
+        // Codex fires notify only on agent-turn-complete → --event stop → Completed.
+        assert_eq!(cmd.args, vec!["-c".to_string(), format!("notify=[\"{bin}\",\"--event\",\"stop\"]")]);
+    }
+
+    #[test]
+    fn codex_provides_hooks_and_provision_writes_nothing() {
+        assert!(CodexAdapter.provides_hooks(), "codex has a native notify hook");
+        assert_eq!(CodexAdapter.id(), "codex");
+        let dir = tempfile::tempdir().unwrap();
+        CodexAdapter.provision_hooks(dir.path(), PaneId(1), std::path::Path::new("/tmp/s.sock")).unwrap();
+        // provision is a no-op for codex (hook is a launch arg, not a file).
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0, "codex provision must write nothing");
+    }
+
+    #[test]
+    fn registry_builds_known_adapters_and_rejects_unknown() {
+        assert_eq!(build_adapter("claude").unwrap().id(), "claude");
+        assert_eq!(build_adapter("codex").unwrap().id(), "codex");
+        assert_eq!(build_adapter("shell").unwrap().id(), "synthetic"); // shell → SyntheticAdapter
+        assert!(build_adapter("nope").is_none());
+    }
+
+    #[test]
+    fn registry_descriptors_list_claude_codex_shell() {
+        let ids: Vec<&str> = adapter_descriptors().iter().map(|d| d.id).collect();
+        assert!(ids.contains(&"claude") && ids.contains(&"codex") && ids.contains(&"shell"));
     }
 }

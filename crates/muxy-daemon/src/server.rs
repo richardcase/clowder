@@ -440,9 +440,13 @@ impl Daemon {
                         Some(ClientToDaemon::Input { bytes, .. }) => {
                             let _ = pane.write_input(&bytes);
                             let pid = pane.id();
-                            if self.hookless.lock().unwrap().contains(&pid)
-                                && self.attention_of(pid) == Some(AttentionState::NeedsInput)
-                            {
+                            // User engaged with an agent whose attention was "waiting" → back to Working.
+                            // Applies to all agents: hook-less (VT/BEL) AND hook'd tools like Codex that
+                            // only emit a turn-complete signal and no "resumed" event.
+                            if matches!(
+                                self.attention_of(pid),
+                                Some(AttentionState::NeedsInput | AttentionState::Completed)
+                            ) {
                                 self.set_attention(pid, AttentionState::Working);
                             }
                         }
@@ -1157,6 +1161,48 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         assert_eq!(daemon.attention_of(agent), Some(AttentionState::Working), "input should clear NeedsInput");
+    }
+
+    #[tokio::test]
+    async fn input_clears_hooked_completed_to_working() {
+        let (daemon, repo) = daemon_with_repo();
+        let agent = daemon
+            .spawn_agent(
+                repo.path(),
+                &HookedTestAdapter {
+                    cmd: PaneCommand {
+                        program: "/bin/sh".into(),
+                        args: vec!["-c".into(), "sleep 30".into()],
+                        cwd: None,
+                        env: vec![],
+                    },
+                },
+                "task-a",
+            )
+            .unwrap();
+        // A hook'd agent is NOT in `hookless`.
+        daemon.set_attention(agent, AttentionState::Completed);
+        assert_eq!(daemon.attention_of(agent), Some(AttentionState::Completed));
+
+        // Attach a client and send Input (drives handle_conn's input arm), like
+        // input_clears_hookless_needs_input_to_working does.
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let d = daemon.clone();
+        tokio::spawn(async move { let _ = d.handle_conn(server_io).await; });
+
+        let mut client = MsgStream::<_>::new(client_io);
+        client.send(&ClientToDaemon::Attach { pane: agent }).await.unwrap();
+        let _attached: DaemonToClient = client.recv().await.unwrap().unwrap();
+        let _backlog: DaemonToClient = client.recv().await.unwrap().unwrap();
+
+        client.send(&ClientToDaemon::Input { pane: agent, bytes: b"x".to_vec() }).await.unwrap();
+
+        let mut ok = false;
+        for _ in 0..50 {
+            if daemon.attention_of(agent) == Some(AttentionState::Working) { ok = true; break; }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(ok, "input to a hook'd Completed agent must clear to Working");
     }
 
     fn branch_exists(repo: &std::path::Path, name: &str) -> bool {
