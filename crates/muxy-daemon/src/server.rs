@@ -257,7 +257,8 @@ impl Daemon {
             let tree = trees
                 .get_mut(&agent)
                 .ok_or_else(|| anyhow::anyhow!("no split tree for {agent:?}"))?;
-            crate::split_tree::split_leaf(tree, target, companion, direction, sid);
+            let ok = crate::split_tree::split_leaf(tree, target, companion, direction, sid);
+            debug_assert!(ok, "split_leaf: {target:?} is not a leaf in the tree for {agent:?}");
         }
         self.owner.lock().unwrap().insert(companion, agent);
         self.broadcast_tree(agent);
@@ -283,7 +284,8 @@ impl Daemon {
         }
         self.panes.lock().unwrap().remove(&pane);
         if let Some(tree) = self.trees.lock().unwrap().get_mut(&agent) {
-            crate::split_tree::remove_leaf(tree, pane);
+            let removed = crate::split_tree::remove_leaf(tree, pane);
+            debug_assert!(removed, "remove_leaf: {pane:?} is not in the tree for {agent:?}");
         }
         self.owner.lock().unwrap().remove(&pane);
         self.broadcast_tree(agent);
@@ -1004,6 +1006,40 @@ mod tests {
         // teardown the agent → all companions gone, tree dropped
         daemon.teardown_agent(agent).unwrap();
         assert!(daemon.get(comp).is_none(), "companion must be killed on teardown");
+        assert!(daemon.split_tree_of(agent).is_none());
+    }
+
+    #[tokio::test]
+    async fn teardown_kills_multiple_live_companions() {
+        use crate::split_tree;
+
+        let (daemon, repo) = daemon_with_repo();
+        let agent = daemon
+            .spawn_agent(
+                repo.path(),
+                &crate::agent::SyntheticAdapter {
+                    command: PaneCommand {
+                        program: "/bin/sh".into(),
+                        args: vec!["-c".into(), "sleep 30".into()],
+                        cwd: None,
+                        env: vec![],
+                    },
+                },
+                "task",
+            )
+            .unwrap();
+
+        // Two companions, BOTH live at teardown (neither closed first).
+        let c1 = daemon.split_pane(agent, SplitDirection::Right).unwrap();
+        let c2 = daemon.split_pane(agent, SplitDirection::Down).unwrap();
+        assert!(daemon.get(c1).is_some());
+        assert!(daemon.get(c2).is_some());
+        assert_eq!(split_tree::leaves(&daemon.split_tree_of(agent).unwrap()).len(), 3);
+
+        daemon.teardown_agent(agent).unwrap();
+
+        assert!(daemon.get(c1).is_none(), "companion 1 must be killed on teardown");
+        assert!(daemon.get(c2).is_none(), "companion 2 must be killed on teardown");
         assert!(daemon.split_tree_of(agent).is_none());
     }
 
