@@ -12,6 +12,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // applicationDidFinishLaunching on some macOS versions, so nothing may force-unwrap these.
     private(set) var appModel: AppModel?
     private(set) var surfaceHost: SurfaceHost?
+    private var mainWindow: NSWindow?
+    private var windowCloseDelegate: HideOnCloseDelegate?
+    private var statusBar: StatusBarController?
 
     /// One-time libghostty + model initialization. Idempotent and main-thread-only; runs on
     /// whichever fires first — the SwiftUI scene body or `applicationDidFinishLaunching` — so
@@ -59,6 +62,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         surfaceHost = host
         appModel = model
         model.connect()
+        statusBar = StatusBarController(appModel: model, showWindow: { [weak self] in self?.showWindow() })
         return (model, host)
     }
 
@@ -76,7 +80,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         appModel?.shutdown()   // F1: explicit disconnect
     }
 
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
+        showWindow()
+        return true
+    }
+
+    /// Called by WindowAccessor when the window attaches. Runs once; makes the red close
+    /// button hide (not destroy) the window so the app stays menu-bar-resident.
+    func adoptWindow(_ window: NSWindow) {
+        guard mainWindow == nil else { return }
+        mainWindow = window
+        window.isReleasedWhenClosed = false
+        let d = HideOnCloseDelegate()
+        windowCloseDelegate = d
+        window.delegate = d
+    }
+
+    /// Bring the (possibly hidden) window to the front.
+    func showWindow() {
+        mainWindow?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+}
+
+/// Hides the window on close instead of destroying it, so the app stays alive in the menu bar.
+final class HideOnCloseDelegate: NSObject, NSWindowDelegate {
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        sender.orderOut(nil)
+        return false
+    }
 }
 
 @main
@@ -92,6 +126,7 @@ struct MuxyApp: App {
             ContentView(surfaceHost: boot.surfaceHost)
                 .environmentObject(boot.appModel)
                 .frame(minWidth: 900, minHeight: 560)
+                .background(WindowAccessor { window in delegate.adoptWindow(window) })
         }
         .commands {
             // muxy is a single-window app; remove the default File > New Window (frees ⌘N
