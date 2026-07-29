@@ -14,6 +14,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private(set) var surfaceHost: SurfaceHost?
     private var mainWindow: NSWindow?
     private var windowCloseDelegate: HideOnCloseDelegate?
+    private var statusBar: StatusBarController?
 
     /// One-time libghostty + model initialization. Idempotent and main-thread-only; runs on
     /// whichever fires first — the SwiftUI scene body or `applicationDidFinishLaunching` — so
@@ -61,6 +62,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         surfaceHost = host
         appModel = model
         model.connect()
+        statusBar = StatusBarController(appModel: model, showWindow: { [weak self] in self?.showWindow() })
         return (model, host)
     }
 
