@@ -126,6 +126,7 @@ impl WorkspaceDriver for JjDriver {
         // work under a bookmark so it survives forgetting the workspace, then detach + remove.
         Self::jj(&ws.path, &["bookmark", "set", &ws.branch, "-r", "@"])?;
         Self::jj(&ws.project, &["workspace", "forget", &ws_name])?;
+        // Best-effort removal: work is already pinned under the bookmark, so transient lock errors must not fail the operation.
         let _ = std::fs::remove_dir_all(&ws.path);
         Ok(())
     }
@@ -137,6 +138,7 @@ impl WorkspaceDriver for JjDriver {
         // then detach + remove the workspace. No bookmark was created, so nothing persists.
         let _ = Self::jj(&ws.path, &["abandon", "-r", "@"]);
         Self::jj(&ws.project, &["workspace", "forget", &ws_name])?;
+        // Best-effort removal: work was abandoned, so transient lock errors must not fail cleanup.
         let _ = std::fs::remove_dir_all(&ws.path);
         Ok(())
     }
@@ -280,6 +282,13 @@ mod tests {
         String::from_utf8_lossy(&out.stdout).contains(name)
     }
 
+    fn jj_commit_has_file(repo: &Path, rev: &str, file: &str) -> bool {
+        let out = Command::new("jj").arg("-R").arg(repo).args(["file", "list", "-r", rev])
+            .env("JJ_USER", "muxy-test").env("JJ_EMAIL", "muxy@test.invalid")
+            .output().unwrap();
+        String::from_utf8_lossy(&out.stdout).contains(file)
+    }
+
     #[test]
     fn jj_provision_creates_workspace_and_sets_jj_kind() {
         if !jj_available() { return; }
@@ -300,6 +309,8 @@ mod tests {
         JjDriver.land(&ws).unwrap();
         assert!(!ws.path.exists(), "workspace dir should be removed after land");
         assert!(jj_bookmark_exists(repo.path(), "muxy/task-l"), "bookmark should be kept");
+        assert!(jj_commit_has_file(repo.path(), "muxy/task-l", "work.txt"),
+                "landed bookmark must contain the agent's work");
     }
 
     #[test]
