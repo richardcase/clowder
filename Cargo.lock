@@ -669,6 +669,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "muxy-proto",
+ "muxy-vt",
  "muxy-workspace",
  "notify-rust",
  "portable-pty",

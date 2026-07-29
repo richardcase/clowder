@@ -41,6 +41,8 @@ pub struct Daemon {
     owner: Arc<Mutex<HashMap<PaneId, PaneId>>>,   // any leaf pane -> its agent
     next_split_id: AtomicU64,
     split_tx: broadcast::Sender<(PaneId, PaneTree)>,
+    hookless: Arc<Mutex<std::collections::HashSet<PaneId>>>,
+    scanners: Arc<Mutex<HashMap<PaneId, tokio::task::JoinHandle<()>>>>,
 }
 
 impl Daemon {
@@ -76,6 +78,8 @@ impl Daemon {
             owner: Arc::new(Mutex::new(HashMap::new())),
             next_split_id: AtomicU64::new(1),
             split_tx,
+            hookless: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            scanners: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -152,6 +156,32 @@ impl Daemon {
             AgentMeta { project: project_name, task: task.to_string() },
         );
         self.set_attention(id, AttentionState::Working);
+
+        if !adapter.provides_hooks() {
+            self.hookless.lock().unwrap().insert(id);
+            if let Some(pane_arc) = self.panes.lock().unwrap().get(&id).cloned() {
+                let me = Arc::clone(self);
+                let mut rx = pane_arc.subscribe();
+                let handle = tokio::spawn(async move {
+                    let mut scanner = muxy_vt::SignalScanner::new();
+                    loop {
+                        match rx.recv().await {
+                            Ok(chunk) => {
+                                if !scanner.feed(&chunk).is_empty()
+                                    && me.attention_of(id) != Some(AttentionState::NeedsInput)
+                                {
+                                    me.set_attention(id, AttentionState::NeedsInput);
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(_) => break, // pane gone
+                        }
+                    }
+                });
+                self.scanners.lock().unwrap().insert(id, handle);
+            }
+        }
+
         self.trees.lock().unwrap().insert(id, PaneTree::Leaf { pane: id });
         self.owner.lock().unwrap().insert(id, id);
 
@@ -197,6 +227,10 @@ impl Daemon {
         if let Some(handle) = self.watchers.lock().unwrap().remove(&pane) {
             handle.abort();
         }
+        if let Some(h) = self.scanners.lock().unwrap().remove(&pane) {
+            h.abort();
+        }
+        self.hookless.lock().unwrap().remove(&pane);
         if let Some(ws) = self.workspace_of(pane) {
             self.driver.teardown(&ws)?;
         }
@@ -383,7 +417,15 @@ impl Daemon {
                 }
                 incoming = msgs.recv::<ClientToDaemon>() => {
                     match incoming? {
-                        Some(ClientToDaemon::Input { bytes, .. }) => { let _ = pane.write_input(&bytes); }
+                        Some(ClientToDaemon::Input { bytes, .. }) => {
+                            let _ = pane.write_input(&bytes);
+                            let pid = pane.id();
+                            if self.hookless.lock().unwrap().contains(&pid)
+                                && self.attention_of(pid) == Some(AttentionState::NeedsInput)
+                            {
+                                self.set_attention(pid, AttentionState::Working);
+                            }
+                        }
                         Some(ClientToDaemon::Resize { cols, rows, .. }) => { let _ = pane.resize(cols, rows); }
                         Some(ClientToDaemon::Detach) | None => break,
                         Some(ClientToDaemon::Attach { .. }) => continue,
@@ -1041,6 +1083,72 @@ mod tests {
         assert!(daemon.get(c1).is_none(), "companion 1 must be killed on teardown");
         assert!(daemon.get(c2).is_none(), "companion 2 must be killed on teardown");
         assert!(daemon.split_tree_of(agent).is_none());
+    }
+
+    // A test adapter that claims hooks but launches a benign command (so we can assert the
+    // scanner is NOT spawned for hook'd agents without needing the `claude` binary).
+    struct HookedTestAdapter { cmd: PaneCommand }
+    impl crate::agent::AgentAdapter for HookedTestAdapter {
+        fn id(&self) -> &'static str { "hooked-test" }
+        fn provides_hooks(&self) -> bool { true }
+        fn provision_hooks(&self, _w: &std::path::Path, _a: PaneId, _s: &std::path::Path) -> anyhow::Result<()> { Ok(()) }
+        fn launch_command(&self, _w: &std::path::Path) -> PaneCommand { self.cmd.clone() }
+    }
+
+    fn bell_then_sleep() -> PaneCommand {
+        PaneCommand { program: "/bin/sh".into(), args: vec!["-c".into(), "printf '\\a'; sleep 30".into()], cwd: None, env: vec![] }
+    }
+
+    #[tokio::test]
+    async fn hookless_agent_bell_sets_needs_input() {
+        let (daemon, repo) = daemon_with_repo();
+        let agent = daemon.spawn_agent(repo.path(), &crate::agent::SyntheticAdapter { command: bell_then_sleep() }, "t").unwrap();
+        let mut ok = false;
+        for _ in 0..100 {
+            if daemon.attention_of(agent) == Some(AttentionState::NeedsInput) { ok = true; break; }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(ok, "a BEL from a hook-less agent should set NeedsInput");
+    }
+
+    #[tokio::test]
+    async fn hooked_agent_bell_is_ignored() {
+        let (daemon, repo) = daemon_with_repo();
+        let agent = daemon.spawn_agent(repo.path(), &HookedTestAdapter { cmd: bell_then_sleep() }, "t").unwrap();
+        // give the BEL time to be produced; attention must stay Working (no scanner).
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(daemon.attention_of(agent), Some(AttentionState::Working));
+    }
+
+    #[tokio::test]
+    async fn input_clears_hookless_needs_input_to_working() {
+        let (daemon, repo) = daemon_with_repo();
+        let agent = daemon.spawn_agent(repo.path(), &crate::agent::SyntheticAdapter { command: bell_then_sleep() }, "t").unwrap();
+        // wait for NeedsInput
+        for _ in 0..100 {
+            if daemon.attention_of(agent) == Some(AttentionState::NeedsInput) { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(daemon.attention_of(agent), Some(AttentionState::NeedsInput));
+
+        // Attach a client and send Input (drives handle_conn's input arm), like
+        // client_attaches_and_receives_output; then assert it clears to Working.
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let d = daemon.clone();
+        tokio::spawn(async move { let _ = d.handle_conn(server_io).await; });
+
+        let mut client = MsgStream::<_>::new(client_io);
+        client.send(&ClientToDaemon::Attach { pane: agent }).await.unwrap();
+        let _attached: DaemonToClient = client.recv().await.unwrap().unwrap();
+        let _backlog: DaemonToClient = client.recv().await.unwrap().unwrap();
+
+        client.send(&ClientToDaemon::Input { pane: agent, bytes: b"x".to_vec() }).await.unwrap();
+
+        for _ in 0..100 {
+            if daemon.attention_of(agent) == Some(AttentionState::Working) { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(daemon.attention_of(agent), Some(AttentionState::Working), "input should clear NeedsInput");
     }
 
     #[tokio::test]
