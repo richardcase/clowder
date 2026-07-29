@@ -77,6 +77,8 @@ impl Daemon {
                                         Err(e) => ControlEvent::Error { message: e.to_string() },
                                     },
                                 Ok(ControlRequest::GetSplitTree { agent }) => self.tree_event(agent),
+                                Ok(ControlRequest::LandAgent { .. }) | Ok(ControlRequest::DiscardAgent { .. }) =>
+                                    ControlEvent::Error { message: "land/discard not yet wired".into() },
                                 Err(e) => ControlEvent::Error { message: format!("bad request: {e}") },
                             };
                             write_event(&mut wr, &ev).await?;

@@ -36,6 +36,8 @@ pub enum ControlRequest {
     ClosePane { pane: PaneId },
     SetSplitRatio { split: SplitId, ratio: f32 },
     GetSplitTree { agent: PaneId },
+    LandAgent { pane: PaneId },
+    DiscardAgent { pane: PaneId },
 }
 
 /// daemon → GUI/CLI.
@@ -112,6 +114,19 @@ mod tests {
             let s = serde_json::to_string(&r).unwrap();
             assert_eq!(r, serde_json::from_str::<ControlRequest>(&s).unwrap(), "{s}");
         }
+    }
+
+    #[test]
+    fn land_discard_requests_roundtrip() {
+        for r in [
+            ControlRequest::LandAgent { pane: PaneId(3) },
+            ControlRequest::DiscardAgent { pane: PaneId(4) },
+        ] {
+            let s = serde_json::to_string(&r).unwrap();
+            assert_eq!(r, serde_json::from_str::<ControlRequest>(&s).unwrap(), "{s}");
+        }
+        assert!(serde_json::to_string(&ControlRequest::LandAgent { pane: PaneId(3) }).unwrap()
+            .contains(r#""type":"landAgent""#));
     }
 
     #[test]
