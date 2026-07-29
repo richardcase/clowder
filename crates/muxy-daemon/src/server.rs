@@ -161,9 +161,15 @@ impl Daemon {
             self.hookless.lock().unwrap().insert(id);
             if let Some(pane_arc) = self.panes.lock().unwrap().get(&id).cloned() {
                 let me = Arc::clone(self);
-                let mut rx = pane_arc.subscribe();
+                let (snapshot, mut rx) = pane_arc.snapshot_and_subscribe();
                 let handle = tokio::spawn(async move {
                     let mut scanner = muxy_vt::SignalScanner::new();
+                    // Scan output already produced before we subscribed (no lost early signal).
+                    if !scanner.feed(&snapshot).is_empty()
+                        && me.attention_of(id) != Some(AttentionState::NeedsInput)
+                    {
+                        me.set_attention(id, AttentionState::NeedsInput);
+                    }
                     loop {
                         match rx.recv().await {
                             Ok(chunk) => {
