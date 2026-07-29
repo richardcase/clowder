@@ -1,4 +1,4 @@
-use crate::{AgentInfo, AttentionState, PaneId};
+use crate::{AdapterInfo, AgentInfo, AttentionState, PaneId};
 use serde::{Deserialize, Serialize};
 
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Serialize, Deserialize)]
@@ -31,6 +31,7 @@ pub enum PaneTree {
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum ControlRequest {
     ListAgents,
+    ListAdapters,
     SpawnAgent { project: String, task: String, adapter: String },
     SplitPane { pane: PaneId, direction: SplitDirection },
     ClosePane { pane: PaneId },
@@ -45,6 +46,7 @@ pub enum ControlRequest {
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum ControlEvent {
     AgentList { agents: Vec<AgentInfo> },
+    AdapterList { adapters: Vec<AdapterInfo> },
     AttentionChanged { pane: PaneId, state: AttentionState },
     AgentRemoved { pane: PaneId },
     AgentSpawned { pane: PaneId },
@@ -127,6 +129,28 @@ mod tests {
         }
         assert!(serde_json::to_string(&ControlRequest::LandAgent { pane: PaneId(3) }).unwrap()
             .contains(r#""type":"landAgent""#));
+    }
+
+    #[test]
+    fn list_adapters_request_round_trips() {
+        let r = ControlRequest::ListAdapters;
+        let s = serde_json::to_string(&r).unwrap();
+        assert_eq!(s, r#"{"type":"listAdapters"}"#);
+        assert_eq!(serde_json::from_str::<ControlRequest>(&s).unwrap(), r);
+    }
+
+    #[test]
+    fn adapter_list_event_round_trips_with_camelcase() {
+        let ev = ControlEvent::AdapterList {
+            adapters: vec![AdapterInfo { id: "codex".into(), display_name: "OpenAI Codex".into() }],
+        };
+        let s = serde_json::to_string(&ev).unwrap();
+        // type tag camelCase; struct field display_name → displayName.
+        assert_eq!(
+            s,
+            r#"{"type":"adapterList","adapters":[{"id":"codex","displayName":"OpenAI Codex"}]}"#
+        );
+        assert_eq!(serde_json::from_str::<ControlEvent>(&s).unwrap(), ev);
     }
 
     #[test]
