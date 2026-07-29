@@ -9,6 +9,9 @@ pub trait AgentAdapter: Send + Sync {
     fn provision_hooks(&self, worktree: &Path, agent_id: PaneId, hook_sock: &Path) -> Result<()>;
     /// The command to launch the agent (cwd/env are filled in by the daemon).
     fn launch_command(&self, worktree: &Path) -> PaneCommand;
+    /// Whether this adapter injects tool-native attention hooks. If false, the daemon runs the
+    /// VT-signal fallback scanner for the agent instead.
+    fn provides_hooks(&self) -> bool;
 }
 
 /// Resolve the `muxy-hook` binary the injected hooks should invoke. The agent process
@@ -70,6 +73,10 @@ impl AgentAdapter for ClaudeAdapter {
     fn launch_command(&self, _worktree: &Path) -> PaneCommand {
         PaneCommand { program: "claude".into(), args: vec![], cwd: None, env: vec![] }
     }
+
+    fn provides_hooks(&self) -> bool {
+        true
+    }
 }
 
 /// Test adapter: runs a caller-supplied benign command in the worktree and drops a marker
@@ -91,11 +98,24 @@ impl AgentAdapter for SyntheticAdapter {
     fn launch_command(&self, _worktree: &Path) -> PaneCommand {
         self.command.clone()
     }
+
+    fn provides_hooks(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adapters_declare_hook_support() {
+        assert!(ClaudeAdapter.provides_hooks(), "claude has hooks");
+        let synthetic = SyntheticAdapter {
+            command: PaneCommand { program: "/bin/sh".into(), args: vec![], cwd: None, env: vec![] },
+        };
+        assert!(!synthetic.provides_hooks(), "shell/synthetic has no hooks");
+    }
 
     #[test]
     fn claude_adapter_writes_hook_settings() {
