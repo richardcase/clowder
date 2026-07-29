@@ -15,6 +15,9 @@ final class StatusBarController: NSObject {
         self.showWindow = showWindow
         self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         super.init()
+        let menu = NSMenu()
+        menu.delegate = self
+        statusItem.menu = menu
         // objectWillChange fires before the @Published update, so refresh on the next tick.
         cancellable = appModel.objectWillChange.sink { [weak self] _ in
             DispatchQueue.main.async { self?.refresh() }
@@ -22,10 +25,9 @@ final class StatusBarController: NSObject {
         refresh()
     }
 
+    /// Updates only the status button (count/icon); the menu is built lazily on open.
     private func refresh() {
-        let needy = appModel.store.agentsNeedingAttention
-        let n = needy.count
-
+        let n = appModel.store.attentionCount
         if let button = statusItem.button {
             if n > 0 {
                 button.image = NSImage(systemSymbolName: "bell.badge.fill", accessibilityDescription: "agents need attention")
@@ -37,8 +39,28 @@ final class StatusBarController: NSObject {
                 button.title = ""
             }
         }
+    }
 
-        let menu = NSMenu()
+    @discardableResult
+    private func addItem(to menu: NSMenu, _ title: String, _ action: Selector) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+        item.target = self
+        menu.addItem(item)
+        return item
+    }
+
+    @objc private func selectAgent(_ sender: NSMenuItem) {
+        if let pane = sender.representedObject as? UInt64 { appModel.selectedPane = pane }
+        showWindow()
+    }
+    @objc private func showWindowAction() { showWindow() }
+    @objc private func quitAction() { NSApp.terminate(nil) }
+}
+
+extension StatusBarController: NSMenuDelegate {
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        menu.removeAllItems()
+        let needy = appModel.store.agentsNeedingAttention
         if needy.isEmpty {
             let item = NSMenuItem(title: "No agents need attention", action: nil, keyEquivalent: "")
             item.isEnabled = false
@@ -59,22 +81,5 @@ final class StatusBarController: NSObject {
         addItem(to: menu, "Show muxy Window", #selector(showWindowAction))
         let quit = addItem(to: menu, "Quit muxy", #selector(quitAction))
         quit.keyEquivalent = "q"
-
-        statusItem.menu = menu
     }
-
-    @discardableResult
-    private func addItem(to menu: NSMenu, _ title: String, _ action: Selector) -> NSMenuItem {
-        let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
-        item.target = self
-        menu.addItem(item)
-        return item
-    }
-
-    @objc private func selectAgent(_ sender: NSMenuItem) {
-        if let pane = sender.representedObject as? UInt64 { appModel.selectedPane = pane }
-        showWindow()
-    }
-    @objc private func showWindowAction() { showWindow() }
-    @objc private func quitAction() { NSApp.terminate(nil) }
 }
