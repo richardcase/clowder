@@ -146,6 +146,9 @@ struct MuxyApp: App {
                 menuItem("Split Down", .splitDown)
                 menuItem("Close Pane", .closePane)
                 menuItem("Focus Next Pane", .focusNextPane)
+                Divider()
+                menuItem("Land Agent", .landAgent)
+                Button("Discard Agent…") { delegate.appModel?.run(.discardAgent) }
             }
         }
     }
