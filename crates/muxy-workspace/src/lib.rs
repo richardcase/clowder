@@ -1,6 +1,7 @@
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum WorkspaceKind { Git, Jj }
@@ -77,6 +78,66 @@ impl WorkspaceDriver for GitWorktreeDriver {
         Self::git(&ws.project, &["worktree", "remove", "--force", &path_str])?;
         let _ = Command::new("git").arg("-C").arg(&ws.project).args(["worktree", "prune"]).output();
         Self::git(&ws.project, &["branch", "-D", &ws.branch])?;   // force-delete the unmerged branch
+        Ok(())
+    }
+}
+
+/// A jujutsu workspace driver: each agent gets its own `jj workspace` (a working copy
+/// with its own working-copy commit `@`). Sibling to GitWorktreeDriver; shells out to `jj`.
+pub struct JjDriver;
+
+impl JjDriver {
+    fn jj(repo: &Path, args: &[&str]) -> Result<()> {
+        let out = Command::new("jj")
+            .arg("-R")
+            .arg(repo)
+            .args(args)
+            .output()
+            .with_context(|| format!("failed to run jj {args:?}"))?;
+        if !out.status.success() {
+            bail!("jj {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr));
+        }
+        Ok(())
+    }
+}
+
+impl WorkspaceDriver for JjDriver {
+    fn kind(&self) -> WorkspaceKind {
+        WorkspaceKind::Jj
+    }
+
+    fn provision(&self, project: &Path, name: &str) -> Result<Workspace> {
+        let branch = format!("muxy/{name}");
+        let path = project.join(".muxy").join("worktrees").join(name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| "create worktrees parent dir")?;
+        }
+        let ws_name = format!("muxy-{name}");
+        let path_str = path.to_string_lossy().to_string();
+        // Create a jj workspace at `path` with a fresh working-copy commit.
+        Self::jj(project, &["workspace", "add", "--name", &ws_name, &path_str])?;
+        Ok(Workspace { path, branch, project: project.to_path_buf(), kind: WorkspaceKind::Jj })
+    }
+
+    fn land(&self, ws: &Workspace) -> Result<()> {
+        let name = ws.branch.strip_prefix("muxy/").unwrap_or(&ws.branch);
+        let ws_name = format!("muxy-{name}");
+        // jj auto-snapshots the working copy into `@` — nothing to add/commit. Pin the
+        // work under a bookmark so it survives forgetting the workspace, then detach + remove.
+        Self::jj(&ws.path, &["bookmark", "set", &ws.branch, "-r", "@"])?;
+        Self::jj(&ws.project, &["workspace", "forget", &ws_name])?;
+        let _ = std::fs::remove_dir_all(&ws.path);
+        Ok(())
+    }
+
+    fn discard(&self, ws: &Workspace) -> Result<()> {
+        let name = ws.branch.strip_prefix("muxy/").unwrap_or(&ws.branch);
+        let ws_name = format!("muxy-{name}");
+        // Drop the working-copy change (best-effort — an empty `@` needn't block cleanup),
+        // then detach + remove the workspace. No bookmark was created, so nothing persists.
+        let _ = Self::jj(&ws.path, &["abandon", "-r", "@"]);
+        Self::jj(&ws.project, &["workspace", "forget", &ws_name])?;
+        let _ = std::fs::remove_dir_all(&ws.path);
         Ok(())
     }
 }
@@ -162,5 +223,69 @@ mod tests {
         let ws = GitWorktreeDriver.provision(repo.path(), "task-k").unwrap();
         assert_eq!(ws.kind, WorkspaceKind::Git);
         assert_eq!(GitWorktreeDriver.kind(), WorkspaceKind::Git);
+    }
+
+    fn jj_available() -> bool {
+        Command::new("jj").arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
+    }
+
+    /// A fresh jj repo with one snapshotted file. Returns the TempDir (kept alive).
+    fn init_jj_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        let run = |args: &[&str]| {
+            let ok = Command::new("jj").arg("-R").arg(p).args(args)
+                .env("JJ_USER", "muxy-test").env("JJ_EMAIL", "muxy@test.invalid")
+                .status().unwrap().success();
+            assert!(ok, "jj {args:?} failed");
+        };
+        // `jj git init <p>` initialises in place (validate exact form in Step 0).
+        let ok = Command::new("jj").args(["git", "init", &p.to_string_lossy()])
+            .env("JJ_USER", "muxy-test").env("JJ_EMAIL", "muxy@test.invalid")
+            .status().unwrap().success();
+        assert!(ok, "jj git init failed");
+        std::fs::write(p.join("README.md"), b"init").unwrap();
+        run(&["status"]); // force a working-copy snapshot
+        dir
+    }
+
+    fn jj_bookmark_exists(repo: &Path, name: &str) -> bool {
+        let out = Command::new("jj").arg("-R").arg(repo).args(["bookmark", "list"])
+            .env("JJ_USER", "muxy-test").env("JJ_EMAIL", "muxy@test.invalid")
+            .output().unwrap();
+        String::from_utf8_lossy(&out.stdout).contains(name)
+    }
+
+    #[test]
+    fn jj_provision_creates_workspace_and_sets_jj_kind() {
+        if !jj_available() { return; }
+        let repo = init_jj_repo();
+        let ws = JjDriver.provision(repo.path(), "task-j").unwrap();
+        assert!(ws.path.is_dir(), "jj workspace dir not created");
+        assert_eq!(ws.branch, "muxy/task-j");
+        assert_eq!(ws.kind, WorkspaceKind::Jj);
+        assert_eq!(JjDriver.kind(), WorkspaceKind::Jj);
+    }
+
+    #[test]
+    fn jj_land_sets_bookmark_forgets_workspace_removes_dir() {
+        if !jj_available() { return; }
+        let repo = init_jj_repo();
+        let ws = JjDriver.provision(repo.path(), "task-l").unwrap();
+        std::fs::write(ws.path.join("work.txt"), b"agent output").unwrap();
+        JjDriver.land(&ws).unwrap();
+        assert!(!ws.path.exists(), "workspace dir should be removed after land");
+        assert!(jj_bookmark_exists(repo.path(), "muxy/task-l"), "bookmark should be kept");
+    }
+
+    #[test]
+    fn jj_discard_forgets_workspace_and_leaves_no_bookmark() {
+        if !jj_available() { return; }
+        let repo = init_jj_repo();
+        let ws = JjDriver.provision(repo.path(), "task-d").unwrap();
+        std::fs::write(ws.path.join("work.txt"), b"throwaway").unwrap();
+        JjDriver.discard(&ws).unwrap();
+        assert!(!ws.path.exists(), "workspace dir should be removed after discard");
+        assert!(!jj_bookmark_exists(repo.path(), "muxy/task-d"), "discard must not leave a bookmark");
     }
 }
