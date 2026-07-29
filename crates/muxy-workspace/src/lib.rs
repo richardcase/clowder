@@ -142,6 +142,30 @@ impl WorkspaceDriver for JjDriver {
     }
 }
 
+/// Pick a workspace driver for `project`: jj if a `.jj` dir is found at `project` or an
+/// ancestor, else git. `.jj` wins over `.git` (colocated repos), matching jj's own behaviour.
+pub fn driver_for(project: &Path) -> Arc<dyn WorkspaceDriver> {
+    let mut cur = Some(project);
+    while let Some(dir) = cur {
+        if dir.join(".jj").is_dir() {
+            return Arc::new(JjDriver);
+        }
+        if dir.join(".git").exists() {
+            return Arc::new(GitWorktreeDriver);
+        }
+        cur = dir.parent();
+    }
+    Arc::new(GitWorktreeDriver)
+}
+
+/// The driver matching a provisioned workspace's kind — used to route land/discard.
+pub fn driver_for_kind(kind: WorkspaceKind) -> Arc<dyn WorkspaceDriver> {
+    match kind {
+        WorkspaceKind::Git => Arc::new(GitWorktreeDriver),
+        WorkspaceKind::Jj => Arc::new(JjDriver),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,5 +311,35 @@ mod tests {
         JjDriver.discard(&ws).unwrap();
         assert!(!ws.path.exists(), "workspace dir should be removed after discard");
         assert!(!jj_bookmark_exists(repo.path(), "muxy/task-d"), "discard must not leave a bookmark");
+    }
+
+    #[test]
+    fn driver_for_picks_git_for_a_git_project() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        assert_eq!(driver_for(dir.path()).kind(), WorkspaceKind::Git);
+    }
+
+    #[test]
+    fn driver_for_picks_jj_when_dot_jj_present_even_with_git() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".jj")).unwrap();
+        assert_eq!(driver_for(dir.path()).kind(), WorkspaceKind::Jj); // .jj wins
+    }
+
+    #[test]
+    fn driver_for_finds_marker_in_ancestor() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".jj")).unwrap();
+        let nested = dir.path().join("a").join("b");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert_eq!(driver_for(&nested).kind(), WorkspaceKind::Jj);
+    }
+
+    #[test]
+    fn driver_for_kind_maps_both() {
+        assert_eq!(driver_for_kind(WorkspaceKind::Git).kind(), WorkspaceKind::Git);
+        assert_eq!(driver_for_kind(WorkspaceKind::Jj).kind(), WorkspaceKind::Jj);
     }
 }
