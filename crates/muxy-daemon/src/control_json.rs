@@ -50,6 +50,8 @@ impl Daemon {
                             let ev = match serde_json::from_str::<ControlRequest>(&l) {
                                 Ok(ControlRequest::ListAgents) =>
                                     ControlEvent::AgentList { agents: self.list_agents() },
+                                Ok(ControlRequest::ListAdapters) =>
+                                    ControlEvent::AdapterList { adapters: self.list_adapters() },
                                 Ok(ControlRequest::SpawnAgent { project, task, adapter }) =>
                                     match self.spawn_from_control(&project, &task, &adapter) {
                                         Ok(pane) => ControlEvent::AgentSpawned { pane },
@@ -303,5 +305,44 @@ mod tests {
         let l = clines.next_line().await.unwrap().unwrap();
         assert!(l.contains(r#""type":"error""#), "expected error event: {l}");
         assert!(daemon.list_agents().is_empty());
+    }
+
+    #[test]
+    fn list_adapters_returns_registry_descriptor_ids() {
+        let daemon = Daemon::new();
+        let ids: Vec<String> = daemon.list_adapters().into_iter().map(|a| a.id).collect();
+        // Descriptor ids (NOT adapter.id() — shell's adapter reports "synthetic").
+        assert!(ids.contains(&"claude".to_string()));
+        assert!(ids.contains(&"codex".to_string()));
+        assert!(ids.contains(&"shell".to_string()));
+        assert!(!ids.contains(&"synthetic".to_string()), "must expose descriptor id 'shell', not 'synthetic'");
+    }
+
+    #[tokio::test]
+    async fn control_json_list_adapters_yields_adapter_list_with_codex() {
+        let daemon = Arc::new(Daemon::new_with(
+            Arc::new(FakeNotifier::new()),
+            std::path::PathBuf::from("/tmp/unused-cjson4.sock"),
+        ));
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let d = daemon.clone();
+        tokio::spawn(async move { let _ = d.handle_control_json(server_io).await; });
+
+        let (crd, mut cwr) = tokio::io::split(client_io);
+        let mut clines = BufReader::new(crd).lines();
+
+        // Initial snapshot: empty AgentList.
+        let first = clines.next_line().await.unwrap().unwrap();
+        assert!(first.contains(r#""type":"agentList""#), "{first}");
+
+        cwr.write_all(b"{\"type\":\"listAdapters\"}\n").await.unwrap();
+        let l = clines.next_line().await.unwrap().unwrap();
+        assert!(l.contains(r#""type":"adapterList""#), "{l}");
+        let adapters = match serde_json::from_str::<ControlEvent>(&l).unwrap() {
+            ControlEvent::AdapterList { adapters } => adapters,
+            other => panic!("expected AdapterList, got {other:?}"),
+        };
+        assert!(adapters.iter().any(|a| a.id == "codex"), "{adapters:?}");
     }
 }

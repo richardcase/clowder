@@ -384,6 +384,14 @@ impl Daemon {
         out
     }
 
+    /// The adapters a client may spawn (registry descriptor ids + labels).
+    pub fn list_adapters(&self) -> Vec<muxy_proto::AdapterInfo> {
+        crate::adapter_descriptors()
+            .iter()
+            .map(|d| muxy_proto::AdapterInfo { id: d.id.to_string(), display_name: d.display_name.to_string() })
+            .collect()
+    }
+
     fn get(&self, id: PaneId) -> Option<Arc<Pane>> {
         self.panes.lock().unwrap().get(&id).cloned()
     }

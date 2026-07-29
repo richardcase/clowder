@@ -54,6 +54,13 @@ pub struct AgentInfo {
     pub state: AttentionState,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdapterInfo {
+    pub id: String,
+    pub display_name: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
