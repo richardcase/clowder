@@ -17,6 +17,7 @@ struct TerminalContainer: NSViewRepresentable {
 
     func updateNSView(_ nsView: SurfaceView, context: Context) {
         nsView.onFocus = onFocus
+        nsView.setFocused(isFocused)
         // Only the focused leaf claims first responder (native click-focus handles the rest).
         if isFocused, nsView.window?.firstResponder !== nsView {
             DispatchQueue.main.async { nsView.window?.makeFirstResponder(nsView) }

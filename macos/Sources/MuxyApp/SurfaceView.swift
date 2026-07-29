@@ -9,6 +9,7 @@ final class SurfaceView: NSView {
     private let app: ghostty_app_t
     private let command: String
     private let socketPath: String
+    private var wantsFocus = false
 
     init(app: ghostty_app_t, paneId: UInt64, muxyBinary: String, socketPath: String) {
         self.app = app
@@ -31,6 +32,12 @@ final class SurfaceView: NSView {
         let ok = super.becomeFirstResponder()
         if ok { onFocus?() }
         return ok
+    }
+
+    /// Tie libghostty surface focus to whether this pane is the focused split leaf.
+    func setFocused(_ focused: Bool) {
+        wantsFocus = focused
+        if let surface { ghostty_surface_set_focus(surface, focused) }
     }
 
     override func viewDidMoveToWindow() {
@@ -68,7 +75,7 @@ final class SurfaceView: NSView {
         }
         ghostty_surface_set_content_scale(surface, config.scale_factor, config.scale_factor)
         pushSize()
-        ghostty_surface_set_focus(surface, true)
+        ghostty_surface_set_focus(surface, wantsFocus)
     }
 
     private func pushSize() {
