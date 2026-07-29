@@ -20,7 +20,7 @@ struct ContentView: View {
             }
         }
         .sheet(isPresented: $model.showingSpawn) {
-            SpawnSheet { project, task, adapter in
+            SpawnSheet(adapters: model.adapters) { project, task, adapter in
                 model.spawn(project: project, task: task, adapter: adapter)
             }
         }

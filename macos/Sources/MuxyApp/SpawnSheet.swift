@@ -1,6 +1,8 @@
 import SwiftUI
+import MuxyCore
 
 struct SpawnSheet: View {
+    let adapters: [AdapterInfo]
     let onSpawn: (String, String, String) -> Void
     @Environment(\.dismiss) private var dismiss
     @State private var project = ""
@@ -20,18 +22,20 @@ struct SpawnSheet: View {
                     .textFieldStyle(.roundedBorder)
                 TextField("Task", text: $task)
                     .textFieldStyle(.roundedBorder)
-                TextField("Adapter", text: $adapter)
-                    .textFieldStyle(.roundedBorder)
+                Picker("Adapter", selection: $adapter) {
+                    ForEach(adapters) { a in
+                        Text(a.displayName).tag(a.id)
+                    }
+                }
             }
             HStack {
                 Button("Cancel") { dismiss() }
                     .keyboardShortcut(.cancelAction)
                 Spacer()
                 Button("Spawn") {
-                    let a = adapter.trimmingCharacters(in: .whitespaces)
                     onSpawn(project.trimmingCharacters(in: .whitespaces),
                             task.trimmingCharacters(in: .whitespaces),
-                            a.isEmpty ? "claude" : a)
+                            adapter)
                     dismiss()
                 }
                 .keyboardShortcut(.defaultAction)
