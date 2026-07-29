@@ -141,7 +141,6 @@ mod tests {
     use super::*;
     use crate::FakeNotifier;
     use muxy_proto::AttentionState;
-    use muxy_workspace::GitWorktreeDriver;
     use std::process::Command as PCommand;
     use std::time::Duration;
     use tokio::io::AsyncWriteExt;
@@ -165,7 +164,6 @@ mod tests {
     async fn control_json_lists_spawns_and_streams() {
         let repo = init_repo();
         let daemon = Arc::new(Daemon::new_with(
-            Arc::new(GitWorktreeDriver),
             Arc::new(FakeNotifier::new()),
             std::path::PathBuf::from("/tmp/unused-cjson.sock"),
         ));
@@ -234,7 +232,6 @@ mod tests {
     async fn split_pane_over_control_stream_yields_split_tree_changed() {
         let repo = init_repo();
         let daemon = Arc::new(Daemon::new_with(
-            Arc::new(GitWorktreeDriver),
             Arc::new(FakeNotifier::new()),
             std::path::PathBuf::from("/tmp/unused-cjson3.sock"),
         ));
@@ -292,7 +289,6 @@ mod tests {
     async fn control_json_spawn_unknown_adapter_errors() {
         let repo = init_repo();
         let daemon = Arc::new(Daemon::new_with(
-            Arc::new(GitWorktreeDriver),
             Arc::new(FakeNotifier::new()),
             std::path::PathBuf::from("/tmp/unused-cjson2.sock"),
         ));

@@ -5,7 +5,7 @@ use anyhow::Result;
 use muxy_proto::AttentionState;
 use muxy_proto::{ClientToDaemon, DaemonToClient, MsgStream, PaneId};
 use muxy_proto::{PaneTree, SplitDirection, SplitId};
-use muxy_workspace::{GitWorktreeDriver, Workspace, WorkspaceDriver};
+use muxy_workspace::{driver_for, driver_for_kind, Workspace};
 use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
@@ -34,7 +34,6 @@ pub struct Daemon {
     workspaces: Arc<Mutex<HashMap<PaneId, Workspace>>>,
     agents: Arc<Mutex<HashMap<PaneId, AgentMeta>>>,
     watchers: Arc<Mutex<HashMap<PaneId, tokio::task::JoinHandle<()>>>>,
-    driver: Arc<dyn WorkspaceDriver>,
     notifier: Arc<dyn Notifier>,
     hook_sock: PathBuf,
     trees: Arc<Mutex<HashMap<PaneId, PaneTree>>>, // agent pane -> split tree
@@ -47,18 +46,10 @@ pub struct Daemon {
 
 impl Daemon {
     pub fn new() -> Daemon {
-        Daemon::new_with(
-            Arc::new(GitWorktreeDriver),
-            Arc::new(OsNotifier),
-            PathBuf::from("/tmp/muxy-hook.sock"),
-        )
+        Daemon::new_with(Arc::new(OsNotifier), PathBuf::from("/tmp/muxy-hook.sock"))
     }
 
-    pub fn new_with(
-        driver: Arc<dyn WorkspaceDriver>,
-        notifier: Arc<dyn Notifier>,
-        hook_sock: PathBuf,
-    ) -> Daemon {
+    pub fn new_with(notifier: Arc<dyn Notifier>, hook_sock: PathBuf) -> Daemon {
         let (attention_tx, _) = broadcast::channel(256);
         let (removed_tx, _) = broadcast::channel(256);
         let (split_tx, _) = broadcast::channel(256);
@@ -71,7 +62,6 @@ impl Daemon {
             workspaces: Arc::new(Mutex::new(HashMap::new())),
             agents: Arc::new(Mutex::new(HashMap::new())),
             watchers: Arc::new(Mutex::new(HashMap::new())),
-            driver,
             notifier,
             hook_sock,
             trees: Arc::new(Mutex::new(HashMap::new())),
@@ -124,7 +114,8 @@ impl Daemon {
     /// Provision an isolated worktree, inject the adapter's hooks, and spawn the agent in it.
     pub fn spawn_agent(self: &Arc<Self>, project: &Path, adapter: &dyn AgentAdapter, task: &str) -> Result<PaneId> {
         let id = self.alloc_id();
-        let ws = self.driver.provision(project, task)?;
+        let driver = driver_for(project);
+        let ws = driver.provision(project, task)?;
 
         // If any post-provision step fails (e.g. the agent binary isn't on PATH), tear down
         // the freshly-provisioned worktree/branch instead of leaking it — otherwise a retry
@@ -143,7 +134,7 @@ impl Daemon {
             Err(e) => {
                 // Nothing was ever landed here; fully clean up (worktree + freshly-created
                 // branch) so a retry with the same task name doesn't collide.
-                let _ = self.driver.discard(&ws);
+                let _ = driver.discard(&ws);
                 return Err(e);
             }
         };
@@ -241,10 +232,11 @@ impl Daemon {
         }
         self.hookless.lock().unwrap().remove(&pane);
         if let Some(ws) = self.workspace_of(pane) {
+            let driver = driver_for_kind(ws.kind);
             if land {
-                self.driver.land(&ws)?;
+                driver.land(&ws)?;
             } else {
-                self.driver.discard(&ws)?;
+                driver.discard(&ws)?;
             }
         }
         self.workspaces.lock().unwrap().remove(&pane);
@@ -737,7 +729,6 @@ mod tests {
     async fn list_agents_reports_project_task_and_state() {
         use crate::{FakeNotifier, SyntheticAdapter};
         use muxy_proto::AttentionState;
-        use muxy_workspace::GitWorktreeDriver;
         use std::process::Command as PCommand;
         use std::sync::Arc as StdArc;
 
@@ -754,7 +745,6 @@ mod tests {
         run(&["commit", "-qm", "init"]);
 
         let daemon = StdArc::new(Daemon::new_with(
-            StdArc::new(GitWorktreeDriver),
             StdArc::new(FakeNotifier::new()),
             std::path::PathBuf::from("/tmp/unused-listagents.sock"),
         ));
@@ -786,7 +776,6 @@ mod tests {
     async fn control_conn_lists_agents_and_streams_attention() {
         use crate::{FakeNotifier, SyntheticAdapter};
         use muxy_proto::AttentionState;
-        use muxy_workspace::GitWorktreeDriver;
         use std::process::Command as PCommand;
         use std::time::Duration;
 
@@ -802,7 +791,6 @@ mod tests {
         run(&["commit", "-qm", "init"]);
 
         let daemon = Arc::new(Daemon::new_with(
-            Arc::new(GitWorktreeDriver),
             Arc::new(FakeNotifier::new()),
             std::path::PathBuf::from("/tmp/unused-control.sock"),
         ));
@@ -853,7 +841,6 @@ mod tests {
     async fn agent_marked_exited_on_process_exit() {
         use crate::{FakeNotifier, SyntheticAdapter};
         use muxy_proto::AttentionState;
-        use muxy_workspace::GitWorktreeDriver;
         use std::process::Command as PCommand;
         use std::time::Duration;
 
@@ -869,7 +856,6 @@ mod tests {
         run(&["commit", "-qm", "init"]);
 
         let daemon = Arc::new(Daemon::new_with(
-            Arc::new(GitWorktreeDriver),
             Arc::new(FakeNotifier::new()),
             std::path::PathBuf::from("/tmp/unused-reaper.sock"),
         ));
@@ -901,7 +887,6 @@ mod tests {
     #[tokio::test]
     async fn teardown_of_running_agent_does_not_leave_spurious_exited() {
         use crate::{FakeNotifier, SyntheticAdapter};
-        use muxy_workspace::GitWorktreeDriver;
         use std::process::Command as PCommand;
         use std::time::Duration;
 
@@ -917,7 +902,6 @@ mod tests {
         run(&["commit", "-qm", "init"]);
 
         let daemon = Arc::new(Daemon::new_with(
-            Arc::new(GitWorktreeDriver),
             Arc::new(FakeNotifier::new()),
             std::path::PathBuf::from("/tmp/unused-teardown-race.sock"),
         ));
@@ -944,7 +928,6 @@ mod tests {
     #[tokio::test]
     async fn control_conn_gets_agent_removed_on_teardown() {
         use crate::{FakeNotifier, SyntheticAdapter};
-        use muxy_workspace::GitWorktreeDriver;
         use std::process::Command as PCommand;
         use std::time::Duration;
 
@@ -960,7 +943,6 @@ mod tests {
         run(&["commit", "-qm", "init"]);
 
         let daemon = Arc::new(Daemon::new_with(
-            Arc::new(GitWorktreeDriver),
             Arc::new(FakeNotifier::new()),
             std::path::PathBuf::from("/tmp/unused-removed.sock"),
         ));
@@ -1000,7 +982,6 @@ mod tests {
     /// Temp git repo + a daemon wired up the same way the other integration tests build one.
     fn daemon_with_repo() -> (Arc<Daemon>, tempfile::TempDir) {
         use crate::FakeNotifier;
-        use muxy_workspace::GitWorktreeDriver;
         use std::process::Command as PCommand;
 
         let repo = tempfile::tempdir().unwrap();
@@ -1015,7 +996,6 @@ mod tests {
         run(&["commit", "-qm", "init"]);
 
         let daemon = Arc::new(Daemon::new_with(
-            Arc::new(GitWorktreeDriver),
             Arc::new(FakeNotifier::new()),
             std::path::PathBuf::from("/tmp/unused-split-tree.sock"),
         ));
@@ -1210,6 +1190,61 @@ mod tests {
         assert!(daemon.workspace_of(agent).is_none());
         assert!(daemon.get(agent).is_none());
         assert!(!branch_exists(repo.path(), "muxy/task-b"), "discard deletes the branch");
+    }
+
+    fn jj_available() -> bool {
+        std::process::Command::new("jj").arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
+    }
+
+    /// A fresh jj repo with one snapshotted file. Returns the TempDir (kept alive).
+    fn init_jj_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        let run = |args: &[&str]| {
+            let ok = std::process::Command::new("jj").arg("-R").arg(p).args(args)
+                .env("JJ_USER", "muxy-test").env("JJ_EMAIL", "muxy@test.invalid")
+                .status().unwrap().success();
+            assert!(ok, "jj {args:?} failed");
+        };
+        let ok = std::process::Command::new("jj").args(["git", "init", &p.to_string_lossy()])
+            .env("JJ_USER", "muxy-test").env("JJ_EMAIL", "muxy@test.invalid")
+            .status().unwrap().success();
+        assert!(ok, "jj git init failed");
+        std::fs::write(p.join("README.md"), b"init").unwrap();
+        run(&["status"]); // force a working-copy snapshot
+        dir
+    }
+
+    fn jj_bookmark_exists(repo: &std::path::Path, name: &str) -> bool {
+        let out = std::process::Command::new("jj").arg("-R").arg(repo).args(["bookmark", "list"])
+            .env("JJ_USER", "muxy-test").env("JJ_EMAIL", "muxy@test.invalid")
+            .output().unwrap();
+        String::from_utf8_lossy(&out.stdout).contains(name)
+    }
+
+    #[tokio::test]
+    async fn spawn_in_jj_repo_uses_jj_driver_and_land_keeps_bookmark() {
+        if !jj_available() { return; }
+        use crate::{FakeNotifier, SyntheticAdapter};
+
+        let repo = init_jj_repo();
+        let daemon = Arc::new(Daemon::new_with(
+            Arc::new(FakeNotifier::new()),
+            std::path::PathBuf::from("/tmp/unused-jj.sock"),
+        ));
+        let adapter = SyntheticAdapter {
+            command: PaneCommand {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), "sleep 30".into()],
+                cwd: None,
+                env: vec![],
+            },
+        };
+        let pane = daemon.spawn_agent(repo.path(), &adapter, "task-a").unwrap();
+        assert_eq!(daemon.workspace_of(pane).unwrap().kind, muxy_workspace::WorkspaceKind::Jj);
+        daemon.land_agent(pane).unwrap();
+        assert!(daemon.list_agents().is_empty());
+        assert!(jj_bookmark_exists(repo.path(), "muxy/task-a"));
     }
 
     #[tokio::test]

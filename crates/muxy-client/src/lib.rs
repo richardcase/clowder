@@ -255,7 +255,6 @@ mod tests {
     async fn spawn_via_control_returns_pane_id() {
         use muxy_daemon::server::Daemon;
         use muxy_daemon::FakeNotifier;
-        use muxy_workspace::GitWorktreeDriver;
         use std::process::Command as PCommand;
         use std::sync::Arc;
 
@@ -275,7 +274,6 @@ mod tests {
         let sockdir = tempfile::tempdir().unwrap();
         let sock = sockdir.path().join("control.sock");
         let daemon = Arc::new(Daemon::new_with(
-            Arc::new(GitWorktreeDriver),
             Arc::new(FakeNotifier::new()),
             std::path::PathBuf::from("/tmp/unused-cli.sock"),
         ));
