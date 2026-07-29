@@ -65,4 +65,14 @@ final class LifecycleTests: XCTestCase {
         let ids = CommandRegistry.all(keymap: Keymap()).map(\.id)
         XCTAssertTrue(ids.contains(.landAgent) && ids.contains(.discardAgent))
     }
+
+    func testConfirmUsesCapturedPaneNotCurrentSelection() {
+        let (model, fake) = modelWithAgent()   // agent at pane 1, selectedPane == 1
+        model.run(.landAgent)                  // captures pane 1 into pendingLifecycle
+        model.selectedPane = 2                 // selection moves after the request
+        model.confirmLifecycle()
+        // must send to the CAPTURED pane (1), not the current selection (2)
+        XCTAssertTrue(fake.sentLines.contains { $0.contains("\"type\":\"landAgent\"") && $0.contains("\"pane\":1") })
+        XCTAssertFalse(fake.sentLines.contains { $0.contains("\"pane\":2") })
+    }
 }
