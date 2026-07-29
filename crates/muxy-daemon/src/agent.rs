@@ -134,6 +134,36 @@ impl AgentAdapter for SyntheticAdapter {
     }
 }
 
+/// A spawnable adapter's stable id + human label (single source of truth for spawn + M4b discovery).
+pub struct AdapterDescriptor {
+    pub id: &'static str,
+    pub display_name: &'static str,
+}
+
+/// The adapters a client may spawn.
+pub fn adapter_descriptors() -> &'static [AdapterDescriptor] {
+    &[
+        AdapterDescriptor { id: "claude", display_name: "Claude Code" },
+        AdapterDescriptor { id: "codex", display_name: "OpenAI Codex" },
+        AdapterDescriptor { id: "shell", display_name: "Shell" },
+    ]
+}
+
+/// Construct an adapter by id, or `None` for an unknown id.
+pub fn build_adapter(id: &str) -> Option<Box<dyn AgentAdapter>> {
+    match id {
+        "claude" => Some(Box::new(ClaudeAdapter)),
+        "codex" => Some(Box::new(CodexAdapter)),
+        "shell" => {
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+            Some(Box::new(SyntheticAdapter {
+                command: PaneCommand { program: shell, args: vec![], cwd: None, env: vec![] },
+            }))
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,5 +225,19 @@ mod tests {
         CodexAdapter.provision_hooks(dir.path(), PaneId(1), std::path::Path::new("/tmp/s.sock")).unwrap();
         // provision is a no-op for codex (hook is a launch arg, not a file).
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0, "codex provision must write nothing");
+    }
+
+    #[test]
+    fn registry_builds_known_adapters_and_rejects_unknown() {
+        assert_eq!(build_adapter("claude").unwrap().id(), "claude");
+        assert_eq!(build_adapter("codex").unwrap().id(), "codex");
+        assert_eq!(build_adapter("shell").unwrap().id(), "synthetic"); // shell → SyntheticAdapter
+        assert!(build_adapter("nope").is_none());
+    }
+
+    #[test]
+    fn registry_descriptors_list_claude_codex_shell() {
+        let ids: Vec<&str> = adapter_descriptors().iter().map(|d| d.id).collect();
+        assert!(ids.contains(&"claude") && ids.contains(&"codex") && ids.contains(&"shell"));
     }
 }
