@@ -51,4 +51,12 @@ public final class AgentStore: ObservableObject {
     /// The sidebar order flattened: agents grouped by project, projects sorted, agents by pane.
     /// The stable index order used by Cmd-1…9 and the palette.
     public var orderedAgents: [AgentInfo] { byProject.flatMap { $0.agents } }
+
+    /// Agents that want a response — NeedsInput or Completed — in sidebar order.
+    public var agentsNeedingAttention: [AgentInfo] {
+        orderedAgents.filter { $0.state == .needsInput || $0.state == .completed }
+    }
+
+    /// How many agents need attention (the menu-bar count).
+    public var attentionCount: Int { agentsNeedingAttention.count }
 }
