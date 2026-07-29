@@ -25,9 +25,20 @@ public struct AgentInfo: Codable, Identifiable, Equatable, Sendable {
     }
 }
 
+/// Mirrors the Rust `AdapterInfo`.
+public struct AdapterInfo: Codable, Identifiable, Equatable, Sendable {
+    public let id: String
+    public let displayName: String
+    public init(id: String, displayName: String) {
+        self.id = id
+        self.displayName = displayName
+    }
+}
+
 /// GUI/CLI → daemon. Custom `Encodable` for the internally-tagged JSON shape.
 public enum ControlRequest: Encodable, Equatable, Sendable {
     case listAgents
+    case listAdapters
     case spawnAgent(project: String, task: String, adapter: String)
     case splitPane(pane: UInt64, direction: SplitDirection)
     case closePane(pane: UInt64)
@@ -43,6 +54,8 @@ public enum ControlRequest: Encodable, Equatable, Sendable {
         switch self {
         case .listAgents:
             try c.encode("listAgents", forKey: .type)
+        case .listAdapters:
+            try c.encode("listAdapters", forKey: .type)
         case let .spawnAgent(project, task, adapter):
             try c.encode("spawnAgent", forKey: .type)
             try c.encode(project, forKey: .project)
@@ -75,13 +88,14 @@ public enum ControlRequest: Encodable, Equatable, Sendable {
 /// daemon → GUI/CLI. Custom `Decodable` discriminating on `type`.
 public enum ControlEvent: Decodable, Equatable, Sendable {
     case agentList([AgentInfo])
+    case adapterList([AdapterInfo])
     case attentionChanged(pane: UInt64, state: AttentionState)
     case agentRemoved(pane: UInt64)
     case agentSpawned(pane: UInt64)
     case error(message: String)
     case splitTreeChanged(agent: UInt64, tree: PaneTree)
 
-    private enum CodingKeys: String, CodingKey { case type, agents, pane, state, message, agent, tree }
+    private enum CodingKeys: String, CodingKey { case type, agents, adapters, pane, state, message, agent, tree }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -89,6 +103,8 @@ public enum ControlEvent: Decodable, Equatable, Sendable {
         switch type {
         case "agentList":
             self = .agentList(try c.decode([AgentInfo].self, forKey: .agents))
+        case "adapterList":
+            self = .adapterList(try c.decode([AdapterInfo].self, forKey: .adapters))
         case "attentionChanged":
             self = .attentionChanged(
                 pane: try c.decode(UInt64.self, forKey: .pane),

@@ -9,6 +9,7 @@ public final class AgentStore: ObservableObject {
     @Published public private(set) var needsRefresh: Bool = false
     @Published public private(set) var lastError: String?
     @Published public private(set) var trees: [UInt64: PaneTree] = [:]
+    @Published public private(set) var adapters: [AdapterInfo] = [AdapterInfo(id: "claude", displayName: "Claude Code")]
 
     public init() {}
 
@@ -17,6 +18,8 @@ public final class AgentStore: ObservableObject {
         case let .agentList(list):
             agents = Dictionary(uniqueKeysWithValues: list.map { ($0.pane, $0) })
             needsRefresh = false
+        case let .adapterList(list):
+            adapters = list
         case let .attentionChanged(pane, state):
             if var a = agents[pane] {
                 a.state = state

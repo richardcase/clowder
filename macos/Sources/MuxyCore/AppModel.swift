@@ -71,6 +71,7 @@ public final class AppModel: ObservableObject {
             self.session = session
             connectionState = .live
             try session.send(.listAgents)
+            try session.send(.listAdapters)
         } catch {
             connectionState = .closed(reason: "Could not connect: \(error)")
         }
@@ -106,6 +107,8 @@ public final class AppModel: ObservableObject {
 
     /// The selected agent's split tree, or nil (the detail falls back to a lone leaf).
     public var currentTree: PaneTree? { selectedPane.flatMap { store.trees[$0] } }
+
+    public var adapters: [AdapterInfo] { store.adapters }
 
     public func splitFocused(_ direction: SplitDirection) {
         guard let target = focusedPane ?? selectedPane, session != nil else { return }
