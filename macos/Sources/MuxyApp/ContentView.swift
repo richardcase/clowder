@@ -119,8 +119,11 @@ struct ContentView: View {
 
     @ViewBuilder private var statusBar: some View {
         VStack(spacing: 0) {
-            if case let .closed(reason) = model.connectionState {
-                // Live connection state — persists until reconnect, so not dismissable.
+            if case .reconnecting = model.connectionState {
+                // Auto-reconnect in progress — persists until we're live again, not dismissable.
+                banner("Reconnecting to daemon…", color: .orange)
+            } else if case let .closed(reason) = model.connectionState {
+                // Terminal connection state — persists, not dismissable.
                 banner(reason, color: .red)
             } else if let err = model.store.lastError {
                 // A one-shot error — dismissable.
