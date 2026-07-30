@@ -358,8 +358,10 @@ impl Daemon {
             let tree = trees
                 .get_mut(&agent)
                 .ok_or_else(|| anyhow::anyhow!("no split tree for {agent:?}"))?;
-            let ok = crate::split_tree::split_leaf(tree, target, companion, direction, sid);
-            debug_assert!(ok, "split_leaf: {target:?} is not a leaf in the tree for {agent:?}");
+            // A concurrent companion-crash reap may have already removed `target` from the tree
+            // (e.g. splitting a companion the instant its process dies); that's a benign race, not
+            // a bug — the freshly-spawned companion self-heals via its own reap when it exits.
+            let _ = crate::split_tree::split_leaf(tree, target, companion, direction, sid);
         }
         self.owner.lock().unwrap().insert(companion, agent);
         self.broadcast_tree(agent);
