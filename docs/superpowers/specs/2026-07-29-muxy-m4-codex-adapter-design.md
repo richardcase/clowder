@@ -224,3 +224,10 @@ Codex agent is spawnable from a discoverable picker, its turn-complete drives a
 Completed badge that clears on input, and the adapter registry + `ListAdapters` make
 aider/goose one-entry additions. Manual confirmation by the user running a real `codex`
 agent.
+
+**✅ MANUALLY VERIFIED — 2026-07-30.** A real authenticated `codex` agent was spawned
+from the adapter picker (which listed claude/codex/shell): on turn-complete the sidebar
+badge went **Completed** and typing into the pane cleared it back to **Working**. This
+confirms `codex -c 'notify=[...]'` fires end-to-end on **codex 0.145.0** — the load-bearing
+M4a uncertainty is resolved, and no global-config / `[hooks]` fallback is needed.
+Slices merged: M4a (PR #26), M4b (PR #27), M4c (PR #28).
