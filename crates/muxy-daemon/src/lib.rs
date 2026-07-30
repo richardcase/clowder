@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod instance;
 pub mod pane;
 pub mod server;
 pub mod notify;

@@ -42,6 +42,7 @@ pub struct Daemon {
     split_tx: broadcast::Sender<(PaneId, PaneTree)>,
     hookless: Arc<Mutex<std::collections::HashSet<PaneId>>>,
     scanners: Arc<Mutex<HashMap<PaneId, tokio::task::JoinHandle<()>>>>,
+    companion_watchers: Arc<Mutex<HashMap<PaneId, tokio::task::JoinHandle<()>>>>,
     pub(crate) backlog_cap: usize,
     pub(crate) default_cols: u16,
     pub(crate) default_rows: u16,
@@ -74,6 +75,7 @@ impl Daemon {
             split_tx,
             hookless: Arc::new(Mutex::new(std::collections::HashSet::new())),
             scanners: Arc::new(Mutex::new(HashMap::new())),
+            companion_watchers: Arc::new(Mutex::new(HashMap::new())),
             backlog_cap: 256 * 1024,
             default_cols: 80,
             default_rows: 24,
@@ -236,6 +238,9 @@ impl Daemon {
             }
             self.panes.lock().unwrap().remove(c);
             self.owner.lock().unwrap().remove(c);
+            if let Some(h) = self.companion_watchers.lock().unwrap().remove(c) {
+                h.abort();
+            }
         }
         self.trees.lock().unwrap().remove(&pane);
         self.owner.lock().unwrap().remove(&pane);
@@ -269,6 +274,26 @@ impl Daemon {
     /// Kill the agent's process and remove its worktree without keeping the branch.
     pub fn teardown_agent(&self, pane: PaneId) -> Result<()> {
         self.finish_agent(pane, false)
+    }
+
+    /// Graceful shutdown: abort all background watchers/scanners so killed children can't race
+    /// spurious attention/reap events, then kill every child PTY and drop the pane map. Does NOT
+    /// finalize (land/discard) any workspace — agents keep their worktrees.
+    pub fn shutdown(&self) {
+        for (_, h) in self.watchers.lock().unwrap().drain() {
+            h.abort();
+        }
+        for (_, h) in self.scanners.lock().unwrap().drain() {
+            h.abort();
+        }
+        for (_, h) in self.companion_watchers.lock().unwrap().drain() {
+            h.abort();
+        }
+        let panes: Vec<Arc<Pane>> = self.panes.lock().unwrap().values().cloned().collect();
+        for p in panes {
+            let _ = p.kill();
+        }
+        self.panes.lock().unwrap().clear();
     }
 
     /// Finalize the agent's work: commit any dirty changes, remove the worktree, keep the branch.
@@ -308,7 +333,7 @@ impl Daemon {
     }
 
     /// Split `target` (a leaf) by spawning a companion shell in its agent's worktree.
-    pub fn split_pane(&self, target: PaneId, direction: SplitDirection) -> Result<PaneId> {
+    pub fn split_pane(self: &Arc<Self>, target: PaneId, direction: SplitDirection) -> Result<PaneId> {
         let agent = *self
             .owner
             .lock()
@@ -333,12 +358,50 @@ impl Daemon {
             let tree = trees
                 .get_mut(&agent)
                 .ok_or_else(|| anyhow::anyhow!("no split tree for {agent:?}"))?;
-            let ok = crate::split_tree::split_leaf(tree, target, companion, direction, sid);
-            debug_assert!(ok, "split_leaf: {target:?} is not a leaf in the tree for {agent:?}");
+            // A concurrent companion-crash reap may have already removed `target` from the tree
+            // (e.g. splitting a companion the instant its process dies); that's a benign race, not
+            // a bug — the freshly-spawned companion self-heals via its own reap when it exits.
+            let _ = crate::split_tree::split_leaf(tree, target, companion, direction, sid);
         }
         self.owner.lock().unwrap().insert(companion, agent);
         self.broadcast_tree(agent);
+
+        // Reap the companion if its process exits/crashes (mirrors the per-agent watcher). Registered
+        // after owner+tree are set so `reap_companion` always finds the owner. `wait_exit()` returns
+        // immediately if the child already exited, so no exit is missed even if we register late.
+        if let Some(pane_arc) = self.get(companion) {
+            let me = Arc::clone(self);
+            let handle = tokio::spawn(async move {
+                pane_arc.wait_exit().await;
+                me.reap_companion(companion);
+            });
+            self.companion_watchers.lock().unwrap().insert(companion, handle);
+        }
+
         Ok(companion)
+    }
+
+    /// Remove a companion pane whose process exited/crashed: collapse its leaf out of the owning
+    /// agent's tree and broadcast the change. Idempotent — a no-op if the pane is already gone
+    /// (explicit `close_pane`/`teardown` won the race) or if `pane` is an agent's own leaf.
+    pub(crate) fn reap_companion(&self, pane: PaneId) {
+        let agent = match self.owner.lock().unwrap().get(&pane).copied() {
+            Some(a) => a,
+            None => return, // already removed
+        };
+        if agent == pane {
+            return; // an agent's own leaf is never reaped as a companion
+        }
+        if let Some(p) = self.get(pane) {
+            let _ = p.kill();
+        }
+        self.panes.lock().unwrap().remove(&pane);
+        if let Some(tree) = self.trees.lock().unwrap().get_mut(&agent) {
+            let _ = crate::split_tree::remove_leaf(tree, pane);
+        }
+        self.owner.lock().unwrap().remove(&pane);
+        self.companion_watchers.lock().unwrap().remove(&pane);
+        self.broadcast_tree(agent);
     }
 
     /// Close a companion pane (collapsing the tree), or teardown the agent if `pane` is one.
@@ -359,9 +422,13 @@ impl Daemon {
             let _ = p.kill();
         }
         self.panes.lock().unwrap().remove(&pane);
+        if let Some(h) = self.companion_watchers.lock().unwrap().remove(&pane) {
+            h.abort();
+        }
         if let Some(tree) = self.trees.lock().unwrap().get_mut(&agent) {
-            let removed = crate::split_tree::remove_leaf(tree, pane);
-            debug_assert!(removed, "remove_leaf: {pane:?} is not in the tree for {agent:?}");
+            // A concurrent companion-crash reap may have already collapsed this leaf out of the
+            // tree; that's a benign race (whichever of close/reap runs first wins), not a bug.
+            let _ = crate::split_tree::remove_leaf(tree, pane);
         }
         self.owner.lock().unwrap().remove(&pane);
         self.broadcast_tree(agent);
@@ -1371,5 +1438,142 @@ mod tests {
         } else {
             panic!("expected a split")
         }
+    }
+
+    #[tokio::test]
+    async fn companion_crash_removes_leaf_and_broadcasts_tree() {
+        use crate::split_tree;
+        let (daemon, repo) = daemon_with_repo();
+        let agent = daemon
+            .spawn_agent(
+                repo.path(),
+                &crate::agent::SyntheticAdapter {
+                    command: PaneCommand {
+                        program: "/bin/sh".into(),
+                        args: vec!["-c".into(), "sleep 30".into()],
+                        cwd: None,
+                        env: vec![],
+                    },
+                },
+                "task",
+            )
+            .unwrap();
+
+        let mut rx = daemon.subscribe_splits();
+        let comp = daemon.split_pane(agent, SplitDirection::Right).unwrap();
+        assert_eq!(split_tree::leaves(&daemon.split_tree_of(agent).unwrap()), vec![agent, comp]);
+        let _ = rx.try_recv(); // drain the split broadcast
+
+        // Simulate the companion process crashing.
+        daemon.get(comp).unwrap().kill().unwrap();
+
+        // The watcher must reap it: tree collapses back to the lone agent leaf, pane gone.
+        let mut collapsed = false;
+        for _ in 0..100 {
+            if daemon.split_tree_of(agent) == Some(PaneTree::Leaf { pane: agent }) {
+                collapsed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(collapsed, "a crashed companion's leaf must be removed from the tree");
+        assert!(daemon.get(comp).is_none(), "the crashed companion pane must be dropped");
+
+        // A SplitTreeChanged for this agent was broadcast by the reap.
+        let mut saw = false;
+        for _ in 0..40 {
+            match rx.try_recv() {
+                Ok((a, _)) if a == agent => {
+                    saw = true;
+                    break;
+                }
+                Ok(_) => continue,
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+        assert!(saw, "reap must broadcast SplitTreeChanged for the owning agent");
+
+        daemon.teardown_agent(agent).unwrap();
+    }
+
+    #[tokio::test]
+    async fn reap_companion_is_idempotent() {
+        use crate::split_tree;
+        let (daemon, repo) = daemon_with_repo();
+        let agent = daemon
+            .spawn_agent(
+                repo.path(),
+                &crate::agent::SyntheticAdapter {
+                    command: PaneCommand {
+                        program: "/bin/sh".into(),
+                        args: vec!["-c".into(), "sleep 30".into()],
+                        cwd: None,
+                        env: vec![],
+                    },
+                },
+                "task",
+            )
+            .unwrap();
+        let comp = daemon.split_pane(agent, SplitDirection::Right).unwrap();
+
+        // Explicit close removes the companion.
+        daemon.close_pane(comp).unwrap();
+        assert_eq!(split_tree::leaves(&daemon.split_tree_of(agent).unwrap()), vec![agent]);
+
+        // A late reap (e.g. the watcher firing after close) must be a safe no-op: the tree stays a
+        // lone agent leaf and nothing panics.
+        daemon.reap_companion(comp);
+        assert_eq!(daemon.split_tree_of(agent), Some(PaneTree::Leaf { pane: agent }));
+
+        // Reaping the agent's own leaf must never remove it.
+        daemon.reap_companion(agent);
+        assert!(daemon.split_tree_of(agent).is_some(), "reap must never remove an agent's own leaf");
+
+        daemon.teardown_agent(agent).unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_kills_children_and_clears_panes() {
+        fn pid_alive(pid: &str) -> bool {
+            std::process::Command::new("kill")
+                .args(["-0", pid])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        }
+
+        let daemon = Arc::new(Daemon::new());
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("pid");
+        let script = format!("echo $$ > {}; exec sleep 30", pidfile.display());
+        let pane = daemon.spawn_pane(sh(&script), 80, 24).unwrap();
+
+        // Wait for the child to record its PID.
+        let mut pid = String::new();
+        for _ in 0..100 {
+            if let Ok(s) = std::fs::read_to_string(&pidfile) {
+                if !s.trim().is_empty() {
+                    pid = s.trim().to_string();
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!pid.is_empty(), "child never wrote its PID");
+        assert!(pid_alive(&pid), "child alive before shutdown");
+
+        daemon.shutdown();
+
+        // The pane is removed and its child is killed.
+        assert!(daemon.get(pane).is_none(), "shutdown must clear the panes map");
+        let mut dead = false;
+        for _ in 0..100 {
+            if !pid_alive(&pid) {
+                dead = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(dead, "shutdown must kill the child PTY process");
     }
 }
