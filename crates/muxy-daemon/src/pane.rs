@@ -1,8 +1,9 @@
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use muxy_proto::PaneId;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::io::Read;
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 use tokio::sync::broadcast;
 
 #[derive(Clone, Debug)]
@@ -59,7 +60,7 @@ impl Pane {
                     Ok(n) => {
                         let chunk = buf[..n].to_vec();
                         {
-                            let mut b = bl.lock().unwrap();
+                            let mut b = bl.lock();
                             b.extend_from_slice(&chunk);
                             if b.len() > backlog_cap {
                                 let drop = b.len() - backlog_cap;
@@ -97,21 +98,21 @@ impl Pane {
 
     pub fn write_input(&self, bytes: &[u8]) -> Result<()> {
         use std::io::Write;
-        let mut w = self.writer.lock().map_err(|_| anyhow!("writer poisoned"))?;
+        let mut w = self.writer.lock();
         w.write_all(bytes)?;
         w.flush()?;
         Ok(())
     }
 
     pub fn resize(&self, cols: u16, rows: u16) -> Result<()> {
-        let m = self.master.lock().map_err(|_| anyhow!("master poisoned"))?;
+        let m = self.master.lock();
         m.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })?;
-        *self.size.lock().unwrap() = (cols, rows);
+        *self.size.lock() = (cols, rows);
         Ok(())
     }
 
     pub fn size(&self) -> (u16, u16) {
-        *self.size.lock().unwrap()
+        *self.size.lock()
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<Vec<u8>> {
@@ -119,7 +120,7 @@ impl Pane {
     }
 
     pub fn backlog(&self) -> Vec<u8> {
-        self.backlog.lock().unwrap().clone()
+        self.backlog.lock().clone()
     }
 
     /// Atomically snapshot the current backlog and subscribe to live output.
@@ -128,7 +129,7 @@ impl Pane {
     /// returned receiver sees exactly the chunks appended AFTER this snapshot —
     /// none dropped, none duplicated.
     pub fn snapshot_and_subscribe(&self) -> (Vec<u8>, broadcast::Receiver<Vec<u8>>) {
-        let b = self.backlog.lock().unwrap();
+        let b = self.backlog.lock();
         let rx = self.output_tx.subscribe();
         let snap = b.clone();
         drop(b);
@@ -136,7 +137,7 @@ impl Pane {
     }
 
     pub fn kill(&self) -> anyhow::Result<()> {
-        self.killer.lock().map_err(|_| anyhow!("killer poisoned"))?.kill()?;
+        self.killer.lock().kill()?;
         Ok(())
     }
 
@@ -157,9 +158,7 @@ impl Drop for Pane {
     /// Backstop: a dropped pane must never leak its child process. `kill()` on an
     /// already-exited child is harmless.
     fn drop(&mut self) {
-        if let Ok(mut k) = self.killer.lock() {
-            let _ = k.kill();
-        }
+        let _ = self.killer.lock().kill();
     }
 }
 

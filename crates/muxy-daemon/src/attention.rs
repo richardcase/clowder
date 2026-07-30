@@ -12,7 +12,9 @@ impl Daemon {
             let (stream, _addr) = listener.accept().await?;
             let me = self.clone();
             tokio::spawn(async move {
-                let _ = me.handle_hook_conn(stream).await;
+                if let Some(line) = crate::logging::conn_error_line("hook", me.handle_hook_conn(stream).await) {
+                    tracing::warn!("{line}");
+                }
             });
         }
     }

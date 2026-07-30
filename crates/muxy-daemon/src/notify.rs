@@ -1,5 +1,5 @@
 use muxy_proto::{AttentionState, PaneId};
-use std::sync::Mutex;
+use parking_lot::Mutex;
 
 pub trait Notifier: Send + Sync {
     fn notify(&self, pane: PaneId, state: AttentionState);
@@ -33,13 +33,13 @@ impl FakeNotifier {
         Self { calls: Mutex::new(Vec::new()) }
     }
     pub fn calls(&self) -> Vec<(PaneId, AttentionState)> {
-        self.calls.lock().unwrap().clone()
+        self.calls.lock().clone()
     }
 }
 
 impl Notifier for FakeNotifier {
     fn notify(&self, pane: PaneId, state: AttentionState) {
-        self.calls.lock().unwrap().push((pane, state));
+        self.calls.lock().push((pane, state));
     }
 }
 

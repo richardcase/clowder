@@ -10,7 +10,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::UnixListener;
 use tokio::sync::broadcast;
@@ -95,13 +96,13 @@ impl Daemon {
     }
 
     pub fn set_attention(&self, pane: PaneId, state: AttentionState) {
-        self.attention.lock().unwrap().insert(pane, state);
+        self.attention.lock().insert(pane, state);
         let _ = self.attention_tx.send((pane, state));
         self.notifier.notify(pane, state);
     }
 
     pub fn attention_of(&self, pane: PaneId) -> Option<AttentionState> {
-        self.attention.lock().unwrap().get(&pane).copied()
+        self.attention.lock().get(&pane).copied()
     }
 
     pub fn subscribe_attention(&self) -> broadcast::Receiver<(PaneId, AttentionState)> {
@@ -122,7 +123,7 @@ impl Daemon {
     }
 
     fn register_pane(&self, id: PaneId, pane: Pane) {
-        self.panes.lock().unwrap().insert(id, Arc::new(pane));
+        self.panes.lock().insert(id, Arc::new(pane));
     }
 
     pub fn spawn_pane(&self, cmd: PaneCommand, cols: u16, rows: u16) -> Result<PaneId> {
@@ -160,20 +161,20 @@ impl Daemon {
             }
         };
         self.register_pane(id, pane);
-        self.workspaces.lock().unwrap().insert(id, ws);
+        self.workspaces.lock().insert(id, ws);
         let project_name = project
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| project.to_string_lossy().to_string());
-        self.agents.lock().unwrap().insert(
+        self.agents.lock().insert(
             id,
             AgentMeta { project: project_name, task: task.to_string() },
         );
         self.set_attention(id, AttentionState::Working);
 
         if !adapter.provides_hooks() {
-            self.hookless.lock().unwrap().insert(id);
-            if let Some(pane_arc) = self.panes.lock().unwrap().get(&id).cloned() {
+            self.hookless.lock().insert(id);
+            if let Some(pane_arc) = self.panes.lock().get(&id).cloned() {
                 let me = Arc::clone(self);
                 let (snapshot, mut rx) = pane_arc.snapshot_and_subscribe();
                 let handle = tokio::spawn(async move {
@@ -198,27 +199,27 @@ impl Daemon {
                         }
                     }
                 });
-                self.scanners.lock().unwrap().insert(id, handle);
+                self.scanners.lock().insert(id, handle);
             }
         }
 
-        self.trees.lock().unwrap().insert(id, PaneTree::Leaf { pane: id });
-        self.owner.lock().unwrap().insert(id, id);
+        self.trees.lock().insert(id, PaneTree::Leaf { pane: id });
+        self.owner.lock().insert(id, id);
 
-        if let Some(pane_arc) = self.panes.lock().unwrap().get(&id).cloned() {
+        if let Some(pane_arc) = self.panes.lock().get(&id).cloned() {
             let me = Arc::clone(self);
             let handle = tokio::spawn(async move {
                 pane_arc.wait_exit().await;
                 me.set_attention(id, AttentionState::Exited);
             });
-            self.watchers.lock().unwrap().insert(id, handle);
+            self.watchers.lock().insert(id, handle);
         }
 
         Ok(id)
     }
 
     pub(crate) fn workspace_of(&self, pane: PaneId) -> Option<Workspace> {
-        self.workspaces.lock().unwrap().get(&pane).cloned()
+        self.workspaces.lock().get(&pane).cloned()
     }
 
     /// Kill the agent's process and finalize its workspace (land or discard); drop all
@@ -228,7 +229,6 @@ impl Daemon {
         let companions: Vec<PaneId> = self
             .trees
             .lock()
-            .unwrap()
             .get(&pane)
             .map(|t| crate::split_tree::leaves(t).into_iter().filter(|p| *p != pane).collect())
             .unwrap_or_default();
@@ -236,25 +236,25 @@ impl Daemon {
             if let Some(p) = self.get(*c) {
                 let _ = p.kill();
             }
-            self.panes.lock().unwrap().remove(c);
-            self.owner.lock().unwrap().remove(c);
-            if let Some(h) = self.companion_watchers.lock().unwrap().remove(c) {
+            self.panes.lock().remove(c);
+            self.owner.lock().remove(c);
+            if let Some(h) = self.companion_watchers.lock().remove(c) {
                 h.abort();
             }
         }
-        self.trees.lock().unwrap().remove(&pane);
-        self.owner.lock().unwrap().remove(&pane);
+        self.trees.lock().remove(&pane);
+        self.owner.lock().remove(&pane);
 
         if let Some(p) = self.get(pane) {
             let _ = p.kill();
         }
-        if let Some(handle) = self.watchers.lock().unwrap().remove(&pane) {
+        if let Some(handle) = self.watchers.lock().remove(&pane) {
             handle.abort();
         }
-        if let Some(h) = self.scanners.lock().unwrap().remove(&pane) {
+        if let Some(h) = self.scanners.lock().remove(&pane) {
             h.abort();
         }
-        self.hookless.lock().unwrap().remove(&pane);
+        self.hookless.lock().remove(&pane);
         if let Some(ws) = self.workspace_of(pane) {
             let driver = driver_for_kind(ws.kind);
             if land {
@@ -263,10 +263,10 @@ impl Daemon {
                 driver.discard(&ws)?;
             }
         }
-        self.workspaces.lock().unwrap().remove(&pane);
-        self.panes.lock().unwrap().remove(&pane);
-        self.attention.lock().unwrap().remove(&pane);
-        self.agents.lock().unwrap().remove(&pane);
+        self.workspaces.lock().remove(&pane);
+        self.panes.lock().remove(&pane);
+        self.attention.lock().remove(&pane);
+        self.agents.lock().remove(&pane);
         let _ = self.removed_tx.send(pane);
         Ok(())
     }
@@ -280,20 +280,20 @@ impl Daemon {
     /// spurious attention/reap events, then kill every child PTY and drop the pane map. Does NOT
     /// finalize (land/discard) any workspace — agents keep their worktrees.
     pub fn shutdown(&self) {
-        for (_, h) in self.watchers.lock().unwrap().drain() {
+        for (_, h) in self.watchers.lock().drain() {
             h.abort();
         }
-        for (_, h) in self.scanners.lock().unwrap().drain() {
+        for (_, h) in self.scanners.lock().drain() {
             h.abort();
         }
-        for (_, h) in self.companion_watchers.lock().unwrap().drain() {
+        for (_, h) in self.companion_watchers.lock().drain() {
             h.abort();
         }
-        let panes: Vec<Arc<Pane>> = self.panes.lock().unwrap().values().cloned().collect();
+        let panes: Vec<Arc<Pane>> = self.panes.lock().values().cloned().collect();
         for p in panes {
             let _ = p.kill();
         }
-        self.panes.lock().unwrap().clear();
+        self.panes.lock().clear();
     }
 
     /// Finalize the agent's work: commit any dirty changes, remove the worktree, keep the branch.
@@ -311,7 +311,7 @@ impl Daemon {
     }
 
     pub fn split_tree_of(&self, agent: PaneId) -> Option<PaneTree> {
-        self.trees.lock().unwrap().get(&agent).cloned()
+        self.trees.lock().get(&agent).cloned()
     }
 
     /// SplitTreeChanged for `agent`, or an Error event if it has no tree.
@@ -337,13 +337,11 @@ impl Daemon {
         let agent = *self
             .owner
             .lock()
-            .unwrap()
             .get(&target)
             .ok_or_else(|| anyhow::anyhow!("unknown pane {target:?}"))?;
         let path = self
             .workspaces
             .lock()
-            .unwrap()
             .get(&agent)
             .map(|w| w.path.clone())
             .ok_or_else(|| anyhow::anyhow!("no workspace for agent {agent:?}"))?;
@@ -354,7 +352,7 @@ impl Daemon {
         )?;
         let sid = self.alloc_split_id();
         {
-            let mut trees = self.trees.lock().unwrap();
+            let mut trees = self.trees.lock();
             let tree = trees
                 .get_mut(&agent)
                 .ok_or_else(|| anyhow::anyhow!("no split tree for {agent:?}"))?;
@@ -363,7 +361,7 @@ impl Daemon {
             // a bug — the freshly-spawned companion self-heals via its own reap when it exits.
             let _ = crate::split_tree::split_leaf(tree, target, companion, direction, sid);
         }
-        self.owner.lock().unwrap().insert(companion, agent);
+        self.owner.lock().insert(companion, agent);
         self.broadcast_tree(agent);
 
         // Reap the companion if its process exits/crashes (mirrors the per-agent watcher). Registered
@@ -375,7 +373,7 @@ impl Daemon {
                 pane_arc.wait_exit().await;
                 me.reap_companion(companion);
             });
-            self.companion_watchers.lock().unwrap().insert(companion, handle);
+            self.companion_watchers.lock().insert(companion, handle);
         }
 
         Ok(companion)
@@ -385,7 +383,7 @@ impl Daemon {
     /// agent's tree and broadcast the change. Idempotent — a no-op if the pane is already gone
     /// (explicit `close_pane`/`teardown` won the race) or if `pane` is an agent's own leaf.
     pub(crate) fn reap_companion(&self, pane: PaneId) {
-        let agent = match self.owner.lock().unwrap().get(&pane).copied() {
+        let agent = match self.owner.lock().get(&pane).copied() {
             Some(a) => a,
             None => return, // already removed
         };
@@ -395,19 +393,19 @@ impl Daemon {
         if let Some(p) = self.get(pane) {
             let _ = p.kill();
         }
-        self.panes.lock().unwrap().remove(&pane);
-        if let Some(tree) = self.trees.lock().unwrap().get_mut(&agent) {
+        self.panes.lock().remove(&pane);
+        if let Some(tree) = self.trees.lock().get_mut(&agent) {
             let _ = crate::split_tree::remove_leaf(tree, pane);
         }
-        self.owner.lock().unwrap().remove(&pane);
-        self.companion_watchers.lock().unwrap().remove(&pane);
+        self.owner.lock().remove(&pane);
+        self.companion_watchers.lock().remove(&pane);
         self.broadcast_tree(agent);
     }
 
     /// Close a companion pane (collapsing the tree), or teardown the agent if `pane` is one.
     /// Returns Some(agent) if a companion was closed, None if an agent was torn down.
     pub fn close_pane(&self, pane: PaneId) -> Result<Option<PaneId>> {
-        let is_agent = self.trees.lock().unwrap().contains_key(&pane);
+        let is_agent = self.trees.lock().contains_key(&pane);
         if is_agent {
             self.teardown_agent(pane)?;
             return Ok(None);
@@ -415,22 +413,21 @@ impl Daemon {
         let agent = *self
             .owner
             .lock()
-            .unwrap()
             .get(&pane)
             .ok_or_else(|| anyhow::anyhow!("unknown pane {pane:?}"))?;
         if let Some(p) = self.get(pane) {
             let _ = p.kill();
         }
-        self.panes.lock().unwrap().remove(&pane);
-        if let Some(h) = self.companion_watchers.lock().unwrap().remove(&pane) {
+        self.panes.lock().remove(&pane);
+        if let Some(h) = self.companion_watchers.lock().remove(&pane) {
             h.abort();
         }
-        if let Some(tree) = self.trees.lock().unwrap().get_mut(&agent) {
+        if let Some(tree) = self.trees.lock().get_mut(&agent) {
             // A concurrent companion-crash reap may have already collapsed this leaf out of the
             // tree; that's a benign race (whichever of close/reap runs first wins), not a bug.
             let _ = crate::split_tree::remove_leaf(tree, pane);
         }
-        self.owner.lock().unwrap().remove(&pane);
+        self.owner.lock().remove(&pane);
         self.broadcast_tree(agent);
         Ok(Some(agent))
     }
@@ -439,7 +436,7 @@ impl Daemon {
     pub fn set_split_ratio(&self, split: SplitId, ratio: f32) -> Result<PaneId> {
         let mut found = None;
         {
-            let mut trees = self.trees.lock().unwrap();
+            let mut trees = self.trees.lock();
             for (agent, tree) in trees.iter_mut() {
                 if crate::split_tree::set_ratio(tree, split, ratio) {
                     found = Some(*agent);
@@ -454,12 +451,12 @@ impl Daemon {
 
     /// The agent owning any leaf (or the agent itself).
     pub fn owner_of(&self, pane: PaneId) -> Option<PaneId> {
-        self.owner.lock().unwrap().get(&pane).copied()
+        self.owner.lock().get(&pane).copied()
     }
 
     pub fn list_agents(&self) -> Vec<muxy_proto::AgentInfo> {
-        let agents = self.agents.lock().unwrap();
-        let attention = self.attention.lock().unwrap();
+        let agents = self.agents.lock();
+        let attention = self.attention.lock();
         let mut out: Vec<muxy_proto::AgentInfo> = agents
             .iter()
             .map(|(pane, meta)| muxy_proto::AgentInfo {
@@ -482,7 +479,7 @@ impl Daemon {
     }
 
     fn get(&self, id: PaneId) -> Option<Arc<Pane>> {
-        self.panes.lock().unwrap().get(&id).cloned()
+        self.panes.lock().get(&id).cloned()
     }
 
     pub async fn serve(self: Arc<Self>, listener: UnixListener) -> Result<()> {
@@ -490,7 +487,9 @@ impl Daemon {
             let (stream, _addr) = listener.accept().await?;
             let me = self.clone();
             tokio::spawn(async move {
-                let _ = me.handle_conn(stream).await;
+                if let Some(line) = crate::logging::conn_error_line("client", me.handle_conn(stream).await) {
+                    tracing::warn!("{line}");
+                }
             });
         }
     }
@@ -643,7 +642,7 @@ mod tests {
         let pane = daemon
             .spawn_pane(sh("yes ABCDEFGHIJKLMNOPQRST | head -c 20000"), 80, 24)
             .unwrap();
-        let backlog_len = || daemon.panes.lock().unwrap().get(&pane).unwrap().backlog().len();
+        let backlog_len = || daemon.panes.lock().get(&pane).unwrap().backlog().len();
         // Wait until the buffer fills to the cap (the child prints ~20000 bytes >> 4096).
         for _ in 0..100 {
             if backlog_len() >= 4096 {
