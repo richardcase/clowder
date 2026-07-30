@@ -28,10 +28,13 @@ per-user sockets, resolves the bundled `muxy` binary, and wires supervision into
   `runtime_dir = $XDG_RUNTIME_DIR › $TMPDIR › /tmp` — identical to M5b's `InstanceLock::default_path`.
   **Env still wins** (`MUXY_SOCK`/`MUXY_CONTROL_SOCK`/`MUXY_HOOK_SOCK`), so dev/CI flows are unchanged.
 - **Supervisor policy:** relaunch on unexpected exit with **bounded exponential backoff**
-  (`min(10, 0.5·2^attempt)` → 0.5,1,2,4,8,10…), backoff-*first* so it never hot-loops. An exit code of
-  **exactly 1** means the daemon lost M5b's single-instance `flock` (main.rs `exit(1)` is only that
-  path) → **yield** (do not relaunch; the app connects to the existing daemon via M5d). `stop()` cancels
-  and terminates. Same `@MainActor` + injected-`sleep` pattern as M5d's `AppModel`.
+  (`min(10, 0.5·2^attempt)` → 0.5,1,2,4,8,10…), backoff-*first* so it never hot-loops. The daemon exits
+  with a **distinct code 3** when it loses M5b's single-instance `flock` → the supervisor **yields**
+  (does not relaunch; the app connects to the existing daemon via M5d). Any OTHER non-zero exit (a
+  crash, or an `anyhow`-`Err` from `main` such as a bind/accept failure — all of which are code ≠ 3)
+  is treated as a crash → relaunch. (Do NOT match on code 1: `fn main() -> Result<()>` returning `Err`
+  also exits 1, so 1 is NOT flock-specific.) `stop()` cancels and terminates. Same `@MainActor` +
+  injected-`sleep` pattern as M5d's `AppModel`.
 - **Bundle identity:** `com.github.richardcase.muxy`, name `Muxy`, version from the top-level `VERSION`
   file (`0.1.0`), min macOS 14, regular dock app (**not** `LSUIElement` — M1d's tray relies on it).
 - **Dev flows must keep working:** `swift run muxy-app` (unbundled) still resolves `muxy` via
@@ -290,7 +293,7 @@ final class DaemonSupervisorTests: XCTestCase {
         XCTAssertEqual(sup.state, .stopped)
     }
 
-    func testExitCode1YieldsWithoutRelaunch() async {
+    func testExitCode3YieldsWithoutRelaunch() async {
         let controller = SleepController()
         var spawned: [FakeDaemonProcess] = []
         let sup = DaemonSupervisor(
@@ -298,12 +301,31 @@ final class DaemonSupervisorTests: XCTestCase {
             sleep: { await controller.sleep($0) }
         )
         sup.start()
-        spawned[0].exit(1)                            // lost M5b's single-instance flock
+        spawned[0].exit(3)                            // distinct single-instance-loser code (lost flock)
         XCTAssertEqual(sup.state, .yielded)
         // No backoff scheduled, no relaunch — the app connects to the existing daemon via M5d.
         for _ in 0..<20 { await Task.yield() }
         XCTAssertEqual(controller.parkedCount, 0)
         XCTAssertEqual(spawned.count, 1)
+        sup.stop()
+    }
+
+    func testGenericErrorExit1Relaunches() async {
+        let controller = SleepController()
+        var spawned: [FakeDaemonProcess] = []
+        let sup = DaemonSupervisor(
+            spawn: { let p = FakeDaemonProcess(); spawned.append(p); return p },
+            sleep: { await controller.sleep($0) }
+        )
+        sup.start()
+        spawned[0].exit(1)                            // generic main() Err (e.g. bind failure) → relaunch, NOT yield
+        XCTAssertEqual(sup.state, .relaunching)
+        let parked = await eventually { controller.parkedCount == 1 }
+        XCTAssertTrue(parked)
+        controller.advance()
+        let live = await eventually { sup.state == .running }
+        XCTAssertTrue(live)
+        XCTAssertEqual(spawned.count, 2)
         sup.stop()
     }
 }
@@ -371,9 +393,10 @@ public final class DaemonSupervisor {
     private func handleExit(_ code: Int32) {
         process = nil
         guard !isStopping else { return }
-        if code == 1 {
-            // Lost M5b's single-instance flock: another daemon owns it. Don't relaunch — the app
-            // connects to the existing daemon via M5d.
+        if code == 3 {
+            // Daemon's DISTINCT single-instance-loser code (lost M5b's flock): another daemon owns
+            // it. Don't relaunch — the app connects to the existing daemon via M5d. NOT code 1:
+            // `main() -> Result<()>` returning Err (e.g. a bind failure) also exits 1 and must relaunch.
             state = .yielded
             return
         }
@@ -792,7 +815,9 @@ git commit -m "feat(build): scripts/build-app.sh assembles Muxy.app (bundle + pl
   double-click smoke → Task 4.
 - **Reuses, not redefines,** `SleepController`/`eventually` (module-scoped in `AppModelTests.swift`) —
   Task 2 must not redeclare them (duplicate-symbol compile error).
-- **Composition with M5:** the supervisor's `exit == 1` → `.yielded` branch defers to M5b's flock
+- **Composition with M5:** the daemon's flock-refusal path exits with a DISTINCT code 3 (changed from
+  1 so a generic `main` `Err`/bind-failure exit-1 relaunches rather than yielding); the supervisor's
+  `exit == 3` → `.yielded` branch defers to M5b's flock
   owner; a crash relaunch composes with M5d's client reconnect (Task 3 manual step 3 exercises both).
 - **Dev flows preserved:** `swift run muxy-app` is unbundled → `bundledBin` returns nil →
   `makeDaemonSupervisor()` returns nil (no auto-daemon; dev starts it by hand), `muxy` resolves via

@@ -113,11 +113,13 @@ A **testable supervisor**, split like M5d's reconnect (pure policy in `MuxyCore`
   `Bundle.main/Resources/bin/muxy-daemon` with the per-user socket env (below) and the bundle's
   `bin/` on `PATH` (so any `muxy`/`muxy-hook` lookups resolve to the bundled copies). The app calls
   `supervisor.start()` in `bootstrap()` before `AppModel.connect()`. M5b's single-instance `flock`
-  makes a redundant spawn (e.g. a dev daemon already running) exit cleanly with a non-zero code — the
-  supervisor treats an **immediate** exit-code-1 as "someone else owns the daemon" and does **not**
-  hot-loop relaunch (backoff still applies; the app just connects to the existing daemon via M5d).
-  On daemon crash, the supervisor relaunches **and** `AppModel`'s M5d reconnect re-attaches — the two
-  compose.
+  makes a redundant spawn (e.g. a dev daemon already running) exit with a **distinct code 3**
+  ("single-instance loser") — the supervisor treats code 3 as "someone else owns the daemon" and
+  **yields** (does not relaunch; the app connects to the existing daemon via M5d). Any other non-zero
+  exit — a crash, or an `anyhow`-`Err` from `main` (e.g. a bind failure, which exits 1) — is a crash →
+  relaunch with backoff. (Code 1 is deliberately NOT the flock signal, since `main() -> Result<()>`
+  returning `Err` also yields 1.) On daemon crash, the supervisor relaunches **and** `AppModel`'s M5d
+  reconnect re-attaches — the two compose.
 
 #### 4. Per-user sockets
 
@@ -216,7 +218,8 @@ Order: **M6a → M6b → M6d → M6e**, then **M6c → M6f** once a Developer ID
 
 - **M6a — `DaemonSupervisor` (`swift test`, MuxyCore):** a fake daemon process that exits unexpectedly
   drives a relaunch; backoff is bounded and non-decreasing; `stop()` terminates the child and cancels
-  the loop (no relaunch after stop); an immediate exit-code-1 (single-instance loser) does not hot-loop.
+  the loop (no relaunch after stop); an exit code 3 (single-instance loser) yields without relaunch,
+  while a code-1 (generic `main` error) exit still relaunches.
   Mirrors M5d's deterministic seams (injected spawn + sleep).
 - **M6a — `muxy-config` (`cargo test`):** the default socket dir resolves to `<runtime_dir>/muxy/…`
   (XDG › TMPDIR › /tmp); an env override still wins (no dev regression).
