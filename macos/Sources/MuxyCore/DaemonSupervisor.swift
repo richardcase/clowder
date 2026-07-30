@@ -10,7 +10,7 @@ public protocol DaemonProcess: AnyObject {
 }
 
 /// Launches and supervises the muxy-daemon child process: relaunches it (bounded backoff) if it exits
-/// unexpectedly, yields if it lost the single-instance lock (exit 1), and stops cleanly on quit.
+/// unexpectedly, yields if it lost the single-instance lock (exit 3), and stops cleanly on quit.
 /// Libghostty-free and unit-testable via injected spawn + sleep seams (mirrors AppModel's reconnect).
 @MainActor
 public final class DaemonSupervisor {
@@ -50,9 +50,10 @@ public final class DaemonSupervisor {
     private func handleExit(_ code: Int32) {
         process = nil
         guard !isStopping else { return }
-        if code == 1 {
-            // Lost M5b's single-instance flock: another daemon owns it. Don't relaunch — the app
-            // connects to the existing daemon via M5d.
+        if code == 3 {
+            // Daemon's DISTINCT single-instance-loser code (lost M5b's flock) → defer to the owner.
+            // NOT code 1: `main() -> Result<()>` returning Err (e.g. a bind failure) also exits 1 and
+            // must relaunch, not yield.
             state = .yielded
             return
         }

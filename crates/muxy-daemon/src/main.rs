@@ -26,7 +26,9 @@ async fn main() -> Result<()> {
         Ok(l) => l,
         Err(e) => {
             tracing::error!("{e}");
-            std::process::exit(1);
+            // Distinct code so a supervising parent can tell "another instance already owns the daemon"
+            // (yield) apart from a generic startup error / `main` Err (which exits 1 → relaunch).
+            std::process::exit(3);
         }
     };
 

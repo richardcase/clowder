@@ -80,7 +80,7 @@ final class DaemonSupervisorTests: XCTestCase {
         XCTAssertEqual(sup.state, .stopped)
     }
 
-    func testExitCode1YieldsWithoutRelaunch() async {
+    func testExitCode3YieldsWithoutRelaunch() async {
         let controller = SleepController()
         var spawned: [FakeDaemonProcess] = []
         let sup = DaemonSupervisor(
@@ -88,12 +88,31 @@ final class DaemonSupervisorTests: XCTestCase {
             sleep: { await controller.sleep($0) }
         )
         sup.start()
-        spawned[0].exit(1)                            // lost M5b's single-instance flock
+        spawned[0].exit(3)                            // lost M5b's single-instance flock
         XCTAssertEqual(sup.state, .yielded)
         // No backoff scheduled, no relaunch — the app connects to the existing daemon via M5d.
         for _ in 0..<20 { await Task.yield() }
         XCTAssertEqual(controller.parkedCount, 0)
         XCTAssertEqual(spawned.count, 1)
+        sup.stop()
+    }
+
+    func testGenericErrorExit1Relaunches() async {
+        let controller = SleepController()
+        var spawned: [FakeDaemonProcess] = []
+        let sup = DaemonSupervisor(
+            spawn: { let p = FakeDaemonProcess(); spawned.append(p); return p },
+            sleep: { await controller.sleep($0) }
+        )
+        sup.start()
+        spawned[0].exit(1)                            // generic main() Err (e.g. bind failure) → relaunch, NOT yield
+        XCTAssertEqual(sup.state, .relaunching)
+        let parked = await eventually { controller.parkedCount == 1 }
+        XCTAssertTrue(parked)
+        controller.advance()
+        let live = await eventually { sup.state == .running }
+        XCTAssertTrue(live)
+        XCTAssertEqual(spawned.count, 2)
         sup.stop()
     }
 }
