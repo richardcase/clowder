@@ -30,7 +30,7 @@ pub fn resize_msg(pane: PaneId, cols: u16, rows: u16) -> ClientToDaemon {
 /// Connect to the daemon's raw-mode socket and attach to `pane_id`, pumping
 /// stdin/stdout until the pane exits or the terminal is detached.
 pub async fn attach(pane_id: u64) -> Result<()> {
-    let sock = std::env::var("MUXY_SOCK").unwrap_or_else(|_| "/tmp/muxy.sock".into());
+    let sock = muxy_config::Config::load().client_sock;
     let pane = PaneId(pane_id);
 
     let stream = UnixStream::connect(&sock).await?;

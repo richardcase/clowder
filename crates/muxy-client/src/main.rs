@@ -1,6 +1,5 @@
 use anyhow::{anyhow, Result};
 use muxy_client::{attach, spawn_via_control};
-use std::path::Path;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -10,8 +9,8 @@ async fn main() -> Result<()> {
             let project = args.get(2).ok_or_else(|| anyhow!("usage: muxy spawn <project> <task> [adapter]"))?;
             let task = args.get(3).ok_or_else(|| anyhow!("usage: muxy spawn <project> <task> [adapter]"))?;
             let adapter = args.get(4).map(|s| s.as_str()).unwrap_or("claude");
-            let sock = std::env::var("MUXY_CONTROL_SOCK").unwrap_or_else(|_| "/tmp/muxy-control.sock".into());
-            let pane = spawn_via_control(Path::new(&sock), project, task, adapter).await?;
+            let sock = muxy_config::Config::load().control_sock;
+            let pane = spawn_via_control(&sock, project, task, adapter).await?;
             println!("{}", pane.0);
             Ok(())
         }
