@@ -42,6 +42,7 @@ pub struct Daemon {
     split_tx: broadcast::Sender<(PaneId, PaneTree)>,
     hookless: Arc<Mutex<std::collections::HashSet<PaneId>>>,
     scanners: Arc<Mutex<HashMap<PaneId, tokio::task::JoinHandle<()>>>>,
+    companion_watchers: Arc<Mutex<HashMap<PaneId, tokio::task::JoinHandle<()>>>>,
     pub(crate) backlog_cap: usize,
     pub(crate) default_cols: u16,
     pub(crate) default_rows: u16,
@@ -74,6 +75,7 @@ impl Daemon {
             split_tx,
             hookless: Arc::new(Mutex::new(std::collections::HashSet::new())),
             scanners: Arc::new(Mutex::new(HashMap::new())),
+            companion_watchers: Arc::new(Mutex::new(HashMap::new())),
             backlog_cap: 256 * 1024,
             default_cols: 80,
             default_rows: 24,
@@ -269,6 +271,26 @@ impl Daemon {
     /// Kill the agent's process and remove its worktree without keeping the branch.
     pub fn teardown_agent(&self, pane: PaneId) -> Result<()> {
         self.finish_agent(pane, false)
+    }
+
+    /// Graceful shutdown: abort all background watchers/scanners so killed children can't race
+    /// spurious attention/reap events, then kill every child PTY and drop the pane map. Does NOT
+    /// finalize (land/discard) any workspace — agents keep their worktrees.
+    pub fn shutdown(&self) {
+        for (_, h) in self.watchers.lock().unwrap().drain() {
+            h.abort();
+        }
+        for (_, h) in self.scanners.lock().unwrap().drain() {
+            h.abort();
+        }
+        for (_, h) in self.companion_watchers.lock().unwrap().drain() {
+            h.abort();
+        }
+        let panes: Vec<Arc<Pane>> = self.panes.lock().unwrap().values().cloned().collect();
+        for p in panes {
+            let _ = p.kill();
+        }
+        self.panes.lock().unwrap().clear();
     }
 
     /// Finalize the agent's work: commit any dirty changes, remove the worktree, keep the branch.
@@ -1371,5 +1393,50 @@ mod tests {
         } else {
             panic!("expected a split")
         }
+    }
+
+    #[tokio::test]
+    async fn shutdown_kills_children_and_clears_panes() {
+        fn pid_alive(pid: &str) -> bool {
+            std::process::Command::new("kill")
+                .args(["-0", pid])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        }
+
+        let daemon = Arc::new(Daemon::new());
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("pid");
+        let script = format!("echo $$ > {}; exec sleep 30", pidfile.display());
+        let pane = daemon.spawn_pane(sh(&script), 80, 24).unwrap();
+
+        // Wait for the child to record its PID.
+        let mut pid = String::new();
+        for _ in 0..100 {
+            if let Ok(s) = std::fs::read_to_string(&pidfile) {
+                if !s.trim().is_empty() {
+                    pid = s.trim().to_string();
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!pid.is_empty(), "child never wrote its PID");
+        assert!(pid_alive(&pid), "child alive before shutdown");
+
+        daemon.shutdown();
+
+        // The pane is removed and its child is killed.
+        assert!(daemon.get(pane).is_none(), "shutdown must clear the panes map");
+        let mut dead = false;
+        for _ in 0..100 {
+            if !pid_alive(&pid) {
+                dead = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(dead, "shutdown must kill the child PTY process");
     }
 }
