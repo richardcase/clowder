@@ -684,6 +684,7 @@ dependencies = [
  "muxy-workspace",
  "notify-rust",
  "portable-pty",
+ "rustix 0.38.44",
  "serde_json",
  "tempfile",
  "tokio",
