@@ -13,13 +13,22 @@ async fn main() -> Result<()> {
     let daemon = Arc::new(Daemon::new_from_config(config));
     let hook_path = daemon.hook_sock().to_path_buf();
 
+    // Sockets may live in a per-user dir that doesn't exist yet; create each parent.
+    for p in [&sock_path, &hook_path, &control_path] {
+        if let Some(dir) = p.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+    }
+
     // Single-instance guard: refuse to start if another daemon already holds the lock.
     let lock_path = InstanceLock::default_path();
     let lock = match InstanceLock::acquire(&lock_path) {
         Ok(l) => l,
         Err(e) => {
             tracing::error!("{e}");
-            std::process::exit(1);
+            // Distinct code so a supervising parent can tell "another instance already owns the daemon"
+            // (yield) apart from a generic startup error / `main` Err (which exits 1 → relaunch).
+            std::process::exit(3);
         }
     };
 

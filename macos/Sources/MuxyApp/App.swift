@@ -15,6 +15,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var mainWindow: NSWindow?
     private var windowCloseDelegate: HideOnCloseDelegate?
     private var statusBar: StatusBarController?
+    private var daemonSupervisor: DaemonSupervisor?
 
     /// One-time libghostty + model initialization. Idempotent and main-thread-only; runs on
     /// whichever fires first — the SwiftUI scene body or `applicationDidFinishLaunching` — so
@@ -25,11 +26,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func bootstrap() -> (appModel: AppModel, surfaceHost: SurfaceHost) {
         if let appModel, let surfaceHost { return (appModel, surfaceHost) }
 
+        // Bundled binary + per-user sockets (dev overrides via env/MUXY_BIN still honored).
+        let socks = MuxyPaths.socketPaths()
+        let socketPath = socks.client
+        let controlPath = socks.control
         let muxyBinary = ProcessInfo.processInfo.environment["MUXY_BIN"]
+            ?? MuxyPaths.bundledBin("muxy")
             ?? FileManager.default.currentDirectoryPath + "/../target/debug/muxy"
-        let socketPath = ProcessInfo.processInfo.environment["MUXY_SOCK"] ?? "/tmp/muxy.sock"
-        let controlPath = ProcessInfo.processInfo.environment["MUXY_CONTROL_SOCK"]
-            ?? "/tmp/muxy-control.sock"
+
+        // Launch + supervise our own daemon when bundled (no-op / nil under `swift run`, where the
+        // developer starts the daemon by hand).
+        if let supervisor = makeDaemonSupervisor() {
+            daemonSupervisor = supervisor
+            supervisor.start()
+        }
 
         // --- libghostty init (unchanged sequence, relocated from main.swift) ---
         guard ghostty_init(UInt(CommandLine.argc), CommandLine.unsafeArgv) == GHOSTTY_SUCCESS else {
@@ -68,16 +78,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         bootstrap()
-        // Launched as a bare executable (not a .app bundle), a SwiftUI app does not
-        // become the frontmost/active app on its own, so keystrokes go to whatever was
-        // in front. Claim regular-app status and activate — restoring what the old
-        // hand-rolled main.swift did (setActivationPolicy(.regular) + activate).
-        NSApp.setActivationPolicy(.regular)
-        NSApp.activate(ignoringOtherApps: true)
+        // A real .app bundle is frontmost on launch. Only force activation when running UNBUNDLED
+        // (dev `swift run muxy-app`), where a bare executable would otherwise not become active.
+        if Bundle.main.bundleIdentifier == nil {
+            NSApp.setActivationPolicy(.regular)
+            NSApp.activate(ignoringOtherApps: true)
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        appModel?.shutdown()   // F1: explicit disconnect
+        appModel?.shutdown()          // F1: explicit disconnect
+        daemonSupervisor?.stop()      // terminate the child daemon we spawned
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
