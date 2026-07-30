@@ -36,6 +36,7 @@ enum MuxyPaths {
 final class ProcessDaemon: DaemonProcess {
     private let process = Process()
     private var onExit: ((Int32) -> Void)?
+    private var launchFailed = false
 
     init(execPath: String, env: [String: String]) {
         process.executableURL = URL(fileURLWithPath: execPath)
@@ -44,11 +45,26 @@ final class ProcessDaemon: DaemonProcess {
             let code = p.terminationStatus
             Task { @MainActor in self?.onExit?(code) }
         }
-        try? process.run()
+        do {
+            try process.run()
+        } catch {
+            // Launch failed → the terminationHandler will never fire. Record it and deliver a
+            // synthetic crash exit once the supervisor registers onExit, so it relaunches (backoff)
+            // instead of being stuck in a false ".running".
+            FileHandle.standardError.write(Data("muxy: failed to launch daemon at \(execPath): \(error)\n".utf8))
+            launchFailed = true
+        }
     }
 
     func terminate() { if process.isRunning { process.terminate() } }   // SIGTERM → M5b graceful shutdown
-    func setOnExit(_ handler: @escaping (Int32) -> Void) { onExit = handler }
+
+    func setOnExit(_ handler: @escaping (Int32) -> Void) {
+        onExit = handler
+        if launchFailed {
+            // -1 = crash-style (NOT 1, which means "lost the single-instance flock") → backoff relaunch.
+            Task { @MainActor in handler(-1) }
+        }
+    }
 }
 
 /// Build a supervisor that spawns the bundled daemon with per-user sockets + bundled bin/ on PATH.
