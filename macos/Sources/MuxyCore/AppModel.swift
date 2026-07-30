@@ -116,6 +116,7 @@ public final class AppModel: ObservableObject {
                 reconnectTask = nil
                 return
             } catch {
+                connectionState = .reconnecting   // a mid-hydration failure may have flipped us to .live
                 attempt += 1
             }
         }

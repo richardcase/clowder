@@ -7,8 +7,14 @@ final class FakeControlTransport: ControlTransport {
     private(set) var disconnected = false
     var receiver: ((String) -> Void)?
     var onClose: (() -> Void)?
+    /// When true, `send(line:)` throws instead of recording — simulates a transport that was
+    /// built successfully (past `makeTransport()`) but whose socket dies before/during hydration.
+    var failSend = false
     func setReceiver(_ receiver: @escaping (String) -> Void) { self.receiver = receiver }
-    func send(line: String) throws { sentLines.append(line) }
+    func send(line: String) throws {
+        if failSend { struct SendFailed: Error {}; throw SendFailed() }
+        sentLines.append(line)
+    }
     func setOnClose(_ handler: @escaping () -> Void) { self.onClose = handler }
     func disconnect() { disconnected = true; onClose?() }
     /// Test helper: simulate the daemon pushing a JSON line.
@@ -182,6 +188,41 @@ final class AppModelTests: XCTestCase {
 
         XCTAssertEqual(call, callsBefore, "no reconnect attempt may run after shutdown")
         XCTAssertTrue(transports[0].disconnected)
+    }
+
+    func testMidHydrationFailureDuringReconnectStaysReconnecting() async {
+        let controller = SleepController()
+        var transports: [FakeControlTransport] = []
+        var call = 0
+        let model = AppModel(
+            makeTransport: {
+                call += 1
+                let f = FakeControlTransport()
+                if call == 2 { f.failSend = true }   // 1st reconnect attempt: transport builds, hydration send throws
+                transports.append(f)
+                return f
+            },
+            sleep: { await controller.sleep($0) }
+        )
+
+        model.connect()
+        XCTAssertEqual(model.connectionState, .live)
+        transports[0].onClose?()                              // drop → reconnecting
+        XCTAssertEqual(model.connectionState, .reconnecting)
+
+        let parkedAtFirstBackoff = await eventually { controller.parkedCount == 1 }
+        XCTAssertTrue(parkedAtFirstBackoff)
+        controller.advance()   // wake → attemptConnect on transports[1] (failSend) → throws mid-hydration
+
+        let parkedAtSecondBackoff = await eventually { controller.parkedCount == 1 }
+        XCTAssertTrue(parkedAtSecondBackoff)
+        XCTAssertEqual(model.connectionState, .reconnecting,
+                        "a mid-hydration failure must not leave state as .live")
+
+        controller.advance()   // wake → attemptConnect on transports[2] (failSend = false) → live
+        let wentLive = await eventually { model.connectionState == .live }
+        XCTAssertTrue(wentLive)
+        model.shutdown()
     }
 }
 
