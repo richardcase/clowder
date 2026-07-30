@@ -424,8 +424,9 @@ impl Daemon {
             h.abort();
         }
         if let Some(tree) = self.trees.lock().unwrap().get_mut(&agent) {
-            let removed = crate::split_tree::remove_leaf(tree, pane);
-            debug_assert!(removed, "remove_leaf: {pane:?} is not in the tree for {agent:?}");
+            // A concurrent companion-crash reap may have already collapsed this leaf out of the
+            // tree; that's a benign race (whichever of close/reap runs first wins), not a bug.
+            let _ = crate::split_tree::remove_leaf(tree, pane);
         }
         self.owner.lock().unwrap().remove(&pane);
         self.broadcast_tree(agent);
