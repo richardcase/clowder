@@ -153,6 +153,16 @@ impl Pane {
     }
 }
 
+impl Drop for Pane {
+    /// Backstop: a dropped pane must never leak its child process. `kill()` on an
+    /// already-exited child is harmless.
+    fn drop(&mut self) {
+        if let Ok(mut k) = self.killer.lock() {
+            let _ = k.kill();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,5 +252,49 @@ mod tests {
             seen.windows(5).any(|w| w == b"after"),
             "subscriber did not receive post-snapshot output"
         );
+    }
+
+    fn pid_alive(pid: &str) -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", pid])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    #[tokio::test]
+    async fn dropping_a_pane_kills_its_child() {
+        // The child records its own PID, then execs `sleep` (keeping that PID). After we drop the
+        // Pane, `Drop for Pane` must kill that PID.
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("pid");
+        let script = format!("echo $$ > {}; exec sleep 30", pidfile.display());
+        let pane = Pane::spawn(PaneId(9), sh(&script), 80, 24, 4096).unwrap();
+
+        // Wait for the child to write its PID.
+        let mut pid = String::new();
+        for _ in 0..100 {
+            if let Ok(s) = std::fs::read_to_string(&pidfile) {
+                if !s.trim().is_empty() {
+                    pid = s.trim().to_string();
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!pid.is_empty(), "child never wrote its PID");
+        assert!(pid_alive(&pid), "child should be alive before drop");
+
+        drop(pane);
+
+        let mut dead = false;
+        for _ in 0..100 {
+            if !pid_alive(&pid) {
+                dead = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(dead, "child process should be killed when its Pane is dropped");
     }
 }
