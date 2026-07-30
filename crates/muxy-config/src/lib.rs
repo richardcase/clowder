@@ -1,9 +1,6 @@
 use serde::Deserialize;
 use std::path::PathBuf;
 
-const DEFAULT_CLIENT_SOCK: &str = "/tmp/muxy.sock";
-const DEFAULT_CONTROL_SOCK: &str = "/tmp/muxy-control.sock";
-const DEFAULT_HOOK_SOCK: &str = "/tmp/muxy-hook.sock";
 const DEFAULT_BACKLOG_CAP: usize = 256 * 1024;
 const DEFAULT_COLS: u16 = 80;
 const DEFAULT_ROWS: u16 = 24;
@@ -42,13 +39,22 @@ impl Config {
     fn resolve(f: FileConfig, get_env: &dyn Fn(&str) -> Option<String>) -> Config {
         let s = f.sockets.unwrap_or_default();
         let p = f.pane.unwrap_or_default();
-        let path = |env: &str, file: Option<PathBuf>, def: &str| {
-            get_env(env).map(PathBuf::from).or(file).unwrap_or_else(|| PathBuf::from(def))
+
+        // Per-user runtime dir for sockets: $XDG_RUNTIME_DIR › $TMPDIR › /tmp (mirrors the daemon's
+        // single-instance PID lock dir). Env socket vars still override below.
+        let nonempty = |k: &str| get_env(k).filter(|v| !v.is_empty());
+        let runtime_dir = nonempty("XDG_RUNTIME_DIR")
+            .or_else(|| nonempty("TMPDIR"))
+            .unwrap_or_else(|| "/tmp".to_string());
+        let default_sock = |name: &str| PathBuf::from(&runtime_dir).join("muxy").join(name);
+
+        let path = |env: &str, file: Option<PathBuf>, def: PathBuf| {
+            get_env(env).map(PathBuf::from).or(file).unwrap_or(def)
         };
         Config {
-            client_sock: path("MUXY_SOCK", s.client, DEFAULT_CLIENT_SOCK),
-            control_sock: path("MUXY_CONTROL_SOCK", s.control, DEFAULT_CONTROL_SOCK),
-            hook_sock: path("MUXY_HOOK_SOCK", s.hook, DEFAULT_HOOK_SOCK),
+            client_sock: path("MUXY_SOCK", s.client, default_sock("muxy.sock")),
+            control_sock: path("MUXY_CONTROL_SOCK", s.control, default_sock("muxy-control.sock")),
+            hook_sock: path("MUXY_HOOK_SOCK", s.hook, default_sock("muxy-hook.sock")),
             backlog_cap: get_env("MUXY_BACKLOG_CAP").and_then(|v| v.parse().ok())
                 .or(p.backlog_cap).unwrap_or(DEFAULT_BACKLOG_CAP),
             shell: get_env("SHELL").or(p.shell).unwrap_or_else(|| "/bin/sh".into()),
@@ -87,10 +93,36 @@ mod tests {
     #[test]
     fn defaults_when_empty() {
         let c = Config::resolve(FileConfig::default(), &no_env);
-        assert_eq!(c.client_sock, PathBuf::from("/tmp/muxy.sock"));
+        // Per-user default: no XDG_RUNTIME_DIR/TMPDIR in `no_env` → runtime_dir is /tmp.
+        assert_eq!(c.client_sock, PathBuf::from("/tmp/muxy/muxy.sock"));
         assert_eq!(c.backlog_cap, 262144);
         assert_eq!(c.shell, "/bin/sh");
         assert_eq!((c.default_cols, c.default_rows), (80, 24));
+    }
+
+    #[test]
+    fn default_socket_dir_honors_xdg_runtime_dir_then_tmpdir() {
+        let xdg = |k: &str| if k == "XDG_RUNTIME_DIR" { Some("/run/user/501".into()) } else { None };
+        let c = Config::resolve(FileConfig::default(), &xdg);
+        assert_eq!(c.client_sock, PathBuf::from("/run/user/501/muxy/muxy.sock"));
+        assert_eq!(c.control_sock, PathBuf::from("/run/user/501/muxy/muxy-control.sock"));
+        assert_eq!(c.hook_sock, PathBuf::from("/run/user/501/muxy/muxy-hook.sock"));
+
+        let tmp = |k: &str| if k == "TMPDIR" { Some("/var/folders/xy".into()) } else { None };
+        let c2 = Config::resolve(FileConfig::default(), &tmp);
+        assert_eq!(c2.client_sock, PathBuf::from("/var/folders/xy/muxy/muxy.sock"));
+    }
+
+    #[test]
+    fn env_socket_overrides_per_user_default() {
+        let env = |k: &str| match k {
+            "XDG_RUNTIME_DIR" => Some("/run/user/501".into()),
+            "MUXY_SOCK" => Some("/env/explicit.sock".into()),
+            _ => None,
+        };
+        let c = Config::resolve(FileConfig::default(), &env);
+        assert_eq!(c.client_sock, PathBuf::from("/env/explicit.sock")); // env wins over the per-user default
+        assert_eq!(c.control_sock, PathBuf::from("/run/user/501/muxy/muxy-control.sock")); // others still per-user
     }
 
     #[test]
