@@ -683,6 +683,7 @@ dependencies = [
  "muxy-vt",
  "muxy-workspace",
  "notify-rust",
+ "parking_lot",
  "portable-pty",
  "rustix 0.38.44",
  "serde_json",
