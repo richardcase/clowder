@@ -23,6 +23,7 @@ public final class AppModel: ObservableObject {
     public enum ConnectionState: Equatable {
         case connecting
         case live
+        case reconnecting
         case closed(reason: String)
     }
 
@@ -43,11 +44,18 @@ public final class AppModel: ObservableObject {
     private var connection: ControlTransport?
     private var session: ControlSession?
     private var storeSubscription: AnyCancellable?
+    private let sleepFn: (TimeInterval) async -> Void
+    private var reconnectTask: Task<Void, Never>?
+    private var isShuttingDown = false
 
     public init(store: AgentStore = AgentStore(),
-                makeTransport: @escaping () throws -> ControlTransport) {
+                makeTransport: @escaping () throws -> ControlTransport,
+                sleep: @escaping (TimeInterval) async -> Void = { d in
+                    try? await Task.sleep(nanoseconds: UInt64(max(0, d) * 1_000_000_000))
+                }) {
         self.store = store
         self.makeTransport = makeTransport
+        self.sleepFn = sleep
         // Republish nested store changes so SwiftUI views observing AppModel refresh
         // when agents/attention/lastError mutate (nested ObservableObject changes do
         // not cascade to the parent automatically under Combine).
@@ -57,24 +65,62 @@ public final class AppModel: ObservableObject {
         }
     }
 
-    /// Build the transport + session and hydrate. On any failure, land in `.closed`.
+    /// Build the transport + session and hydrate. Initial failure lands in `.closed`; a later DROP
+    /// of a live connection enters the reconnect loop (see `handleClose`).
     public func connect() {
+        isShuttingDown = false
         connectionState = .connecting
         do {
-            let transport = try makeTransport()
-            transport.setOnClose { [weak self] in
-                // UnixSocketConnection already delivers this on the main queue.
-                self?.connectionState = .closed(reason: "Disconnected from daemon")
-            }
-            let session = ControlSession(transport: transport, store: store)
-            self.connection = transport
-            self.session = session
-            connectionState = .live
-            try session.send(.listAgents)
-            try session.send(.listAdapters)
+            try attemptConnect()
         } catch {
             connectionState = .closed(reason: "Could not connect: \(error)")
         }
+    }
+
+    /// One connection attempt: build the transport, wire close→reconnect, hydrate. Throws on failure.
+    private func attemptConnect() throws {
+        let transport = try makeTransport()
+        transport.setOnClose { [weak self] in self?.handleClose() }
+        let session = ControlSession(transport: transport, store: store)
+        self.connection = transport
+        self.session = session
+        connectionState = .live
+        try session.send(.listAgents)
+        try session.send(.listAdapters)
+    }
+
+    /// The transport closed. Unless we're explicitly shutting down, start reconnecting.
+    private func handleClose() {
+        guard !isShuttingDown else { return }
+        scheduleReconnect()
+    }
+
+    private func backoffDelay(_ attempt: Int) -> TimeInterval {
+        min(10.0, 0.5 * pow(2.0, Double(attempt)))
+    }
+
+    /// Start the bounded exponential-backoff reconnect loop (idempotent while one is running).
+    private func scheduleReconnect() {
+        guard !isShuttingDown, reconnectTask == nil else { return }
+        connectionState = .reconnecting
+        reconnectTask = Task { [weak self] in await self?.reconnectLoop() }
+    }
+
+    private func reconnectLoop() async {
+        var attempt = 0
+        while !Task.isCancelled && !isShuttingDown {
+            await sleepFn(backoffDelay(attempt))
+            if Task.isCancelled || isShuttingDown { break }
+            do {
+                try attemptConnect()          // sets .live + re-hydrates on success
+                reconnectTask = nil
+                return
+            } catch {
+                connectionState = .reconnecting   // a mid-hydration failure may have flipped us to .live
+                attempt += 1
+            }
+        }
+        reconnectTask = nil
     }
 
     public func spawn(project: String, task: String, adapter: String) {
@@ -184,9 +230,12 @@ public final class AppModel: ObservableObject {
     /// Dismiss the current error banner.
     public func dismissError() { store.clearLastError() }
 
-    /// Explicit teardown (F1): never rely on deinit — the read loop keeps the
-    /// connection alive while parked in read().
+    /// Explicit teardown (F1): cancel any reconnect loop, then disconnect. `isShuttingDown` makes the
+    /// disconnect's own `onClose` a no-op so we don't re-arm reconnect while quitting.
     public func shutdown() {
+        isShuttingDown = true
+        reconnectTask?.cancel()
+        reconnectTask = nil
         connection?.disconnect()
         session = nil
         connection = nil
