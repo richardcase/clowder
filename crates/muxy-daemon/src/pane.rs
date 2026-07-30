@@ -5,8 +5,6 @@ use std::io::Read;
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
-const BACKLOG_CAP: usize = 256 * 1024;
-
 #[derive(Clone, Debug)]
 pub struct PaneCommand {
     pub program: String,
@@ -27,7 +25,7 @@ pub struct Pane {
 }
 
 impl Pane {
-    pub fn spawn(id: PaneId, cmd: PaneCommand, cols: u16, rows: u16) -> Result<Pane> {
+    pub fn spawn(id: PaneId, cmd: PaneCommand, cols: u16, rows: u16, backlog_cap: usize) -> Result<Pane> {
         let pty = native_pty_system();
         let pair = pty.openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })?;
 
@@ -63,8 +61,8 @@ impl Pane {
                         {
                             let mut b = bl.lock().unwrap();
                             b.extend_from_slice(&chunk);
-                            if b.len() > BACKLOG_CAP {
-                                let drop = b.len() - BACKLOG_CAP;
+                            if b.len() > backlog_cap {
+                                let drop = b.len() - backlog_cap;
                                 b.drain(0..drop);
                             }
                             let _ = tx.send(chunk);
@@ -172,7 +170,7 @@ mod tests {
 
     #[tokio::test]
     async fn pane_captures_child_output_in_backlog() {
-        let pane = Pane::spawn(PaneId(1), sh("printf muxy-hello"), 80, 24).unwrap();
+        let pane = Pane::spawn(PaneId(1), sh("printf muxy-hello"), 80, 24, 256 * 1024).unwrap();
         // give the reader thread time to drain
         for _ in 0..50 {
             if pane.backlog().windows(10).any(|w| w == b"muxy-hello") {
@@ -191,7 +189,7 @@ mod tests {
     #[tokio::test]
     async fn pane_forwards_input_to_child() {
         // `cat` echoes stdin back to stdout
-        let pane = Pane::spawn(PaneId(2), sh("cat"), 80, 24).unwrap();
+        let pane = Pane::spawn(PaneId(2), sh("cat"), 80, 24, 256 * 1024).unwrap();
         let mut sub = pane.subscribe();
         pane.write_input(b"ping\n").unwrap();
         let mut seen = Vec::new();
@@ -211,7 +209,7 @@ mod tests {
     #[tokio::test]
     async fn snapshot_and_subscribe_is_atomic_with_reader_thread() {
         // `cat` echoes stdin back to stdout
-        let pane = Pane::spawn(PaneId(3), sh("cat"), 80, 24).unwrap();
+        let pane = Pane::spawn(PaneId(3), sh("cat"), 80, 24, 256 * 1024).unwrap();
         pane.write_input(b"before\n").unwrap();
 
         // Wait until "before" has landed in the backlog.

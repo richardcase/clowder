@@ -11,6 +11,7 @@ path = "src/main.rs"
 muxy-proto = { path = "../muxy-proto" }
 muxy-workspace = { path = "../muxy-workspace" }
 muxy-vt = { path = "../muxy-vt" }
+muxy-config = { path = "../muxy-config" }
 tokio = { workspace = true }
 portable-pty = { workspace = true }
 anyhow = { workspace = true }

@@ -42,6 +42,10 @@ pub struct Daemon {
     split_tx: broadcast::Sender<(PaneId, PaneTree)>,
     hookless: Arc<Mutex<std::collections::HashSet<PaneId>>>,
     scanners: Arc<Mutex<HashMap<PaneId, tokio::task::JoinHandle<()>>>>,
+    pub(crate) backlog_cap: usize,
+    pub(crate) default_cols: u16,
+    pub(crate) default_rows: u16,
+    pub(crate) shell: String,
 }
 
 impl Daemon {
@@ -70,7 +74,22 @@ impl Daemon {
             split_tx,
             hookless: Arc::new(Mutex::new(std::collections::HashSet::new())),
             scanners: Arc::new(Mutex::new(HashMap::new())),
+            backlog_cap: 256 * 1024,
+            default_cols: 80,
+            default_rows: 24,
+            shell: std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()),
         }
+    }
+
+    /// Build a daemon whose pane defaults (sockets already resolved into `hook_sock`, backlog cap,
+    /// shell, pane size) come from `muxy-config`. Uses `OsNotifier` like `new()`.
+    pub fn new_from_config(config: muxy_config::Config) -> Daemon {
+        let mut d = Daemon::new_with(Arc::new(OsNotifier), config.hook_sock);
+        d.backlog_cap = config.backlog_cap;
+        d.default_cols = config.default_cols;
+        d.default_rows = config.default_rows;
+        d.shell = config.shell;
+        d
     }
 
     pub fn set_attention(&self, pane: PaneId, state: AttentionState) {
@@ -106,7 +125,7 @@ impl Daemon {
 
     pub fn spawn_pane(&self, cmd: PaneCommand, cols: u16, rows: u16) -> Result<PaneId> {
         let id = self.alloc_id();
-        let pane = Pane::spawn(id, cmd, cols, rows)?;
+        let pane = Pane::spawn(id, cmd, cols, rows, self.backlog_cap)?;
         self.register_pane(id, pane);
         Ok(id)
     }
@@ -128,7 +147,7 @@ impl Daemon {
             cmd.env.push(("MUXY_AGENT_ID".into(), id.0.to_string()));
             cmd.env.push(("MUXY_HOOK_SOCK".into(), self.hook_sock.to_string_lossy().to_string()));
 
-            Pane::spawn(id, cmd, 80, 24)
+            Pane::spawn(id, cmd, self.default_cols, self.default_rows, self.backlog_cap)
         })() {
             Ok(p) => p,
             Err(e) => {
@@ -303,8 +322,11 @@ impl Daemon {
             .get(&agent)
             .map(|w| w.path.clone())
             .ok_or_else(|| anyhow::anyhow!("no workspace for agent {agent:?}"))?;
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-        let companion = self.spawn_pane(companion_command(shell, path), 80, 24)?;
+        let companion = self.spawn_pane(
+            companion_command(self.shell.clone(), path),
+            self.default_cols,
+            self.default_rows,
+        )?;
         let sid = self.alloc_split_id();
         {
             let mut trees = self.trees.lock().unwrap();
@@ -542,6 +564,29 @@ mod tests {
             cwd: None,
             env: vec![],
         }
+    }
+
+    #[tokio::test]
+    async fn small_backlog_cap_bounds_the_buffer() {
+        // A daemon with a tiny configured backlog cap must bound the pane's byte-tail even
+        // though the child emits far more than the cap.
+        let mut d = Daemon::new_with(Arc::new(crate::FakeNotifier::new()), "/tmp/unused-cap.sock".into());
+        d.backlog_cap = 4096; // pub(crate) — set before wrapping in Arc
+        let daemon = Arc::new(d);
+        let pane = daemon
+            .spawn_pane(sh("yes ABCDEFGHIJKLMNOPQRST | head -c 20000"), 80, 24)
+            .unwrap();
+        let backlog_len = || daemon.panes.lock().unwrap().get(&pane).unwrap().backlog().len();
+        // Wait until the buffer fills to the cap (the child prints ~20000 bytes >> 4096).
+        for _ in 0..100 {
+            if backlog_len() >= 4096 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let len = backlog_len();
+        assert!(len <= 4096, "backlog {len} exceeded the configured cap of 4096");
+        assert!(len >= 2048, "backlog {len} never filled — drain path not exercised");
     }
 
     #[tokio::test]
