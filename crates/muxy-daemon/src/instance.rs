@@ -51,6 +51,13 @@ impl InstanceLock {
     }
 }
 
+/// Best-effort unlink of each path; a missing file is not an error.
+pub fn remove_files(paths: &[&Path]) {
+    for p in paths {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -68,7 +75,21 @@ mod tests {
 
         // Releasing the first lock lets a later acquire succeed (stale lock is reclaimable).
         drop(lock1);
-        let _lock2 = InstanceLock::acquire(&path).expect("acquire after release succeeds");
+        // Retry briefly: when this test runs alongside the crate's PTY-spawning tests (which
+        // fork() child processes), a sibling test's forked-but-not-yet-exec'd child can transiently
+        // hold a duplicate of our just-closed fd (fork() copies fds; Rust's CLOEXEC only takes
+        // effect at exec()), making an immediate reacquire spuriously see WOULDBLOCK. This is a
+        // test-process artifact of running many fork-happy tests in one binary, not a production
+        // concern (the daemon never re-acquires its own lock). Give it a brief window to clear.
+        let mut lock2 = InstanceLock::acquire(&path);
+        for _ in 0..20 {
+            if lock2.is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            lock2 = InstanceLock::acquire(&path);
+        }
+        let _lock2 = lock2.expect("acquire after release succeeds");
     }
 
     #[test]
@@ -80,5 +101,19 @@ mod tests {
             "default path should end with muxy/daemon.pid, got {}",
             p.display()
         );
+    }
+
+    #[test]
+    fn remove_files_unlinks_existing_and_ignores_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let present = dir.path().join("a.sock");
+        let missing = dir.path().join("b.sock");
+        std::fs::write(&present, b"x").unwrap();
+        assert!(present.exists());
+
+        remove_files(&[present.as_path(), missing.as_path()]);
+
+        assert!(!present.exists(), "existing file should be removed");
+        assert!(!missing.exists(), "missing file stays missing (no panic)");
     }
 }
