@@ -261,16 +261,16 @@ final class DaemonSupervisorTests: XCTestCase {
             sleep: { await controller.sleep($0) }
         )
         sup.start()
-        // Each relaunched process immediately crashes (code 2), 7 times.
-        spawned[0].exit(2)
-        for _ in 0..<7 {
+        spawned[0].exit(2)                            // schedule backoff #1 (0.5)
+        // 7 backoffs total: crash after each of the first 6 relaunches; let the 7th survive (so no
+        // trailing parked sleep is left dangling).
+        for i in 0..<7 {
             let parked = await eventually { controller.parkedCount == 1 }
             XCTAssertTrue(parked)
-            controller.advance()                      // relaunch → new process → crash it
-            let n = await eventually { spawned.count >= 1 }   // let the relaunch land
-            XCTAssertTrue(n)
-            spawned.last?.exit(2)
-            await Task.yield()
+            controller.advance()                      // consume the backoff → relaunch
+            let running = await eventually { sup.state == .running }
+            XCTAssertTrue(running)
+            if i < 6 { spawned.last?.exit(2) }        // crash again → schedule the next backoff
         }
         // 7 recorded backoffs, bounded at 10, non-decreasing.
         XCTAssertEqual(controller.delays, [0.5, 1, 2, 4, 8, 10, 10])
@@ -341,6 +341,8 @@ public final class DaemonSupervisor {
     private let sleepFn: (TimeInterval) async -> Void
     private var process: DaemonProcess?
     private var relaunchTask: Task<Void, Never>?
+    private var relaunchAttempt = 0     // persists across crashes so backoff escalates (crashes arrive
+                                        // as separate async callbacks, not one continuous loop)
     private var isStopping = false
 
     public init(spawn: @escaping () -> DaemonProcess,
@@ -355,6 +357,7 @@ public final class DaemonSupervisor {
     public func start() {
         guard process == nil, relaunchTask == nil else { return }
         isStopping = false
+        relaunchAttempt = 0
         launch()
     }
 
@@ -377,24 +380,23 @@ public final class DaemonSupervisor {
         scheduleRelaunch()
     }
 
+    private func backoffDelay(_ attempt: Int) -> TimeInterval { min(10.0, 0.5 * pow(2.0, Double(attempt))) }
+
+    /// Schedule one delayed relaunch. `relaunchAttempt` is an INSTANCE counter (not loop-local): each
+    /// crash arrives as its own async `onExit` callback, so the counter must persist across callbacks
+    /// for the backoff to escalate. Reset only in `start()`.
     private func scheduleRelaunch() {
         guard relaunchTask == nil, !isStopping else { return }
         state = .relaunching
-        relaunchTask = Task { [weak self] in await self?.relaunchLoop() }
-    }
-
-    private func backoffDelay(_ attempt: Int) -> TimeInterval { min(10.0, 0.5 * pow(2.0, Double(attempt))) }
-
-    private func relaunchLoop() async {
-        var attempt = 0
-        while !Task.isCancelled && !isStopping {
-            await sleepFn(backoffDelay(attempt))
-            if Task.isCancelled || isStopping { break }
-            launch()                 // spawn again; sets .running
-            relaunchTask = nil
-            return
+        let delay = backoffDelay(relaunchAttempt)
+        relaunchAttempt += 1
+        relaunchTask = Task { [weak self] in
+            guard let self else { return }
+            await self.sleepFn(delay)
+            self.relaunchTask = nil
+            guard !Task.isCancelled, !self.isStopping else { return }
+            self.launch()            // spawn again; sets .running
         }
-        relaunchTask = nil
     }
 
     /// Explicit teardown (app quit): cancel relaunches and terminate the child.
