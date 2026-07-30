@@ -5,12 +5,11 @@ use tokio::net::UnixListener;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let sock_path = std::env::var("MUXY_SOCK").unwrap_or_else(|_| "/tmp/muxy.sock".into());
-    let daemon = Arc::new(Daemon::new());
+    let config = muxy_config::Config::load();
+    let sock_path = config.client_sock.clone();
+    let control_path = config.control_sock.clone();
+    let daemon = Arc::new(Daemon::new_from_config(config));
     let hook_path = daemon.hook_sock().to_path_buf();
-
-    let control_path =
-        std::env::var("MUXY_CONTROL_SOCK").unwrap_or_else(|_| "/tmp/muxy-control.sock".into());
 
     let _ = std::fs::remove_file(&sock_path);
     let _ = std::fs::remove_file(&hook_path);
@@ -19,8 +18,10 @@ async fn main() -> Result<()> {
     let hook_listener = UnixListener::bind(&hook_path)?;
     let control_listener = UnixListener::bind(&control_path)?;
     eprintln!(
-        "muxy-daemon: client={sock_path} hook={} control={control_path}",
-        hook_path.display()
+        "muxy-daemon: client={} hook={} control={}",
+        sock_path.display(),
+        hook_path.display(),
+        control_path.display()
     );
 
     let hooks = daemon.clone();
