@@ -114,6 +114,8 @@ the scripts read:
 - `CODESIGN_P12_BASE64`, `CODESIGN_P12_PASSWORD`, `CODESIGN_IDENTITY`, `KEYCHAIN_PASSWORD`
 - plus your chosen notary set: `NOTARY_KEY_BASE64` + `NOTARY_KEY_ID` + `NOTARY_ISSUER`, **or**
   `NOTARY_APPLE_ID` + `NOTARY_PASSWORD` + `NOTARY_TEAM_ID`.
+- optional: `HOMEBREW_TAP_DEPLOY_KEY` — the tap repo's write deploy key, if you publish the Homebrew cask.
+  A final signed release also auto-bumps the cask; see [`homebrew.md`](homebrew.md).
 
 ### c. Create a Doppler service token
 

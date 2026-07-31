@@ -125,10 +125,24 @@ jobs:
         with:
           files: dist/Clowder-*-macos.dmg
           generate_release_notes: true
+          # A tag with a '-' (e.g. v0.3.0-rc1) is a pre-release: keeps it out of GitHub "Latest"
+          # (and thus the Homebrew cask livecheck), and the cask-bump step below skips it too.
+          prerelease: ${{ contains(github.ref_name, '-') }}
           body: |
             Signed & notarized macOS build of Clowder (`${{ github.ref_name }}`).
 
             Open the `.dmg` and drag **Clowder** to **Applications**. No Gatekeeper workaround needed.
+
+      - name: Update Homebrew tap (cask bump)
+        if: ${{ steps.signing.outputs.enabled == 'true' && !contains(github.ref_name, '-') }}
+        env:
+          HOMEBREW_TAP_DEPLOY_KEY: ${{ steps.doppler.outputs.HOMEBREW_TAP_DEPLOY_KEY }}
+        run: |
+          if [ -z "$HOMEBREW_TAP_DEPLOY_KEY" ]; then
+            echo "::warning::No HOMEBREW_TAP_DEPLOY_KEY in Doppler — skipping Homebrew cask bump."
+            exit 0
+          fi
+          scripts/update-homebrew-tap.sh
 
       # ---------- unsigned fallback (no DOPPLER_TOKEN: forks / unconfigured repo) ----------
       - name: Zip the unsigned app bundle
@@ -141,6 +155,7 @@ jobs:
         with:
           files: dist/Clowder-*-macos.zip
           generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
           body: |
             Unsigned macOS build of Clowder (`${{ github.ref_name }}`).
 

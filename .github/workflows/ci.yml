@@ -17,6 +17,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Lint the Homebrew cask template (rendered with placeholder values) so a cask syntax/style error
+      # is caught on the PR, not at release time when the tap bump runs. Homebrew is preinstalled.
+      - name: Lint Homebrew cask template (brew style)
+        run: |
+          dummy_sha="$(printf '0%.0s' $(seq 1 64))"
+          mkdir -p "$RUNNER_TEMP/Casks"
+          sed -e "s/@@VERSION@@/0.0.0/" -e "s/@@SHA256@@/$dummy_sha/" \
+            scripts/homebrew/clowder.rb.tmpl > "$RUNNER_TEMP/Casks/clowder.rb"
+          brew style "$RUNNER_TEMP/Casks/clowder.rb"
+
       - name: Select Xcode (Metal shader compiler needs full Xcode)
         uses: maxim-lobanov/setup-xcode@v1
         with:
