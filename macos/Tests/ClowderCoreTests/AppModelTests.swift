@@ -70,6 +70,23 @@ final class AppModelTests: XCTestCase {
         XCTAssertTrue(fake.disconnected)
     }
 
+    func testReconnectSwapsTransportClearsStoreAndReconnects() {
+        let first = FakeControlTransport()
+        let model = AppModel(makeTransport: { first })
+        model.connect()
+        first.deliver(#"{"type":"agentList","agents":[{"pane":1,"project":"/p","task":"t","state":"Working"}]}"#)
+        XCTAssertFalse(model.store.agents.isEmpty)
+
+        let second = FakeControlTransport()
+        model.reconnect(makeTransport: { second })
+
+        XCTAssertTrue(first.disconnected)                                  // old backend torn down
+        XCTAssertTrue(model.store.agents.isEmpty)                          // old agents dropped
+        XCTAssertEqual(model.connectionState, .live)                      // connected to the new transport
+        XCTAssertTrue(second.sentLines.contains { $0.contains("\"type\":\"listAgents\"") })  // hydrated the new one
+        model.shutdown()
+    }
+
     func testAppliedEventsFlowToStore() {
         let fake = FakeControlTransport()
         let model = AppModel(makeTransport: { fake })

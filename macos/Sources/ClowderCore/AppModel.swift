@@ -40,7 +40,7 @@ public final class AppModel: ObservableObject {
     @Published public var showingSpawn: Bool = false
     @Published public var pendingLifecycle: PendingLifecycle?
 
-    private let makeTransport: () throws -> ControlTransport
+    private var makeTransport: () throws -> ControlTransport
     private var connection: ControlTransport?
     private var session: ControlSession?
     private var storeSubscription: AnyCancellable?
@@ -75,6 +75,17 @@ public final class AppModel: ObservableObject {
         } catch {
             connectionState = .closed(reason: "Could not connect: \(error)")
         }
+    }
+
+    /// Point the control channel at a different backend (a live local↔remote swap): tear down the
+    /// current connection + reconnect loop, drop the previous backend's agents, then connect to the
+    /// new transport. Keeps the same `AppModel` instance so SwiftUI views stay bound.
+    public func reconnect(makeTransport newMakeTransport: @escaping () throws -> ControlTransport) {
+        shutdown()                       // cancel reconnect, disconnect, clear session/connection
+        store.reset()                    // drop the previous backend's agents/trees
+        selectedPane = nil
+        self.makeTransport = newMakeTransport
+        connect()                        // isShuttingDown = false; attempt against the new transport
     }
 
     /// One connection attempt: build the transport, wire close→reconnect, hydrate. Throws on failure.

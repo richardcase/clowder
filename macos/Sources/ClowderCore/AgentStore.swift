@@ -44,6 +44,14 @@ public final class AgentStore: ObservableObject {
     /// Dismiss the current error (clears the error banner).
     public func clearLastError() { lastError = nil }
 
+    /// Drop all per-backend state (used when the app swaps between the local daemon and the remote
+    /// forwarder). Adapters re-hydrate from the new connection's adapterList.
+    public func reset() {
+        agents = [:]
+        trees = [:]
+        lastError = nil
+    }
+
     /// Agents grouped by project (projects sorted; agents within a project sorted by pane).
     public var byProject: [(project: String, agents: [AgentInfo])] {
         Dictionary(grouping: agents.values, by: { $0.project })
