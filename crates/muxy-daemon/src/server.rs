@@ -730,8 +730,24 @@ mod tests {
             let _ = h.await; // session ends; pane must keep running
         }
 
-        // Let the detached pane run a bit more.
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        // Wait — by condition, not a fixed sleep — until the detached shell has produced a line that
+        // can only exist well after the first client detached. A fixed 400ms wait flaked on slow /
+        // loaded CI runners, where the shell (one line per 100ms) hadn't reached line4 yet.
+        let mut produced_while_detached = false;
+        for _ in 0..200 {
+            let has_line4 = daemon
+                .panes
+                .lock()
+                .get(&pane)
+                .map(|p| p.backlog().windows(5).any(|w| w == b"line4"))
+                .unwrap_or(false);
+            if has_line4 {
+                produced_while_detached = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(produced_while_detached, "shell did not keep producing output while detached");
 
         // Second client reattaches; the backlog replay must contain later lines
         // that were produced WHILE no client was attached.
