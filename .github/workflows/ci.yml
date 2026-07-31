@@ -20,7 +20,9 @@ jobs:
       - name: Select Xcode (Metal shader compiler needs full Xcode)
         uses: maxim-lobanov/setup-xcode@v1
         with:
-          xcode-version: latest-stable
+          # Pin to Xcode 16.x (latest minor on the runner): the recipe was verified on Xcode 16, and
+          # this avoids drift to a toolchain where the Metal compiler is a separate download.
+          xcode-version: '16'
 
       - name: Verify toolchain
         run: |
@@ -66,5 +68,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: Muxy-app-unsigned
-          path: dist/Muxy.app
+          # Upload the `dist` root so the artifact keeps the `Muxy.app/Contents/...` bundle structure
+          # (pointing at `dist/Muxy.app` would strip the top `.app` dir, yielding an unusable bundle).
+          path: dist
           if-no-files-found: error
