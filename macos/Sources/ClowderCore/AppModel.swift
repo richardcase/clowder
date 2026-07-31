@@ -85,7 +85,15 @@ public final class AppModel: ObservableObject {
         store.reset()                    // drop the previous backend's agents/trees
         selectedPane = nil
         self.makeTransport = newMakeTransport
-        connect()                        // isShuttingDown = false; attempt against the new transport
+        isShuttingDown = false
+        connectionState = .connecting
+        do {
+            try attemptConnect()
+        } catch {
+            // The freshly-started backend may still be binding its socket — retry with backoff
+            // (the same bounded loop as a live drop) rather than giving up in `.closed`.
+            scheduleReconnect()
+        }
     }
 
     /// One connection attempt: build the transport, wire close→reconnect, hydrate. Throws on failure.
