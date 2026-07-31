@@ -150,9 +150,10 @@ and copy the resulting `ghostty-internal.a` + `ghostty.h` to `macos/vendor/libgh
 toolchain (full Xcode for Metal, zig 0.16, clang 17). This makes the vendored `.a` reproducible and is
 the build step M6d's CI invokes. The `.a` stays gitignored (built by the script / cached in CI).
 
-### M6c — Codesign → notarize → staple → DMG (DEFERRED — blocked on Developer ID)
+### M6c — Codesign → notarize → staple → DMG (BUILT 2026-07-31 — Developer ID obtained)
 
-Design (not built until a Developer ID exists): `codesign --deep --options runtime` with a hardened-
+Built — see plan `docs/superpowers/plans/2026-07-31-clowder-m6c-signing.md`
+(`scripts/sign-app.sh` + `scripts/package-dmg.sh` + secret-gated `release.yml`). Design as shipped: `codesign --deep --options runtime` with a hardened-
 runtime entitlements plist and the "Developer ID Application" identity over `Muxy.app` (bundled
 binaries signed inner-first); submit to Apple `notarytool` with an app-specific password / API key;
 `stapler staple`; package a DMG (`create-dmg` or `hdiutil`). CI secrets: the signing identity (imported

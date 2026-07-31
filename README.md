@@ -62,14 +62,12 @@ and survival.
 
 ### From a release (collaborators)
 
-Download `Clowder-vX.Y.Z-macos.zip` from the repo's [Releases](https://github.com/richardcase/clowder/releases)
-and unzip it. The build is **unsigned / un-notarized**, so macOS Gatekeeper will quarantine it — clear
-the quarantine, then move it to `/Applications`:
+Download `Clowder-vX.Y.Z-macos.dmg` from the repo's [Releases](https://github.com/richardcase/clowder/releases),
+open it, and drag **Clowder** to **Applications**. Releases are **signed with a Developer ID and
+notarized by Apple**, so Gatekeeper accepts them with no workaround.
 
-```sh
-xattr -dr com.apple.quarantine Clowder.app   # or: right-click Clowder.app → Open
-mv Clowder.app /Applications/
-```
+> Older releases (before signing was set up) shipped as an unsigned `.zip`; if you have one of those,
+> clear the quarantine first: `xattr -dr com.apple.quarantine Clowder.app`.
 
 ### From source
 
@@ -133,18 +131,20 @@ Repo layout:
 
 The top-level [`VERSION`](VERSION) file is the single source of truth; `scripts/set-version.sh <X.Y.Z>`
 propagates it into the Cargo workspace and the app's Info.plist. Pushing a `vX.Y.Z` tag runs
-[`release.yml`](.github/workflows/release.yml), which builds the app and publishes a GitHub Release with
-the (unsigned) `Clowder.app` attached. See [`docs/versioning.md`](docs/versioning.md).
+[`release.yml`](.github/workflows/release.yml), which builds the app and publishes a GitHub Release. When
+the Developer ID signing secrets are configured it attaches a **signed + notarized `.dmg`**
+(`scripts/sign-app.sh` → `scripts/package-dmg.sh`); otherwise it falls back to an unsigned `.zip`. See
+[`docs/versioning.md`](docs/versioning.md).
 
 ## Status
 
 Built and green in CI: the daemon/client spine, the native SwiftUI + libghostty client, split panes,
 the Land/Discard lifecycle (git + jj), Claude/Codex/shell adapters, robustness (config, single-instance,
-reconnect), packaging (a self-contained `.app`, reproducible libghostty build, versioned releases).
+reconnect), packaging (a self-contained `.app`, reproducible libghostty build, versioned releases),
+**code-signing → notarization → signed DMG** (Developer ID).
 
-Not yet done: **code-signing → notarization → DMG** and a **Homebrew cask** (both need an Apple
-Developer ID), an authoritative daemon-side VT grid (scrollback reflow-on-resize), and agent survival
-across a daemon restart.
+Not yet done: a **Homebrew cask** (`brew install --cask`), an authoritative daemon-side VT grid
+(scrollback reflow-on-resize), and agent survival across a daemon restart.
 
 ## License
 
