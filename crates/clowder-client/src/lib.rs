@@ -4,6 +4,8 @@ use std::path::Path;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
+pub mod forward;
+
 /// RAII guard that restores the terminal from raw mode when dropped, even on
 /// error paths or panics/unwinds — so a crash in `pump` never leaves the
 /// user's terminal wrecked.

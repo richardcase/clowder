@@ -19,8 +19,18 @@ async fn main() -> Result<()> {
                 .ok_or_else(|| anyhow!("usage: clowder attach <pane-id>"))?;
             attach(pane).await
         }
+        Some("connect") => {
+            let cfg = clowder_config::Config::load();
+            let host = args.get(2).cloned()
+                .or(cfg.remote_host.clone())
+                .ok_or_else(|| anyhow!("usage: clowder connect <host:port>  (or set [remote] host / CLOWDER_REMOTE_HOST)"))?;
+            let dir = cfg.control_sock.parent()
+                .ok_or_else(|| anyhow!("cannot derive forwarder socket dir"))?
+                .join("remote");
+            clowder_client::forward::forward(host, dir).await
+        }
         // Legacy: `clowder <pane-id>` still attaches.
         Some(other) if other.parse::<u64>().is_ok() => attach(other.parse().unwrap()).await,
-        _ => Err(anyhow!("usage: clowder <spawn|attach> ...")),
+        _ => Err(anyhow!("usage: clowder <spawn|attach|connect> ...")),
     }
 }
