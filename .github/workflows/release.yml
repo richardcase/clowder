@@ -133,13 +133,13 @@ jobs:
 
             Open the `.dmg` and drag **Clowder** to **Applications**. No Gatekeeper workaround needed.
 
-      - name: Update Homebrew tap (cask bump)
+      - name: Update Homebrew tap (publish DMG + cask bump)
         if: ${{ steps.signing.outputs.enabled == 'true' && !contains(github.ref_name, '-') }}
         env:
-          HOMEBREW_TAP_DEPLOY_KEY: ${{ steps.doppler.outputs.HOMEBREW_TAP_DEPLOY_KEY }}
+          HOMEBREW_TAP_TOKEN: ${{ steps.doppler.outputs.HOMEBREW_TAP_TOKEN }}
         run: |
-          if [ -z "$HOMEBREW_TAP_DEPLOY_KEY" ]; then
-            echo "::warning::No HOMEBREW_TAP_DEPLOY_KEY in Doppler — skipping Homebrew cask bump."
+          if [ -z "$HOMEBREW_TAP_TOKEN" ]; then
+            echo "::warning::No HOMEBREW_TAP_TOKEN in Doppler — skipping Homebrew publish."
             exit 0
           fi
           scripts/update-homebrew-tap.sh

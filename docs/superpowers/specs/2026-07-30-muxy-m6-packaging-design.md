@@ -182,11 +182,13 @@ publishes a GitHub Release with it attached. (Signed DMG + Homebrew bump join th
 ### M6f — Homebrew cask + tap (BUILT 2026-07-31)
 
 Built — see plan `docs/superpowers/plans/2026-07-31-clowder-m6f-homebrew.md` and
-[`docs/homebrew.md`](../../homebrew.md). A separate `richardcase/homebrew-clowder` tap repo holds a
-**cask** (`Casks/clowder.rb`) installing the notarized DMG from the GitHub Release (+ the `clowder` CLI on
-PATH via a `binary` stanza). The release CI renders `scripts/homebrew/clowder.rb.tmpl` with the version +
-DMG sha256 and SSH-pushes it to the tap (write deploy key from Doppler) on each **final** signed release;
-pre-release tags are skipped. `brew install --cask richardcase/clowder/clowder`.
+[`docs/homebrew.md`](../../homebrew.md). A separate **public** `richardcase/homebrew-clowder` tap repo holds
+a **cask** (`Casks/clowder.rb`) installing the notarized DMG (+ the `clowder` CLI on PATH via a `binary`
+stanza). Because the clowder source repo is **private** (its release assets aren't publicly downloadable),
+the release CI **re-hosts the DMG on the public tap's Releases** and points the cask there. It renders
+`scripts/homebrew/clowder.rb.tmpl` with the version + DMG sha256 and pushes the DMG + cask to the tap using
+a fine-grained PAT (`HOMEBREW_TAP_TOKEN`, from Doppler) on each **final** signed release; pre-release tags
+are skipped. `brew install --cask richardcase/clowder/clowder`.
 
 ## Data flow
 

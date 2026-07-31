@@ -3,6 +3,14 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended)
 > or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax.
 
+> **Amendment (2026-07-31): the clowder source repo is private.** Its release assets aren't publicly
+> downloadable, so the original plan below (cask URL → clowder repo; auth via an SSH deploy key) fails with
+> a 404 in `brew`. Superseded: the signed **DMG is re-hosted on the public tap repo's Releases** and the
+> cask points there, and auth is a single **fine-grained PAT** `HOMEBREW_TAP_TOKEN` (tap repo,
+> contents:write) — doing both the DMG upload (GitHub API) and the cask push — so the **deploy key is
+> dropped**. Read every "deploy key / SSH-push / clowder-repo URL" below as "PAT / https / tap-repo URL".
+> See [`docs/homebrew.md`](../../homebrew.md).
+
 **Goal:** Ship Clowder via a Homebrew **cask** in a personal tap (`richardcase/homebrew-clowder`), and
 auto-bump it on every **final** signed release. `brew install --cask richardcase/clowder/clowder` installs
 the notarized `Clowder.app` and puts the `clowder` CLI on `PATH`.
