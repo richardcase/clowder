@@ -33,6 +33,21 @@ impl Daemon {
     }
 }
 
+use std::net::{IpAddr, SocketAddr};
+
+/// Phase A has no auth, so binding anywhere but loopback or the Tailscale CGNAT
+/// range (100.64.0.0/10) deserves a startup warning. Returns true = warn.
+pub fn should_warn_exposed(addr: &SocketAddr) -> bool {
+    match addr.ip() {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            let is_tailnet = o[0] == 100 && (64..=127).contains(&o[1]); // 100.64.0.0/10
+            !(v4.is_loopback() || is_tailnet)
+        }
+        IpAddr::V6(v6) => !v6.is_loopback(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -74,5 +89,18 @@ mod tests {
         msgs.send(&ClientToDaemon::Attach { pane: PaneId(999_999) }).await.unwrap();
         let res = h.await.unwrap();
         assert!(res.is_ok(), "render route returned: {res:?}");
+    }
+
+    #[test]
+    fn exposure_warning_predicate() {
+        use std::net::SocketAddr;
+        let addr = |s: &str| s.parse::<SocketAddr>().unwrap();
+        // loopback and tailnet (100.64/10) are the sanctioned Phase-A binds → no warning
+        assert!(!should_warn_exposed(&addr("127.0.0.1:7777")));
+        assert!(!should_warn_exposed(&addr("[::1]:7777")));
+        assert!(!should_warn_exposed(&addr("100.101.102.103:7777")));
+        // anything else (all-interfaces / LAN / public) has no auth in Phase A → warn
+        assert!(should_warn_exposed(&addr("0.0.0.0:7777")));
+        assert!(should_warn_exposed(&addr("192.168.1.10:7777")));
     }
 }
