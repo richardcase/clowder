@@ -1,7 +1,0 @@
-[package]
-name = "muxy-vt"
-version.workspace = true
-edition.workspace = true
-
-[dependencies]
-vte = "0.13"

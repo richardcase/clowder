@@ -244,6 +244,89 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
+name = "clowder-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clowder-config",
+ "clowder-daemon",
+ "clowder-proto",
+ "clowder-workspace",
+ "crossterm",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "clowder-config"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
+name = "clowder-daemon"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clowder-config",
+ "clowder-proto",
+ "clowder-vt",
+ "clowder-workspace",
+ "notify-rust",
+ "parking_lot",
+ "portable-pty",
+ "rustix 0.38.44",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "clowder-hook"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clowder-proto",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "clowder-proto"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "futures-util",
+ "postcard",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "clowder-vt"
+version = "0.1.0"
+dependencies = [
+ "vte",
+]
+
+[[package]]
+name = "clowder-workspace"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "tempfile",
+]
+
+[[package]]
 name = "cobs"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -665,89 +748,6 @@ dependencies = [
  "log",
  "wasi",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "muxy-client"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "crossterm",
- "muxy-config",
- "muxy-daemon",
- "muxy-proto",
- "muxy-workspace",
- "serde_json",
- "tempfile",
- "tokio",
-]
-
-[[package]]
-name = "muxy-config"
-version = "0.1.0"
-dependencies = [
- "serde",
- "tempfile",
- "toml",
-]
-
-[[package]]
-name = "muxy-daemon"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "muxy-config",
- "muxy-proto",
- "muxy-vt",
- "muxy-workspace",
- "notify-rust",
- "parking_lot",
- "portable-pty",
- "rustix 0.38.44",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "muxy-hook"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "muxy-proto",
- "tempfile",
- "tokio",
-]
-
-[[package]]
-name = "muxy-proto"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytes",
- "futures-util",
- "postcard",
- "serde",
- "serde_json",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
-name = "muxy-vt"
-version = "0.1.0"
-dependencies = [
- "vte",
-]
-
-[[package]]
-name = "muxy-workspace"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "tempfile",
 ]
 
 [[package]]

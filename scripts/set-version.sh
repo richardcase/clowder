@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Set the muxy version everywhere from a single source. Writes the top-level VERSION file and the
+# Set the clowder version everywhere from a single source. Writes the top-level VERSION file and the
 # Cargo workspace version, then refreshes Cargo.lock. The macOS bundle version flows from VERSION via
 # scripts/build-app.sh (Info.plist), and SwiftPM versioning comes from the git tag.
 #

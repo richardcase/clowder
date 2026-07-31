@@ -1,0 +1,26 @@
+use anyhow::{anyhow, Result};
+use clowder_client::{attach, spawn_via_control};
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    match args.get(1).map(|s| s.as_str()) {
+        Some("spawn") => {
+            let project = args.get(2).ok_or_else(|| anyhow!("usage: clowder spawn <project> <task> [adapter]"))?;
+            let task = args.get(3).ok_or_else(|| anyhow!("usage: clowder spawn <project> <task> [adapter]"))?;
+            let adapter = args.get(4).map(|s| s.as_str()).unwrap_or("claude");
+            let sock = clowder_config::Config::load().control_sock;
+            let pane = spawn_via_control(&sock, project, task, adapter).await?;
+            println!("{}", pane.0);
+            Ok(())
+        }
+        Some("attach") => {
+            let pane = args.get(2).and_then(|s| s.parse().ok())
+                .ok_or_else(|| anyhow!("usage: clowder attach <pane-id>"))?;
+            attach(pane).await
+        }
+        // Legacy: `clowder <pane-id>` still attaches.
+        Some(other) if other.parse::<u64>().is_ok() => attach(other.parse().unwrap()).await,
+        _ => Err(anyhow!("usage: clowder <spawn|attach> ...")),
+    }
+}
