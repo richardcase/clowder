@@ -1,0 +1,11 @@
+[package]
+name = "clowder-config"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3"

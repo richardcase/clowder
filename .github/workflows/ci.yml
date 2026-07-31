@@ -57,18 +57,18 @@ jobs:
       - name: Rust tests (whole workspace)
         run: cargo test --workspace --locked
 
-      - name: Swift tests (MuxyCore)
+      - name: Swift tests (ClowderCore)
         run: swift test
         working-directory: macos
 
-      - name: Assemble unsigned Muxy.app
+      - name: Assemble unsigned Clowder.app
         run: scripts/build-app.sh
 
       - name: Upload unsigned app artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Muxy-app-unsigned
-          # Upload the `dist` root so the artifact keeps the `Muxy.app/Contents/...` bundle structure
-          # (pointing at `dist/Muxy.app` would strip the top `.app` dir, yielding an unusable bundle).
+          name: Clowder-app-unsigned
+          # Upload the `dist` root so the artifact keeps the `Clowder.app/Contents/...` bundle structure
+          # (pointing at `dist/Clowder.app` would strip the top `.app` dir, yielding an unusable bundle).
           path: dist
           if-no-files-found: error

@@ -8,23 +8,23 @@ let pkgDir = URL(fileURLWithPath: #filePath).deletingLastPathComponent().path
 let ghosttyLib = "\(pkgDir)/vendor/libghostty/ghostty-internal.a"
 
 let package = Package(
-    name: "Muxy",
+    name: "Clowder",
     platforms: [
         .macOS(.v14),
     ],
     products: [
-        .library(name: "MuxyCore", targets: ["MuxyCore"]),
-        .executable(name: "muxy-app", targets: ["MuxyApp"]),
+        .library(name: "ClowderCore", targets: ["ClowderCore"]),
+        .executable(name: "clowder-app", targets: ["ClowderApp"]),
     ],
     targets: [
-        .target(name: "MuxyCore"),
-        .testTarget(name: "MuxyCoreTests", dependencies: ["MuxyCore"]),
+        .target(name: "ClowderCore"),
+        .testTarget(name: "ClowderCoreTests", dependencies: ["ClowderCore"]),
         // Wraps the real ghostty.h so Swift imports the C structs directly (no
         // hand-written FFI — ABI drift would corrupt silently).
         .systemLibrary(name: "GhosttyKit", path: "Sources/GhosttyKit"),
         .executableTarget(
-            name: "MuxyApp",
-            dependencies: ["MuxyCore", "GhosttyKit"],
+            name: "ClowderApp",
+            dependencies: ["ClowderCore", "GhosttyKit"],
             linkerSettings: [
                 .unsafeFlags([ghosttyLib, "-lc++"]),
                 .linkedFramework("Metal"),

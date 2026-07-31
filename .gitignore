@@ -1,4 +1,6 @@
 /target
-/.muxy/
+/.clowder/
 /dist/
 /.cache/
+/.muxy/
+.DS_Store

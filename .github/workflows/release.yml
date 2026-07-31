@@ -52,20 +52,20 @@ jobs:
         if: steps.libghostty-cache.outputs.cache-hit != 'true'
         run: scripts/build-libghostty.sh
 
-      - name: Assemble unsigned Muxy.app
+      - name: Assemble unsigned Clowder.app
         run: scripts/build-app.sh
 
       - name: Zip the app bundle
-        run: ditto -c -k --keepParent dist/Muxy.app "dist/Muxy-${GITHUB_REF_NAME}-macos.zip"
+        run: ditto -c -k --keepParent dist/Clowder.app "dist/Clowder-${GITHUB_REF_NAME}-macos.zip"
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/Muxy-*-macos.zip
+          files: dist/Clowder-*-macos.zip
           generate_release_notes: true
           body: |
-            Unsigned macOS build of Muxy (`${{ github.ref_name }}`).
+            Unsigned macOS build of Clowder (`${{ github.ref_name }}`).
 
             > This build is **not code-signed or notarized** (that lands in a later milestone). On
             > first launch macOS Gatekeeper will quarantine it — right-click the app → **Open**, or run
-            > `xattr -dr com.apple.quarantine Muxy.app`.
+            > `xattr -dr com.apple.quarantine Clowder.app`.

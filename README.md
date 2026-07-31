@@ -1,7 +1,7 @@
-# muxy
+# clowder
 
-[![CI](https://github.com/richardcase/muxy/actions/workflows/ci.yml/badge.svg)](https://github.com/richardcase/muxy/actions/workflows/ci.yml)
-[![Release](https://github.com/richardcase/muxy/actions/workflows/release.yml/badge.svg)](https://github.com/richardcase/muxy/actions/workflows/release.yml)
+[![CI](https://github.com/richardcase/clowder/actions/workflows/ci.yml/badge.svg)](https://github.com/richardcase/clowder/actions/workflows/ci.yml)
+[![Release](https://github.com/richardcase/clowder/actions/workflows/release.yml/badge.svg)](https://github.com/richardcase/clowder/actions/workflows/release.yml)
 ![macOS 14+](https://img.shields.io/badge/macOS-14%2B-black?logo=apple)
 ![Rust 2021](https://img.shields.io/badge/rust-2021-orange?logo=rust)
 ![Swift 6](https://img.shields.io/badge/swift-6-orange?logo=swift)
@@ -11,7 +11,7 @@
 agents — each isolated in its own git worktree or jj workspace — with attention routing, while a
 native SwiftUI macOS app renders every agent's live terminal via [libghostty](https://ghostty.org).
 
-> This repository is **private**. The status badges above render for collaborators. muxy is
+> This repository is **private**. The status badges above render for collaborators. clowder is
 > proprietary — see [License](#license).
 
 ## Features
@@ -30,17 +30,17 @@ native SwiftUI macOS app renders every agent's live terminal via [libghostty](ht
 - **Survivable** — the daemon owns the agent PTYs and keeps them running while the window is closed; the
   app **launches + supervises its own daemon** and **auto-reconnects** (bounded backoff) if the
   connection drops.
-- **Robust daemon** — a `~/.config/muxy/config.toml` config file, per-user sockets, a single-instance
+- **Robust daemon** — a `~/.config/clowder/config.toml` config file, per-user sockets, a single-instance
   guard, graceful shutdown that kills child PTYs, companion-crash reaping, and structured `tracing`
   logs.
 
 ## Architecture
 
-muxy uses a tmux-style **client / server** split:
+clowder uses a tmux-style **client / server** split:
 
-- The **daemon** (`muxy-daemon`) owns the agent PTYs, the per-agent worktrees, attention state, the
+- The **daemon** (`clowder-daemon`) owns the agent PTYs, the per-agent worktrees, attention state, the
   split-pane tree, and process survival.
-- The **macOS app** embeds a libghostty surface whose launched command is `muxy attach <pane>` (the
+- The **macOS app** embeds a libghostty surface whose launched command is `clowder attach <pane>` (the
   render pump). Ghostty renders the agent natively client-side while the daemon remains the mux.
 - A JSON control socket drives the app's sidebar, agent spawning, and split-pane operations.
 
@@ -62,27 +62,27 @@ and survival.
 
 ### From a release (collaborators)
 
-Download `Muxy-vX.Y.Z-macos.zip` from the repo's [Releases](https://github.com/richardcase/muxy/releases)
+Download `Clowder-vX.Y.Z-macos.zip` from the repo's [Releases](https://github.com/richardcase/clowder/releases)
 and unzip it. The build is **unsigned / un-notarized**, so macOS Gatekeeper will quarantine it — clear
 the quarantine, then move it to `/Applications`:
 
 ```sh
-xattr -dr com.apple.quarantine Muxy.app   # or: right-click Muxy.app → Open
-mv Muxy.app /Applications/
+xattr -dr com.apple.quarantine Clowder.app   # or: right-click Clowder.app → Open
+mv Clowder.app /Applications/
 ```
 
 ### From source
 
 ```sh
-git clone git@github.com:richardcase/muxy.git && cd muxy
+git clone git@github.com:richardcase/clowder.git && cd clowder
 scripts/build-libghostty.sh    # zig 0.16 + full Xcode; builds the vendored libghostty (once)
-scripts/build-app.sh           # → dist/Muxy.app
-open dist/Muxy.app
+scripts/build-app.sh           # → dist/Clowder.app
+open dist/Clowder.app
 ```
 
 ## Usage
 
-Double-click `Muxy.app` — it launches and **supervises its own daemon** (no manual steps). Then:
+Double-click `Clowder.app` — it launches and **supervises its own daemon** (no manual steps). Then:
 
 - **⌘N** — spawn an agent: pick a project (a git/jj repo), a task, and an adapter (`claude`, `codex`,
   or `shell`).
@@ -90,11 +90,11 @@ Double-click `Muxy.app` — it launches and **supervises its own daemon** (no ma
   Discard is in the menu.
 - The menu-bar item shows how many agents need attention.
 
-The bundled **`muxy` CLI** also works headlessly against a running daemon:
+The bundled **`clowder` CLI** also works headlessly against a running daemon:
 
 ```sh
-muxy spawn <project> <task> [adapter]   # adapter defaults to "claude"; prints the new pane id
-muxy attach <pane-id>                    # attach to a pane in your terminal
+clowder spawn <project> <task> [adapter]   # adapter defaults to "claude"; prints the new pane id
+clowder attach <pane-id>                    # attach to a pane in your terminal
 ```
 
 ## Development
@@ -106,26 +106,26 @@ conventions).
 # Rust workspace (rustup is not auto-sourced here — prefix cargo with the env):
 source "$HOME/.cargo/env" && cargo test --workspace     # CI runs this with --locked
 
-# Swift core (fast — MuxyCore doesn't need libghostty):
+# Swift core (fast — ClowderCore doesn't need libghostty):
 cd macos && swift test
 
 # Run in dev (unbundled builds don't auto-spawn the daemon — start it by hand):
-source "$HOME/.cargo/env" && cargo run -p muxy-daemon
-cd macos && MUXY_BIN="$PWD/../target/debug/muxy" swift run muxy-app
+source "$HOME/.cargo/env" && cargo run -p clowder-daemon
+cd macos && CLOWDER_BIN="$PWD/../target/debug/clowder" swift run clowder-app
 ```
 
 Repo layout:
 
 | Path | What |
 |---|---|
-| `crates/muxy-proto` | Wire protocol + control-plane types (postcard/JSON) |
-| `crates/muxy-config` | Config resolution (env › file › default) |
-| `crates/muxy-daemon` | The headless daemon (binary `muxy-daemon`) |
-| `crates/muxy-client` | Client lib + the `muxy` CLI (binary `muxy`) |
-| `crates/muxy-hook` | Agent lifecycle hook shim (binary `muxy-hook`) |
-| `crates/muxy-vt` | Terminal attention-signal scanner (BEL/OSC) |
-| `crates/muxy-workspace` | Per-agent git/jj worktree provisioning |
-| `macos/` | SwiftPM app — `MuxyCore` (lib) + `muxy-app` (exe), links libghostty |
+| `crates/clowder-proto` | Wire protocol + control-plane types (postcard/JSON) |
+| `crates/clowder-config` | Config resolution (env › file › default) |
+| `crates/clowder-daemon` | The headless daemon (binary `clowder-daemon`) |
+| `crates/clowder-client` | Client lib + the `clowder` CLI (binary `clowder`) |
+| `crates/clowder-hook` | Agent lifecycle hook shim (binary `clowder-hook`) |
+| `crates/clowder-vt` | Terminal attention-signal scanner (BEL/OSC) |
+| `crates/clowder-workspace` | Per-agent git/jj worktree provisioning |
+| `macos/` | SwiftPM app — `ClowderCore` (lib) + `clowder-app` (exe), links libghostty |
 | `scripts/` | `build-app.sh`, `build-libghostty.sh`, `set-version.sh`, `gen-icon.swift` |
 | `docs/` | Design specs/plans (`superpowers/`), `versioning.md`, `building-libghostty.md` |
 
@@ -134,7 +134,7 @@ Repo layout:
 The top-level [`VERSION`](VERSION) file is the single source of truth; `scripts/set-version.sh <X.Y.Z>`
 propagates it into the Cargo workspace and the app's Info.plist. Pushing a `vX.Y.Z` tag runs
 [`release.yml`](.github/workflows/release.yml), which builds the app and publishes a GitHub Release with
-the (unsigned) `Muxy.app` attached. See [`docs/versioning.md`](docs/versioning.md).
+the (unsigned) `Clowder.app` attached. See [`docs/versioning.md`](docs/versioning.md).
 
 ## Status
 

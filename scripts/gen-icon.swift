@@ -1,4 +1,4 @@
-// Renders a simple placeholder app icon (a teal rounded square with a white "M") to a PNG.
+// Renders a simple placeholder app icon (a teal rounded square with a white "C") to a PNG.
 // Usage: swift scripts/gen-icon.swift <out.png> [size]
 import AppKit
 
@@ -20,9 +20,9 @@ let attrs: [NSAttributedString.Key: Any] = [
     .foregroundColor: NSColor.white,
     .paragraphStyle: para,
 ]
-let m = "M" as NSString
-let textSize = m.size(withAttributes: attrs)
-m.draw(at: NSPoint(x: (s - textSize.width) / 2, y: (s - textSize.height) / 2), withAttributes: attrs)
+let c = "C" as NSString
+let textSize = c.size(withAttributes: attrs)
+c.draw(at: NSPoint(x: (s - textSize.width) / 2, y: (s - textSize.height) / 2), withAttributes: attrs)
 image.unlockFocus()
 
 guard let tiff = image.tiffRepresentation,
