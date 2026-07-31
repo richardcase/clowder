@@ -15,17 +15,21 @@ pub struct Config {
     pub shell: String,
     pub default_cols: u16,
     pub default_rows: u16,
+    pub remote_listen: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct FileConfig {
     sockets: Option<Sockets>,
     pane: Option<PaneCfg>,
+    remote: Option<Remote>,
 }
 #[derive(Debug, Default, Deserialize)]
 struct Sockets { client: Option<PathBuf>, control: Option<PathBuf>, hook: Option<PathBuf> }
 #[derive(Debug, Default, Deserialize)]
 struct PaneCfg { backlog_cap: Option<usize>, shell: Option<String>, cols: Option<u16>, rows: Option<u16> }
+#[derive(Debug, Default, Deserialize)]
+struct Remote { listen: Option<String> }
 
 impl Config {
     /// Load `$XDG_CONFIG_HOME/clowder/config.toml` (else `$HOME/.config/clowder/config.toml`), then apply
@@ -39,6 +43,7 @@ impl Config {
     fn resolve(f: FileConfig, get_env: &dyn Fn(&str) -> Option<String>) -> Config {
         let s = f.sockets.unwrap_or_default();
         let p = f.pane.unwrap_or_default();
+        let r = f.remote.unwrap_or_default();
 
         // Per-user runtime dir for sockets: $XDG_RUNTIME_DIR › $TMPDIR › /tmp (mirrors the daemon's
         // single-instance PID lock dir). Env socket vars still override below.
@@ -60,6 +65,9 @@ impl Config {
             shell: get_env("SHELL").or(p.shell).unwrap_or_else(|| "/bin/sh".into()),
             default_cols: p.cols.unwrap_or(DEFAULT_COLS),
             default_rows: p.rows.unwrap_or(DEFAULT_ROWS),
+            // An empty value from EITHER env or file means "off" — the daemon skips the TCP bind
+            // (rather than failing to parse `""` as a socket address at startup).
+            remote_listen: nonempty("CLOWDER_LISTEN").or(r.listen.filter(|s| !s.is_empty())),
         }
     }
 }
@@ -151,5 +159,24 @@ mod tests {
         let f: FileConfig = toml::from_str("[pane]\nbacklog_cap = 1024\n").unwrap();
         let env = |k: &str| if k == "CLOWDER_BACKLOG_CAP" { Some("notanumber".into()) } else { None };
         assert_eq!(Config::resolve(f, &env).backlog_cap, 1024);
+    }
+
+    #[test]
+    fn remote_listen_env_over_file_then_none() {
+        // env wins over file
+        let f = FileConfig { remote: Some(Remote { listen: Some("127.0.0.1:1".into()) }), ..Default::default() };
+        let env = |k: &str| (k == "CLOWDER_LISTEN").then(|| "127.0.0.1:2".to_string());
+        assert_eq!(Config::resolve(f, &env).remote_listen.as_deref(), Some("127.0.0.1:2"));
+
+        // file only
+        let f2 = FileConfig { remote: Some(Remote { listen: Some("127.0.0.1:3".into()) }), ..Default::default() };
+        assert_eq!(Config::resolve(f2, &|_| None).remote_listen.as_deref(), Some("127.0.0.1:3"));
+
+        // neither → None (TCP off)
+        assert_eq!(Config::resolve(FileConfig::default(), &|_| None).remote_listen, None);
+
+        // an empty file value is "off", not Some("") (which would fail to parse/bind later)
+        let f3 = FileConfig { remote: Some(Remote { listen: Some("".into()) }), ..Default::default() };
+        assert_eq!(Config::resolve(f3, &|_| None).remote_listen, None);
     }
 }

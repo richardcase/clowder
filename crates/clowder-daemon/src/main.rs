@@ -10,6 +10,7 @@ async fn main() -> Result<()> {
     let config = clowder_config::Config::load();
     let sock_path = config.client_sock.clone();
     let control_path = config.control_sock.clone();
+    let remote_listen = config.remote_listen.clone();
     let daemon = Arc::new(Daemon::new_from_config(config));
     let hook_path = daemon.hook_sock().to_path_buf();
 
@@ -44,6 +45,23 @@ async fn main() -> Result<()> {
         pid_lock = %lock.path().display(),
         "clowder-daemon listening"
     );
+
+    if let Some(addr_str) = remote_listen {
+        let addr: std::net::SocketAddr = addr_str
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid [remote] listen address {addr_str:?}: {e}"))?;
+        let tcp = tokio::net::TcpListener::bind(addr).await?;
+        if clowder_daemon::remote::should_warn_exposed(&addr) {
+            tracing::warn!(%addr, "remote listener bound to a non-loopback/non-tailnet address — Phase A has NO authentication; expose only behind a trusted tunnel (SSH -L / Tailscale)");
+        }
+        tracing::info!(%addr, "clowder-daemon remote TCP listener enabled");
+        let remote = daemon.clone();
+        tokio::spawn(async move {
+            if let Some(line) = clowder_daemon::logging::conn_error_line("remote server", remote.serve_remote(tcp).await) {
+                tracing::error!("{line}");
+            }
+        });
+    }
 
     let hooks = daemon.clone();
     tokio::spawn(async move {
