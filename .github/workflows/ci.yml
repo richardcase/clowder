@@ -30,10 +30,10 @@ jobs:
           xcrun metal --version
           swift --version
 
-      - name: Install zig 0.16.0
-        uses: mlugg/setup-zig@v1
-        with:
-          version: 0.16.0
+      - name: Install zig (Homebrew — reliable bottle CDN; the zig download mirrors are flaky in CI)
+        run: |
+          brew install zig
+          zig version
 
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
