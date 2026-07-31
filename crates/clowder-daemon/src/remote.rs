@@ -1,10 +1,15 @@
 use crate::server::Daemon;
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use clowder_proto::{read_hello, Channel};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
+
+/// A remote peer that connects but never sends its channel hello is dropped after this, so a
+/// silent client can't park a spawned task forever (slowloris) on the network listener.
+const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl Daemon {
     /// Accept loop for the opt-in remote TCP listener. Each connection is prefixed
@@ -27,7 +32,10 @@ impl Daemon {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send,
     {
-        match read_hello(&mut stream).await? {
+        let channel = tokio::time::timeout(HELLO_TIMEOUT, read_hello(&mut stream))
+            .await
+            .map_err(|_| anyhow!("timed out waiting for channel hello"))??;
+        match channel {
             Channel::Control => self.handle_control_json(stream).await,
             Channel::Render => self.handle_conn(stream).await,
         }
@@ -75,7 +83,12 @@ mod tests {
         // The control handler's first action is to emit an AgentList event as a JSON line.
         let (rd, _wr) = tokio::io::split(client);
         let mut lines = BufReader::new(rd).lines();
-        let line = lines.next_line().await.unwrap().unwrap();
+        // Bound the read so a regression that stops the handler responding fails fast, not hangs CI.
+        let line = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+            .await
+            .expect("control handler produced no line within 5s")
+            .unwrap()
+            .unwrap();
         assert!(line.contains("agentList"), "expected agentList event, got: {line}");
         h.abort();
     }
@@ -91,8 +104,23 @@ mod tests {
         // Render handler reads Attach first; an unknown pane ends the session with Ok(()).
         let mut msgs = MsgStream::new(client);
         msgs.send(&ClientToDaemon::Attach { pane: PaneId(999_999) }).await.unwrap();
-        let res = h.await.unwrap();
+        let res = tokio::time::timeout(Duration::from_secs(5), h)
+            .await
+            .expect("render handler did not finish within 5s")
+            .unwrap();
         assert!(res.is_ok(), "render route returned: {res:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silent_client_hello_times_out() {
+        let daemon = test_daemon();
+        let (client, server) = tokio::io::duplex(64);
+        let h = tokio::spawn(async move { daemon.handle_remote_conn(server).await });
+        // Never send the hello; advance past the timeout (paused clock → no real wait).
+        tokio::time::advance(HELLO_TIMEOUT + Duration::from_secs(1)).await;
+        let res = h.await.unwrap();
+        assert!(res.is_err(), "expected hello timeout error, got: {res:?}");
+        drop(client); // keep the client end alive until after the timeout fires
     }
 
     #[test]

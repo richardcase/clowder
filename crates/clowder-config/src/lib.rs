@@ -65,7 +65,9 @@ impl Config {
             shell: get_env("SHELL").or(p.shell).unwrap_or_else(|| "/bin/sh".into()),
             default_cols: p.cols.unwrap_or(DEFAULT_COLS),
             default_rows: p.rows.unwrap_or(DEFAULT_ROWS),
-            remote_listen: nonempty("CLOWDER_LISTEN").or(r.listen),
+            // An empty value from EITHER env or file means "off" — the daemon skips the TCP bind
+            // (rather than failing to parse `""` as a socket address at startup).
+            remote_listen: nonempty("CLOWDER_LISTEN").or(r.listen.filter(|s| !s.is_empty())),
         }
     }
 }
@@ -172,5 +174,9 @@ mod tests {
 
         // neither → None (TCP off)
         assert_eq!(Config::resolve(FileConfig::default(), &|_| None).remote_listen, None);
+
+        // an empty file value is "off", not Some("") (which would fail to parse/bind later)
+        let f3 = FileConfig { remote: Some(Remote { listen: Some("".into()) }), ..Default::default() };
+        assert_eq!(Config::resolve(f3, &|_| None).remote_listen, None);
     }
 }

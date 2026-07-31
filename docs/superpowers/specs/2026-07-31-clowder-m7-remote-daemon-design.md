@@ -99,6 +99,10 @@ the daemon rejects unauthenticated peers), so the daemon can be exposed on a pub
 entirely in the **forwarder's dial** and the **daemon's accept** (behind the `Hello`), with credentials in
 config/keychain — **no protocol, handler, or app changes**. This is the seam M7a/M7b deliberately preserve.
 
+M7a already added a **hello-read timeout** (a silent peer can't park a connection task forever). Remaining
+network-listener hardening to fold in here: make `serve_remote`'s accept loop resilient to a transient
+`accept()` error instead of terminating the listener on the first one.
+
 ## Data flow
 
 ```
