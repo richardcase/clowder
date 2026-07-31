@@ -1,0 +1,13 @@
+--- a/build.zig
++++ b/build.zig
+@@ -192,7 +192,10 @@
+         // We shouldn't have this guard but we don't currently
+         // build on macOS this way ironically so we need to fix that.
+-        if (!config.target.result.os.tag.isDarwin()) {
++        if (config.target.result.os.tag.isDarwin()) {
++            lib_static.installHeader();
++            lib_static.install("ghostty-internal.a");
++        } else if (!config.target.result.os.tag.isDarwin()) {
+             lib_shared.installHeader(); // Only need one header
+             if (config.target.result.os.tag == .windows) {
+                 lib_shared.install("ghostty-internal.dll");
