@@ -25,5 +25,5 @@ zipped `.app` (Gatekeeper-quarantined on download — right-click → Open, or
 `xattr -dr com.apple.quarantine Clowder.app`).
 
 Signing/notarization and its one-time setup (signing material fetched from Doppler with a single
-read-only service token) are documented in [`code-signing.md`](code-signing.md). A Homebrew cask lands
-in M6f.
+read-only service token) are documented in [`code-signing.md`](code-signing.md). A final release also
+auto-bumps the Homebrew cask — see [`homebrew.md`](homebrew.md).

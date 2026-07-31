@@ -179,12 +179,14 @@ A single source of truth: a top-level `VERSION` file, kept in sync with a `vX.Y.
 versions (retiring `0.0.0`). A `release.yml` workflow on a `v*` tag builds the artifact (via M6d) and
 publishes a GitHub Release with it attached. (Signed DMG + Homebrew bump join this once M6c/M6f land.)
 
-### M6f — Homebrew cask + tap (DEFERRED — blocked on Developer ID / notarized artifact)
+### M6f — Homebrew cask + tap (BUILT 2026-07-31)
 
-Design (not built until M6c produces a notarized DMG): a separate `richardcase/homebrew-muxy` tap repo
-with a **cask** (`muxy.rb`) installing the notarized `.app`/DMG from the GitHub Release; the release CI
-auto-bumps the cask's version + sha256. `brew install --cask richardcase/muxy/muxy`. (A CLI-only
-formula for `muxy` is a possible later add-on; the cask is primary since the `.app` bundles the CLI.)
+Built — see plan `docs/superpowers/plans/2026-07-31-clowder-m6f-homebrew.md` and
+[`docs/homebrew.md`](../../homebrew.md). A separate `richardcase/homebrew-clowder` tap repo holds a
+**cask** (`Casks/clowder.rb`) installing the notarized DMG from the GitHub Release (+ the `clowder` CLI on
+PATH via a `binary` stanza). The release CI renders `scripts/homebrew/clowder.rb.tmpl` with the version +
+DMG sha256 and SSH-pushes it to the tap (write deploy key from Doppler) on each **final** signed release;
+pre-release tags are skipped. `brew install --cask richardcase/clowder/clowder`.
 
 ## Data flow
 

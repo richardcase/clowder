@@ -60,6 +60,15 @@ and survival.
 
 ## Installation
 
+### Homebrew (recommended)
+
+```sh
+brew install --cask richardcase/clowder/clowder
+```
+
+Installs the signed + notarized `Clowder.app` and puts the `clowder` CLI on `PATH`. See
+[`docs/homebrew.md`](docs/homebrew.md).
+
 ### From a release (collaborators)
 
 Download `Clowder-vX.Y.Z-macos.dmg` from the repo's [Releases](https://github.com/richardcase/clowder/releases),
@@ -125,7 +134,7 @@ Repo layout:
 | `crates/clowder-workspace` | Per-agent git/jj worktree provisioning |
 | `macos/` | SwiftPM app — `ClowderCore` (lib) + `clowder-app` (exe), links libghostty |
 | `scripts/` | `build-app.sh`, `build-libghostty.sh`, `set-version.sh`, `gen-icon.swift` |
-| `docs/` | Design specs/plans (`superpowers/`), `versioning.md`, `building-libghostty.md`, `code-signing.md` |
+| `docs/` | Design specs/plans (`superpowers/`), `versioning.md`, `building-libghostty.md`, `code-signing.md`, `homebrew.md` |
 
 ## Versioning & releases
 
@@ -142,10 +151,10 @@ signing is configured it attaches a **signed + notarized `.dmg`** (`scripts/sign
 Built and green in CI: the daemon/client spine, the native SwiftUI + libghostty client, split panes,
 the Land/Discard lifecycle (git + jj), Claude/Codex/shell adapters, robustness (config, single-instance,
 reconnect), packaging (a self-contained `.app`, reproducible libghostty build, versioned releases),
-**code-signing → notarization → signed DMG** (Developer ID).
+**code-signing → notarization → signed DMG** (Developer ID), and a **Homebrew cask** with auto-bump.
 
-Not yet done: a **Homebrew cask** (`brew install --cask`), an authoritative daemon-side VT grid
-(scrollback reflow-on-resize), and agent survival across a daemon restart.
+Not yet done: an authoritative daemon-side VT grid (scrollback reflow-on-resize), and agent survival
+across a daemon restart.
 
 ## License
 
