@@ -1,6 +1,9 @@
+diff --git a/build.zig b/build.zig
+index c371119..90fe1d2 100644
 --- a/build.zig
 +++ b/build.zig
-@@ -192,7 +192,10 @@
+@@ -192,7 +192,10 @@ pub fn build(b: *std.Build) !void {
+ 
          // We shouldn't have this guard but we don't currently
          // build on macOS this way ironically so we need to fix that.
 -        if (!config.target.result.os.tag.isDarwin()) {

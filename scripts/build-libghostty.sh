@@ -36,10 +36,7 @@ git -C "$CACHE" clean -fdxq            # drop prior zig-out / patched build.zig 
 git -C "$CACHE" checkout -q -- .       # restore any tracked files (e.g. a previously-patched build.zig)
 
 echo "==> Applying Darwin static-lib patch"
-# --recount: the patch's hunk header line-counts are off by one (missing a blank
-# context line); --recount has git derive the counts from the hunk body instead of
-# trusting the header, so the (unmodified, verbatim) patch still applies deterministically.
-git -C "$CACHE" apply --recount --verbose "$PATCH"
+git -C "$CACHE" apply --verbose "$PATCH"
 
 echo "==> Building libghostty (zig build — this is heavy: Metal shaders + ~189 MB, several minutes)"
 ( cd "$CACHE" && SDKROOT="$(xcrun --show-sdk-path)" zig build -Dapp-runtime=none -Demit-xcframework=false )
