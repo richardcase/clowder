@@ -78,7 +78,9 @@ Add `remote-host` to the top-level usage string.
 ---
 
 ## Decomposition note
-Tasks 1–2 are automated-testable (Rust `cargo test`; Swift `swift test` for the unchanged supervisor). Tasks 3–5 are ClowderApp: they `swift build` (libghostty) but their behavior is **verified by a maintainer running the app** (GUI) — no headless unit test exercises the window/menu/swap. Sequence them last; if Task 5 (live swap) proves too large, split it into its own slice.
+Tasks 1–2 are automated-testable (Rust `cargo test`; Swift `swift test` for the unchanged supervisor). Tasks 3–5 are ClowderApp: they `swift build` (libghostty) but their behavior is **verified by a maintainer running the app** (GUI) — no headless unit test exercises the window/menu/swap.
+
+**Split (2026-07-31):** Tasks 1–4 shipped as **M7c1** (config-driven remote mode + menu-bar status). **Task 5 (the live "Use local" swap) is deferred to M7c2** — SwiftUI captures the `AppModel`/`SurfaceHost` instances in the window body, so a live swap needs an in-place reconfiguration (`AppModel.reconnect(to:)` clearing the store + reconnecting — testable in ClowderCore — and `SurfaceHost.retarget(socketPath:)` tearing down each pane's `clowder attach`). That's its own reviewable slice; until it lands, switching modes = edit `[remote]` config + relaunch.
 
 ## Self-Review
 - Spec coverage: remote-mode supervisor (T2) ✓, config-driven decision via query (T1,T3) ✓, forwarder socket wiring (T2,T3) ✓, menu-bar status (T4) ✓, live Use-local swap (T5) ✓. Carry-forward: single-forwarder-per-dir (supervisor is one instance) ✓, derive-dir-not-stdout (T2 `forwarderSocketDir`) ✓.

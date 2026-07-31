@@ -73,7 +73,16 @@ other component changes when B lands. The forwarder prints the local socket path
 `CLOWDER_CONTROL_SOCK`) so a **pure-CLI** remote flow works too (run the forwarder, point `clowder attach` /
 env at it).
 
-### M7c — macOS app remote mode (BUILD)
+### M7c — macOS app remote mode (BUILD — split M7c1 + M7c2)
+
+**Built as two slices.** **M7c1 (BUILT 2026-07-31):** config-driven mode at startup + menu-bar status —
+the app resolves the host by shelling out to a new `clowder remote-host` (Rust owns config.toml/env
+parsing; Swift has no TOML parser), `makeBackendSupervisor(remoteHost:)` supervises `clowder connect
+<host>` (or a local daemon) and returns the mode's control/render sockets, and the tray shows
+"Remote: `<host>`" / "Local". **M7c2 (DEFERRED):** the live in-app "Use local"/"Use remote" swap — needs
+`AppModel.reconnect(to:)` (clear store + reconnect) and `SurfaceHost.retarget(socketPath:)` since SwiftUI
+captures those instances in the window body; until it lands, switching modes is edit-`[remote]`-config +
+relaunch.
 
 The M6a backend supervisor branches on config: **remote configured** ⇒ supervise `clowder connect <host>`
 (instead of `clowder-daemon`) and set the surfaces' `CLOWDER_SOCK` + the app's control socket to the
