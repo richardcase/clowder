@@ -40,8 +40,9 @@ final class ProcessDaemon: DaemonProcess {
     private var onExit: ((Int32) -> Void)?
     private var launchFailed = false
 
-    init(execPath: String, env: [String: String]) {
+    init(execPath: String, args: [String] = [], env: [String: String]) {
         process.executableURL = URL(fileURLWithPath: execPath)
+        process.arguments = args
         process.environment = env
         process.terminationHandler = { [weak self] p in
             let code = p.terminationStatus
@@ -53,7 +54,7 @@ final class ProcessDaemon: DaemonProcess {
             // Launch failed → the terminationHandler will never fire. Record it and deliver a
             // synthetic crash exit once the supervisor registers onExit, so it relaunches (backoff)
             // instead of being stuck in a false ".running".
-            FileHandle.standardError.write(Data("clowder: failed to launch daemon at \(execPath): \(error)\n".utf8))
+            FileHandle.standardError.write(Data("clowder: failed to launch backend at \(execPath): \(error)\n".utf8))
             launchFailed = true
         }
     }
@@ -84,4 +85,43 @@ func makeDaemonSupervisor() -> DaemonSupervisor? {
     let binDir = (daemonPath as NSString).deletingLastPathComponent
     env["PATH"] = binDir + ":" + (env["PATH"] ?? "/usr/bin:/bin")
     return DaemonSupervisor(spawn: { ProcessDaemon(execPath: daemonPath, env: env) })
+}
+
+/// Absolute dir where the M7b forwarder (`clowder connect`) binds its local sockets:
+/// `<control-sock parent>/remote`, matching the Rust `forward` derivation. Derived from the DEFAULT
+/// control path (not the forwarder's own socket) so it never becomes `.../remote/remote`.
+func forwarderSocketDir(controlPath: String) -> String {
+    return (controlPath as NSString).deletingLastPathComponent + "/remote"
+}
+
+/// Build the backend supervisor plus the control/render socket paths the app should connect to.
+/// `remoteHost == nil` → supervise a local `clowder-daemon` (today's behavior); non-nil → supervise
+/// the `clowder connect <host>` forwarder and connect to its local sockets. Returns nil when unbundled.
+@MainActor
+func makeBackendSupervisor(remoteHost: String?) -> (supervisor: DaemonSupervisor, control: String, render: String)? {
+    let socks = ClowderPaths.socketPaths()
+    var env = ProcessInfo.processInfo.environment
+
+    if let host = remoteHost {
+        guard let clowderPath = ClowderPaths.bundledBin("clowder") else { return nil }
+        let dir = forwarderSocketDir(controlPath: socks.control)
+        let control = (dir as NSString).appendingPathComponent("clowder-control.sock")
+        let render = (dir as NSString).appendingPathComponent("clowder.sock")
+        let binDir = (clowderPath as NSString).deletingLastPathComponent
+        env["PATH"] = binDir + ":" + (env["PATH"] ?? "/usr/bin:/bin")
+        // Deliberately do NOT set CLOWDER_*_SOCK: the forwarder derives its own dir from the default
+        // control sock (a clean env), which must equal `dir` above — overriding it would push the
+        // forwarder to `.../remote/remote`.
+        let sup = DaemonSupervisor(spawn: { ProcessDaemon(execPath: clowderPath, args: ["connect", host], env: env) })
+        return (sup, control, render)
+    } else {
+        guard let daemonPath = ClowderPaths.bundledBin("clowder-daemon") else { return nil }
+        env["CLOWDER_SOCK"] = socks.client
+        env["CLOWDER_CONTROL_SOCK"] = socks.control
+        env["CLOWDER_HOOK_SOCK"] = socks.hook
+        let binDir = (daemonPath as NSString).deletingLastPathComponent
+        env["PATH"] = binDir + ":" + (env["PATH"] ?? "/usr/bin:/bin")
+        let sup = DaemonSupervisor(spawn: { ProcessDaemon(execPath: daemonPath, env: env) })
+        return (sup, socks.control, socks.client)
+    }
 }
