@@ -60,12 +60,16 @@ pub async fn forward(host: String, dir: PathBuf) -> Result<()> {
         loop {
             let (stream, _) = match listener.accept().await {
                 Ok(v) => v,
-                Err(e) => { tracing::warn!("forwarder accept error: {e}"); continue; }
+                Err(e) => {
+                    eprintln!("clowder connect: accept error: {e}");
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
+                }
             };
             let host = host.clone();
             tokio::spawn(async move {
                 if let Err(e) = forward_stream(stream, &host, channel).await {
-                    tracing::warn!("forward {channel:?} connection ended: {e}");
+                    eprintln!("clowder connect: {channel:?} connection ended: {e}");
                 }
             });
         }
