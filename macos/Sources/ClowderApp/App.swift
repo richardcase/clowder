@@ -39,13 +39,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // connect to the forwarder's sockets); nil → local daemon. Default to the local socket paths;
         // makeBackendSupervisor returns the mode's actual control/render sockets when bundled.
         let remoteHost = resolveRemoteHost(clowderBinary: clowderBinary)
-        currentRemoteHost = remoteHost
         var socketPath = socks.client
         var controlPath = socks.control
         if let backend = makeBackendSupervisor(remoteHost: remoteHost) {
             daemonSupervisor = backend.supervisor
             controlPath = backend.control
             socketPath = backend.render
+            // Only claim "Remote" once a remote backend is actually running — otherwise the tray
+            // label could contradict the (local) sockets we wired up (e.g. unbundled dev).
+            currentRemoteHost = remoteHost
             backend.supervisor.start()
         }
 
@@ -95,14 +97,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let pipe = Pipe()
         proc.standardOutput = pipe
         proc.standardError = FileHandle.nullDevice
+        let data: Data
         do {
             try proc.run()
+            // Read BEFORE waiting: draining after waitUntilExit() can deadlock if the child fills the
+            // pipe buffer (output is one line today, but read-before-wait is the safe order).
+            data = pipe.fileHandleForReading.readDataToEndOfFile()
             proc.waitUntilExit()
         } catch {
             return nil
         }
         guard proc.terminationStatus == 0 else { return nil }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
         let host = (String(data: data, encoding: .utf8) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         return host.isEmpty ? nil : host
     }

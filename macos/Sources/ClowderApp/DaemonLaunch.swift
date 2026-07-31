@@ -70,13 +70,6 @@ final class ProcessDaemon: DaemonProcess {
     }
 }
 
-/// Absolute dir where the M7b forwarder (`clowder connect`) binds its local sockets:
-/// `<control-sock parent>/remote`, matching the Rust `forward` derivation. Derived from the DEFAULT
-/// control path (not the forwarder's own socket) so it never becomes `.../remote/remote`.
-func forwarderSocketDir(controlPath: String) -> String {
-    return (controlPath as NSString).deletingLastPathComponent + "/remote"
-}
-
 /// Build the backend supervisor plus the control/render socket paths the app should connect to.
 /// `remoteHost == nil` → supervise a local `clowder-daemon` (today's behavior); non-nil → supervise
 /// the `clowder connect <host>` forwarder and connect to its local sockets. Returns nil when unbundled.
