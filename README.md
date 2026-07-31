@@ -125,16 +125,17 @@ Repo layout:
 | `crates/clowder-workspace` | Per-agent git/jj worktree provisioning |
 | `macos/` | SwiftPM app — `ClowderCore` (lib) + `clowder-app` (exe), links libghostty |
 | `scripts/` | `build-app.sh`, `build-libghostty.sh`, `set-version.sh`, `gen-icon.swift` |
-| `docs/` | Design specs/plans (`superpowers/`), `versioning.md`, `building-libghostty.md` |
+| `docs/` | Design specs/plans (`superpowers/`), `versioning.md`, `building-libghostty.md`, `code-signing.md` |
 
 ## Versioning & releases
 
 The top-level [`VERSION`](VERSION) file is the single source of truth; `scripts/set-version.sh <X.Y.Z>`
 propagates it into the Cargo workspace and the app's Info.plist. Pushing a `vX.Y.Z` tag runs
 [`release.yml`](.github/workflows/release.yml), which builds the app and publishes a GitHub Release. When
-the Developer ID signing secrets are configured it attaches a **signed + notarized `.dmg`**
-(`scripts/sign-app.sh` → `scripts/package-dmg.sh`); otherwise it falls back to an unsigned `.zip`. See
-[`docs/versioning.md`](docs/versioning.md).
+signing is configured it attaches a **signed + notarized `.dmg`** (`scripts/sign-app.sh` →
+`scripts/package-dmg.sh`); otherwise it falls back to an unsigned `.zip`. Signing material is fetched from
+**Doppler over GitHub OIDC** — no signing secret is stored in GitHub. See
+[`docs/versioning.md`](docs/versioning.md) and [`docs/code-signing.md`](docs/code-signing.md).
 
 ## Status
 

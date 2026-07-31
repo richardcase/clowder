@@ -1,0 +1,184 @@
+# Code signing, notarization & release
+
+How `Clowder.app` is signed with a Developer ID, notarized by Apple, packaged as a DMG, and released —
+plus the one-time setup to enable it. Releases fetch all signing material from **Doppler** over **GitHub
+OIDC**, so **no signing secret and no Doppler token are ever stored in GitHub**.
+
+## The pipeline
+
+```
+scripts/build-app.sh    assemble dist/Clowder.app  (app exe + clowder-daemon/clowder/clowder-hook in
+                        Contents/MacOS/, Info.plist, icon) — UNSIGNED
+scripts/sign-app.sh     codesign each executable inner-first with the Developer ID, hardened runtime
+                        (--options runtime), secure timestamp; then the .app bundle
+scripts/package-dmg.sh  hdiutil DMG (drag-to-Applications layout) → sign → notarytool submit --wait →
+                        stapler staple → verify (stapler validate + spctl)
+```
+
+`sign-app.sh` and `package-dmg.sh` take all inputs from **environment variables** (below), so the same
+scripts run locally and in CI — only how the env is populated differs.
+
+| Env var | Used by | Meaning |
+|---|---|---|
+| `CODESIGN_IDENTITY` | sign-app, package-dmg | `Developer ID Application: NAME (TEAMID)` (or `-` for an ad-hoc smoke test) |
+| `CODESIGN_KEYCHAIN` | sign-app | optional keychain to search for the identity (CI temp keychain) |
+| `NOTARY_PROFILE` | package-dmg | `notarytool` keychain profile (local convenience) |
+| `NOTARY_KEY` / `NOTARY_KEY_ID` / `NOTARY_ISSUER` | package-dmg | App Store Connect API key path + IDs |
+| `NOTARY_APPLE_ID` / `NOTARY_PASSWORD` / `NOTARY_TEAM_ID` | package-dmg | Apple ID + app-specific password |
+
+`package-dmg.sh` auto-selects the first fully-present notary credential set (`NOTARY_PROFILE` › API key ›
+Apple ID); with none set it builds + signs the DMG but skips notarize/staple.
+
+## CI: Doppler via GitHub OIDC
+
+`.github/workflows/release.yml` (on a `v*` tag) builds the app, then — **only when the repository
+Variable `DOPPLER_IDENTITY_ID` is set** — signs and notarizes:
+
+```
+GitHub Actions (id-token: write)
+  └─ requests a short-lived OIDC JWT from GitHub
+       └─ dopplerhq/secrets-fetch-action (auth-method: oidc) exchanges it with Doppler for a
+          short-lived token bound to a Service Account Identity
+            └─ fetches the signing secrets as auto-masked step outputs
+                 └─ mapped into env → sign-app.sh + package-dmg.sh → notarized DMG on the Release
+```
+
+- **No secrets in GitHub.** The only GitHub-side config is three non-secret **Variables**:
+  `DOPPLER_IDENTITY_ID`, `DOPPLER_PROJECT`, `DOPPLER_CONFIG`. All signing material lives in Doppler.
+- **The gate.** `DOPPLER_IDENTITY_ID` being present selects the signed path; a fork pushing a tag has no
+  such Variable, so the workflow falls back to publishing an **unsigned `.zip`**.
+- Fetched secret values are masked in the Actions log by the fetch action.
+
+## One-time setup
+
+### a. Generate the Apple signing material
+
+Requires **Account Holder / Admin** on the Apple Developer team.
+
+**Developer ID Application certificate + private key** → `CODESIGN_IDENTITY`, `CODESIGN_P12_BASE64`,
+`CODESIGN_P12_PASSWORD`:
+
+1. Create the certificate — easiest via Xcode: **Xcode → Settings → Accounts → (your Apple ID) → Manage
+   Certificates… → + → "Developer ID Application"**. This installs the cert **and its private key** into
+   your login keychain.
+   _Alternative (portal):_ [developer.apple.com → Certificates](https://developer.apple.com/account/resources/certificates/list)
+   → **+** → "Developer ID Application" → upload a CSR created in **Keychain Access → Certificate
+   Assistant → Request a Certificate from a Certificate Authority** (save to disk) → download the `.cer`
+   → double-click to install.
+2. Read the identity string:
+   ```sh
+   security find-identity -v -p codesigning
+   ```
+   The `Developer ID Application: NAME (TEAMID)` line is **`CODESIGN_IDENTITY`**. The parenthesized
+   `TEAMID` is your **Team ID**.
+3. Export as `.p12` **with the private key**: Keychain Access → **login** keychain → **My Certificates**
+   → expand the "Developer ID Application…" identity (so the key is included) → right-click → **Export…**
+   → save as `.p12`. The password you set is **`CODESIGN_P12_PASSWORD`**.
+4. Base64-encode for Doppler:
+   ```sh
+   base64 -i DeveloperID.p12        # → CODESIGN_P12_BASE64
+   ```
+   (Line wrapping is fine — CI decodes with `base64 --decode`, which ignores whitespace.)
+
+**Notarization credential — pick ONE** (the API key is the default and is recommended for CI):
+
+- **App Store Connect API key** → `NOTARY_KEY_BASE64`, `NOTARY_KEY_ID`, `NOTARY_ISSUER`:
+  [App Store Connect](https://appstoreconnect.apple.com/access/integrations/api) → **Users and Access →
+  Integrations → App Store Connect API → Team Keys** → generate a key with **Developer** access.
+  > ⚠️ It must be a **Team** key with the **Developer** role — *personal* keys are not eligible for the
+  > Notary API.
+
+  Download `AuthKey_XXXXXXXXXX.p8` — this is a **one-time download**. Then:
+  - **`NOTARY_KEY_ID`** = the 10-character Key ID.
+  - **`NOTARY_ISSUER`** = the Issuer ID (UUID shown at the top of the Keys page).
+  - **`NOTARY_KEY_BASE64`** = `base64 -i AuthKey_XXXXXXXXXX.p8`.
+
+- **Apple ID + app-specific password (alternative)** → `NOTARY_APPLE_ID`, `NOTARY_PASSWORD`,
+  `NOTARY_TEAM_ID`: create an app-specific password at
+  [appleid.apple.com](https://account.apple.com/account/manage) → **Sign-In and Security → App-Specific
+  Passwords → +**. `NOTARY_APPLE_ID` is your Apple ID email; `NOTARY_TEAM_ID` is the Team ID from step 2.
+
+**Ephemeral keychain password** → `KEYCHAIN_PASSWORD`: any random string (CI creates a throwaway keychain
+with it), e.g. `openssl rand -base64 24`.
+
+### b. Put the material in Doppler
+
+Create a Doppler **project** and **config** for releases, and add the secrets using the **exact names**
+the scripts read:
+
+- `CODESIGN_P12_BASE64`, `CODESIGN_P12_PASSWORD`, `CODESIGN_IDENTITY`, `KEYCHAIN_PASSWORD`
+- plus your chosen notary set: `NOTARY_KEY_BASE64` + `NOTARY_KEY_ID` + `NOTARY_ISSUER`, **or**
+  `NOTARY_APPLE_ID` + `NOTARY_PASSWORD` + `NOTARY_TEAM_ID`.
+
+### c. Create a Doppler Service Account + OIDC Identity
+
+1. Create a **Service Account** with **read** access to the release config.
+2. Add a **Service Account Identity** using the **GitHub** OIDC provider, and configure its claim rules to
+   trust this repo's OIDC token:
+   - **Audience** — per Doppler's
+     [GitHub OIDC examples](https://docs.doppler.com/docs/github-oidc-examples), typically
+     `https://github.com/richardcase`.
+   - **Subject / repository** — restrict to `richardcase/clowder` (optionally further to
+     `ref:refs/tags/*` so only tag builds can authenticate).
+3. Copy the Identity's **UUID**.
+
+See Doppler's [Service Account Identities (OIDC)](https://docs.doppler.com/docs/service-account-identities)
+for the exact UI.
+
+### d. Set the GitHub repository Variables
+
+GitHub → **Settings → Secrets and variables → Actions → _Variables_** (the **Variables** tab, **not**
+Secrets):
+
+| Variable | Value |
+|---|---|
+| `DOPPLER_IDENTITY_ID` | the Service Account Identity UUID (also the signing gate) |
+| `DOPPLER_PROJECT` | the Doppler project name |
+| `DOPPLER_CONFIG` | the Doppler config name |
+
+Until `DOPPLER_IDENTITY_ID` exists the release stays unsigned. Once the first signed release succeeds,
+delete any legacy signing **secrets** from the repo — none are needed anymore.
+
+### e. Cut a signed release
+
+```sh
+scripts/set-version.sh 0.2.0        # updates VERSION + Cargo.lock
+git commit -am "Release v0.2.0"
+git tag -a v0.2.0 -m "v0.2.0"       # annotated (plain `git tag` is rejected in this repo)
+git push && git push origin v0.2.0
+```
+
+`release.yml` builds, authenticates to Doppler over OIDC, signs + notarizes, and attaches a
+`Clowder-vX.Y.Z-macos.dmg` to the GitHub Release.
+
+## Local signing & notarization
+
+You can run the full flow on your own machine (needs the Developer ID cert in your login keychain and
+notary credentials):
+
+```sh
+scripts/build-app.sh
+CODESIGN_IDENTITY="Developer ID Application: NAME (TEAMID)" scripts/sign-app.sh
+
+# store notary credentials once (API-key example), then reuse via NOTARY_PROFILE:
+xcrun notarytool store-credentials clowder-notary \
+  --key AuthKey_XXXXXXXXXX.p8 --key-id XXXXXXXXXX --issuer <issuer-uuid>
+
+NOTARY_PROFILE=clowder-notary \
+  CODESIGN_IDENTITY="Developer ID Application: NAME (TEAMID)" \
+  scripts/package-dmg.sh
+```
+
+Expect `notarytool` to report **Accepted**, `stapler validate` to pass, and `spctl -a -t open` to accept
+the DMG. Mount it on a clean Mac → `Clowder.app` launches with no Gatekeeper prompt.
+
+For a credential-free structural smoke test (no Apple account), ad-hoc sign:
+`CODESIGN_IDENTITY="-" scripts/sign-app.sh` → `codesign --verify --deep --strict dist/Clowder.app`.
+
+## References
+
+- Apple — [Signing Mac software with Developer ID](https://developer.apple.com/developer-id/),
+  [Certificates overview](https://developer.apple.com/support/certificates/)
+- Doppler — [GitHub OIDC examples](https://docs.doppler.com/docs/github-oidc-examples),
+  [Service Account Identities](https://docs.doppler.com/docs/service-account-identities),
+  [secrets-fetch-action](https://github.com/DopplerHQ/secrets-fetch-action)

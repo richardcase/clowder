@@ -30,8 +30,9 @@ with no secret it falls through to the existing `ditto`-zip path.
   item explicitly; `--deep` is used only in `--verify`.
 - **Entitlements must be comment-free** — `codesign`'s AMFI XML parser errors on XML comments. Keep
   `macos/clowder-app.entitlements` a bare `<dict/>`; document exceptions in this plan, not in the file.
-- **Signing is secret-gated:** no `CODESIGN_P12_BASE64` secret → unsigned zip path (forks/PRs unaffected).
-  `ci.yml` is **untouched** (still uploads the unsigned artifact).
+- **Signing is gated on the `DOPPLER_IDENTITY_ID` repo variable** → unset ⇒ unsigned zip path (forks/PRs
+  unaffected). Signing material is fetched from Doppler over GitHub OIDC (no GitHub secrets); see
+  [`docs/code-signing.md`](../../code-signing.md). `ci.yml` is **untouched** (still uploads the unsigned artifact).
 - **Notarization creds are undecided:** support both — App Store Connect **API key** (default) and
   **Apple ID + app password** — auto-selected by whichever env set is fully present.
 - Scope: M6c only. No Homebrew (M6f). `set -euo pipefail`.
@@ -69,14 +70,16 @@ with no secret it falls through to the existing `ditto`-zip path.
 - **Note:** the DMG is notarized/stapled, not the inner `.app`. Online Gatekeeper still accepts an app
   drag-copied out of the DMG; a two-pass flow (also staple the `.app`) is an optional robustness upgrade.
 
-## Task 4: `release.yml` signed path (secret-gated)
+## Task 4: `release.yml` signed path (gated on `DOPPLER_IDENTITY_ID` variable)
 
-- [x] `build-app.sh` always runs. A **Detect signing secrets** step emits `steps.signing.outputs.enabled`
-  (`CODESIGN_P12_BASE64` present?). When true: import the cert into a `$RUNNER_TEMP` keychain
-  (`security create-keychain` → `set-keychain-settings -lut` → `unlock` → `import -f pkcs12` →
-  `set-key-partition-list -S apple-tool:,apple:,codesign:` → `list-keychain -s`), export `CODESIGN_KEYCHAIN`,
-  run `sign-app.sh`, decode `NOTARY_KEY_BASE64` → `NOTARY_KEY`, run `package-dmg.sh`, publish the DMG; a
-  final `always()` step deletes the keychain. When false: existing `ditto` zip + unsigned-body publish.
+- [x] `build-app.sh` always runs. When the repo Variable `DOPPLER_IDENTITY_ID` is set: fetch the signing
+  secrets from Doppler over OIDC (`dopplerhq/secrets-fetch-action`, `auth-method: oidc`, `id-token: write`),
+  import the cert into a `$RUNNER_TEMP` keychain (`security create-keychain` → `set-keychain-settings -lut`
+  → `unlock` → `import -f pkcs12` → `set-key-partition-list -S apple-tool:,apple:,codesign:` →
+  `list-keychain -s`), export `CODESIGN_KEYCHAIN`, run `sign-app.sh`, decode `NOTARY_KEY_BASE64` →
+  `NOTARY_KEY`, run `package-dmg.sh`, publish the DMG; a final `always()` step deletes the keychain. When
+  unset: existing `ditto` zip + unsigned-body publish. (Superseded the original GHA-secrets wiring — see
+  [`docs/code-signing.md`](../../code-signing.md).)
 
 ## Task 5: Docs + version
 
@@ -86,30 +89,14 @@ with no secret it falls through to the existing `ditto`-zip path.
 
 ---
 
-## Required GitHub Actions secrets (maintainer sets before the signed release)
+## Secrets, CI wiring & maintainer setup
 
-| Secret | Purpose |
-|---|---|
-| `CODESIGN_P12_BASE64` | base64 of the exported **Developer ID Application** cert+key `.p12` (gates signing) |
-| `CODESIGN_P12_PASSWORD` | password protecting that `.p12` |
-| `CODESIGN_IDENTITY` | e.g. `Developer ID Application: Richard Case (TEAMID)` |
-| `KEYCHAIN_PASSWORD` | arbitrary password for the ephemeral CI keychain |
-| **API-key notary (default)** | `NOTARY_KEY_BASE64` (base64 of `AuthKey_*.p8`), `NOTARY_KEY_ID`, `NOTARY_ISSUER` |
-| **or Apple-ID notary** | `NOTARY_APPLE_ID`, `NOTARY_PASSWORD` (app-specific), `NOTARY_TEAM_ID` |
-
-## Local validation (maintainer — needs the real cert + Apple account)
-
-```sh
-scripts/build-app.sh
-CODESIGN_IDENTITY="Developer ID Application: … (TEAMID)" scripts/sign-app.sh
-# one-time: store notary creds in the keychain (API key shown)
-xcrun notarytool store-credentials clowder-notary \
-  --key AuthKey_XXXX.p8 --key-id XXXXXXXXXX --issuer <issuer-uuid>
-NOTARY_PROFILE=clowder-notary CODESIGN_IDENTITY="Developer ID Application: … (TEAMID)" \
-  scripts/package-dmg.sh
-# expect: notarytool "Accepted", `stapler validate` ok, `spctl` accepts the DMG.
-# then mount the DMG on a clean Mac → Clowder launches with no Gatekeeper block; daemon auto-spawns.
-```
+Signing material lives in **Doppler** (keys: `CODESIGN_P12_BASE64`, `CODESIGN_P12_PASSWORD`,
+`CODESIGN_IDENTITY`, `KEYCHAIN_PASSWORD`, plus the API-key or Apple-ID notary set) and is fetched by
+`release.yml` over **GitHub OIDC** (`dopplerhq/secrets-fetch-action`, `auth-method: oidc`) — GitHub stores
+only the non-secret Variables `DOPPLER_IDENTITY_ID` / `DOPPLER_PROJECT` / `DOPPLER_CONFIG`, no secrets.
+The full flow, how to **generate the Apple signing material**, the Doppler + OIDC setup, and **local
+signing/notarization** all live in [`docs/code-signing.md`](../../code-signing.md).
 
 ## Verification gate
 
