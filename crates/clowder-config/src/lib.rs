@@ -16,6 +16,7 @@ pub struct Config {
     pub default_cols: u16,
     pub default_rows: u16,
     pub remote_listen: Option<String>,
+    pub remote_host: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -29,7 +30,7 @@ struct Sockets { client: Option<PathBuf>, control: Option<PathBuf>, hook: Option
 #[derive(Debug, Default, Deserialize)]
 struct PaneCfg { backlog_cap: Option<usize>, shell: Option<String>, cols: Option<u16>, rows: Option<u16> }
 #[derive(Debug, Default, Deserialize)]
-struct Remote { listen: Option<String> }
+struct Remote { listen: Option<String>, host: Option<String> }
 
 impl Config {
     /// Load `$XDG_CONFIG_HOME/clowder/config.toml` (else `$HOME/.config/clowder/config.toml`), then apply
@@ -68,6 +69,7 @@ impl Config {
             // An empty value from EITHER env or file means "off" — the daemon skips the TCP bind
             // (rather than failing to parse `""` as a socket address at startup).
             remote_listen: nonempty("CLOWDER_LISTEN").or(r.listen.filter(|s| !s.is_empty())),
+            remote_host: nonempty("CLOWDER_REMOTE_HOST").or(r.host.filter(|s| !s.is_empty())),
         }
     }
 }
@@ -164,19 +166,35 @@ mod tests {
     #[test]
     fn remote_listen_env_over_file_then_none() {
         // env wins over file
-        let f = FileConfig { remote: Some(Remote { listen: Some("127.0.0.1:1".into()) }), ..Default::default() };
+        let f = FileConfig { remote: Some(Remote { listen: Some("127.0.0.1:1".into()), host: None }), ..Default::default() };
         let env = |k: &str| (k == "CLOWDER_LISTEN").then(|| "127.0.0.1:2".to_string());
         assert_eq!(Config::resolve(f, &env).remote_listen.as_deref(), Some("127.0.0.1:2"));
 
         // file only
-        let f2 = FileConfig { remote: Some(Remote { listen: Some("127.0.0.1:3".into()) }), ..Default::default() };
+        let f2 = FileConfig { remote: Some(Remote { listen: Some("127.0.0.1:3".into()), host: None }), ..Default::default() };
         assert_eq!(Config::resolve(f2, &|_| None).remote_listen.as_deref(), Some("127.0.0.1:3"));
 
         // neither → None (TCP off)
         assert_eq!(Config::resolve(FileConfig::default(), &|_| None).remote_listen, None);
 
         // an empty file value is "off", not Some("") (which would fail to parse/bind later)
-        let f3 = FileConfig { remote: Some(Remote { listen: Some("".into()) }), ..Default::default() };
+        let f3 = FileConfig { remote: Some(Remote { listen: Some("".into()), host: None }), ..Default::default() };
         assert_eq!(Config::resolve(f3, &|_| None).remote_listen, None);
+    }
+
+    #[test]
+    fn remote_host_env_over_file_then_none() {
+        let f = FileConfig { remote: Some(Remote { listen: None, host: Some("h:1".into()) }), ..Default::default() };
+        let env = |k: &str| (k == "CLOWDER_REMOTE_HOST").then(|| "h:2".to_string());
+        assert_eq!(Config::resolve(f, &env).remote_host.as_deref(), Some("h:2"));
+
+        let f2 = FileConfig { remote: Some(Remote { listen: None, host: Some("h:3".into()) }), ..Default::default() };
+        assert_eq!(Config::resolve(f2, &|_| None).remote_host.as_deref(), Some("h:3"));
+
+        assert_eq!(Config::resolve(FileConfig::default(), &|_| None).remote_host, None);
+
+        // empty file value is "off"
+        let f4 = FileConfig { remote: Some(Remote { listen: None, host: Some("".into()) }), ..Default::default() };
+        assert_eq!(Config::resolve(f4, &|_| None).remote_host, None);
     }
 }
