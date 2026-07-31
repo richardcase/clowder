@@ -1,6 +1,7 @@
 use crate::server::Daemon;
 use anyhow::Result;
 use clowder_proto::{read_hello, Channel};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
@@ -33,10 +34,9 @@ impl Daemon {
     }
 }
 
-use std::net::{IpAddr, SocketAddr};
-
-/// Phase A has no auth, so binding anywhere but loopback or the Tailscale CGNAT
-/// range (100.64.0.0/10) deserves a startup warning. Returns true = warn.
+/// Phase A has no auth, so binding anywhere but loopback or the Tailscale tailnet
+/// ranges (v4 CGNAT 100.64.0.0/10, v6 fd7a:115c:a1e0::/48) deserves a startup
+/// warning. Returns true = warn.
 pub fn should_warn_exposed(addr: &SocketAddr) -> bool {
     match addr.ip() {
         IpAddr::V4(v4) => {
@@ -44,7 +44,11 @@ pub fn should_warn_exposed(addr: &SocketAddr) -> bool {
             let is_tailnet = o[0] == 100 && (64..=127).contains(&o[1]); // 100.64.0.0/10
             !(v4.is_loopback() || is_tailnet)
         }
-        IpAddr::V6(v6) => !v6.is_loopback(),
+        IpAddr::V6(v6) => {
+            let o = v6.octets();
+            let is_tailnet = o[0..6] == [0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0]; // fd7a:115c:a1e0::/48
+            !(v6.is_loopback() || is_tailnet)
+        }
     }
 }
 
@@ -102,5 +106,9 @@ mod tests {
         // anything else (all-interfaces / LAN / public) has no auth in Phase A → warn
         assert!(should_warn_exposed(&addr("0.0.0.0:7777")));
         assert!(should_warn_exposed(&addr("192.168.1.10:7777")));
+        // Tailscale IPv6 (fd7a:115c:a1e0::/48) is also a sanctioned tailnet bind → no warning
+        assert!(!should_warn_exposed(&addr("[fd7a:115c:a1e0::1]:7777")));
+        // non-tailnet global/ULA IPv6 has no auth in Phase A → warn
+        assert!(should_warn_exposed(&addr("[2606:4700::1]:7777")));
     }
 }
