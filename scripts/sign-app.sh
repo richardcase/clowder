@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Sign Clowder.app for Developer ID distribution (M6c): hardened runtime, inner-first, secure timestamp.
-# Signs each nested binary explicitly (inner-first), then the app bundle — NOT `codesign --deep`, which
-# is deprecated and unreliable for bundles with executables outside the standard nesting locations.
+# Signs each executable explicitly (inner-first), then the app bundle — NOT `codesign --deep`, which is
+# deprecated. All binaries live in the standard Contents/MacOS/ nesting location.
 #
 # Usage: scripts/sign-app.sh [app-path]        (default: dist/Clowder.app)
 # Env:
@@ -33,9 +33,9 @@ sign() {
   codesign --force --options runtime "${ts[@]}" ${kc[@]+"${kc[@]}"} --sign "$IDENTITY" "$@" "$f"
 }
 
-echo "==> Signing nested binaries (inner-first)"
+echo "==> Signing bundled binaries (inner-first)"
 for bin in clowder-hook clowder clowder-daemon; do
-  sign "$APP/Contents/Resources/bin/$bin"
+  sign "$APP/Contents/MacOS/$bin"
 done
 
 echo "==> Signing app executable + bundle (with entitlements)"

@@ -158,7 +158,10 @@ runtime entitlements plist and the "Developer ID Application" identity over `Mux
 binaries signed inner-first); submit to Apple `notarytool` with an app-specific password / API key;
 `stapler staple`; package a DMG (`create-dmg` or `hdiutil`). CI secrets: the signing identity (imported
 into a temporary keychain) and the notarization credentials. This slice replaces M6d's "unsigned
-artifact" step with a signed+notarized+stapled DMG.
+artifact" step with a signed+notarized+stapled DMG. **As shipped:** each executable is signed
+explicitly inner-first (not `--deep`); notarization is `hdiutil` DMG; and the three bundled binaries
+were moved from the M6a `Contents/Resources/bin/` into `Contents/MacOS/` (the standard nesting location
+for a bundle's executables) so `codesign` treats them as first-class nested code.
 
 ### M6d — CI (GitHub Actions) (spec now, buildable unsigned)
 

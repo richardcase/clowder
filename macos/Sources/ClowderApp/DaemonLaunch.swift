@@ -24,10 +24,12 @@ enum ClowderPaths {
                 p("CLOWDER_HOOK_SOCK", "clowder-hook.sock"))
     }
 
-    /// A binary bundled at Contents/Resources/bin/<name>, or nil when running unbundled (swift run).
+    /// A binary bundled next to the app executable at Contents/MacOS/<name>, or nil when running
+    /// unbundled (swift run — .build/debug/clowder-app has no Rust siblings, so this returns nil and
+    /// callers fall back to CLOWDER_BIN / the dev target path).
     static func bundledBin(_ name: String) -> String? {
-        guard let res = Bundle.main.resourcePath else { return nil }
-        let path = (res as NSString).appendingPathComponent("bin/\(name)")
+        guard let exeDir = Bundle.main.executableURL?.deletingLastPathComponent() else { return nil }
+        let path = exeDir.appendingPathComponent(name).path
         return FileManager.default.isExecutableFile(atPath: path) ? path : nil
     }
 }
@@ -71,14 +73,15 @@ final class ProcessDaemon: DaemonProcess {
 /// Returns nil when unbundled (dev `swift run`) so the developer keeps starting the daemon by hand.
 @MainActor
 func makeDaemonSupervisor() -> DaemonSupervisor? {
-    guard let daemonPath = ClowderPaths.bundledBin("clowder-daemon"),
-          let res = Bundle.main.resourcePath else { return nil }
+    guard let daemonPath = ClowderPaths.bundledBin("clowder-daemon") else { return nil }
     let socks = ClowderPaths.socketPaths()
     var env = ProcessInfo.processInfo.environment
     env["CLOWDER_SOCK"] = socks.client
     env["CLOWDER_CONTROL_SOCK"] = socks.control
     env["CLOWDER_HOOK_SOCK"] = socks.hook
-    let binDir = (res as NSString).appendingPathComponent("bin")
+    // clowder-daemon's own dir (Contents/MacOS/) holds clowder + clowder-hook too, so putting it on
+    // PATH lets any bare-name lookup by the daemon or its children resolve the bundled copies.
+    let binDir = (daemonPath as NSString).deletingLastPathComponent
     env["PATH"] = binDir + ":" + (env["PATH"] ?? "/usr/bin:/bin")
     return DaemonSupervisor(spawn: { ProcessDaemon(execPath: daemonPath, env: env) })
 }

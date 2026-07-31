@@ -21,8 +21,9 @@ with no secret it falls through to the existing `ditto`-zip path.
 ## Global Constraints
 
 - **libghostty is a static `.a`** linked into the single `clowder-app` Mach-O — there are **no dylibs or
-  frameworks** to sign. Signing targets: the 3 bundled binaries in `Contents/Resources/bin/`, the app exe
-  in `Contents/MacOS/`, then the `.app` bundle — signed **inner-first**.
+  frameworks** to sign. Signing targets, all in `Contents/MacOS/`: the 3 bundled binaries
+  (`clowder-daemon`/`clowder`/`clowder-hook`), the app exe (`clowder-app`), then the `.app` bundle —
+  signed **inner-first**.
 - **Hardened runtime + secure timestamp + Developer ID on every executable**, or notarization rejects the
   bundle. `--options runtime --timestamp`.
 - **Do NOT use `codesign --deep`** to sign (deprecated / unreliable for non-standard nesting). Sign each
@@ -48,13 +49,14 @@ with no secret it falls through to the existing `ditto`-zip path.
 
 - [x] Sign `dist/Clowder.app` (arg-overridable) inner-first. Env: `CODESIGN_IDENTITY` (default
   `"Developer ID Application"`; `"-"` = ad-hoc smoke test, no timestamp), `CODESIGN_KEYCHAIN` (CI temp
-  keychain). Sign the 3 `Resources/bin` binaries with `--options runtime --timestamp`; sign the app exe +
+  keychain). Sign the 3 `Contents/MacOS/` binaries with `--options runtime --timestamp`; sign the app exe +
   bundle additionally with `--entitlements macos/clowder-app.entitlements`. Verify with
   `codesign --verify --deep --strict --verbose=2`.
-- **Note:** the bundled binaries live in `Contents/Resources/bin/` (M6a's layout, chosen so the daemon
-  resolves `clowder-hook` as an exe-sibling). This is non-standard nesting but signs + notarizes fine as
-  long as each is individually signed (they are). If a future Gatekeeper change objects, move them to
-  `Contents/MacOS/` or `Contents/Helpers/` and update `agent.rs` resolution.
+- **Note:** all four executables live in `Contents/MacOS/` — the standard nesting location for a bundle's
+  main exe plus additional command-line tools. The three Rust binaries stay co-located so the daemon
+  resolves `clowder-hook` as an exe-sibling of `clowder-daemon` (`agent.rs`) and the app resolves
+  `clowder` next to its own executable. (Originally `Contents/Resources/bin/`; moved to `MacOS/` because
+  `Resources/` is for non-code and `codesign` seals it as a resource rather than first-class nested code.)
 
 ## Task 3: `scripts/package-dmg.sh`
 
