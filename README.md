@@ -134,7 +134,7 @@ propagates it into the Cargo workspace and the app's Info.plist. Pushing a `vX.Y
 [`release.yml`](.github/workflows/release.yml), which builds the app and publishes a GitHub Release. When
 signing is configured it attaches a **signed + notarized `.dmg`** (`scripts/sign-app.sh` →
 `scripts/package-dmg.sh`); otherwise it falls back to an unsigned `.zip`. Signing material is fetched from
-**Doppler over GitHub OIDC** — no signing secret is stored in GitHub. See
+**Doppler** at build time; GitHub stores only a single read-only Doppler **service token**. See
 [`docs/versioning.md`](docs/versioning.md) and [`docs/code-signing.md`](docs/code-signing.md).
 
 ## Status

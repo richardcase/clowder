@@ -6,7 +6,6 @@ on:
 
 permissions:
   contents: write   # create the GitHub Release
-  id-token: write   # request the GitHub OIDC token used to authenticate to Doppler (signing secrets)
 
 jobs:
   release:
@@ -56,23 +55,33 @@ jobs:
       - name: Assemble Clowder.app
         run: scripts/build-app.sh
 
-      # Signing material is fetched from Doppler at run time over GitHub OIDC — NO signing secret and NO
-      # Doppler token are stored in GitHub. The signing gate is the (non-secret) repository Variable
-      # DOPPLER_IDENTITY_ID: set on the canonical repo → signed; absent (e.g. a fork pushing a tag) →
-      # unsigned fallback. `vars` (unlike `secrets`) is usable directly in `if:`. See docs/code-signing.md.
-      - name: Fetch signing secrets from Doppler (OIDC)
+      # Signing material lives in Doppler and is fetched at run time with a read-only, config-scoped
+      # Doppler SERVICE TOKEN (the only credential in GitHub — no Apple signing secret is stored here).
+      # Gate on the token's presence; secrets aren't reliably usable in `if:`, so surface a boolean
+      # output. Forks / a repo without the token publish an unsigned build. See docs/code-signing.md.
+      # (OIDC — no stored token — needs a Doppler Service Account, a Team/Enterprise feature.)
+      - name: Detect Doppler token
+        id: signing
+        env:
+          DOPPLER_TOKEN: ${{ secrets.DOPPLER_TOKEN }}
+        run: |
+          if [ -n "$DOPPLER_TOKEN" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::No DOPPLER_TOKEN secret — publishing an UNSIGNED build."
+          fi
+
+      - name: Fetch signing secrets from Doppler
         id: doppler
-        if: ${{ vars.DOPPLER_IDENTITY_ID != '' }}
+        if: steps.signing.outputs.enabled == 'true'
         uses: dopplerhq/secrets-fetch-action@v2.0.0
         with:
-          auth-method: oidc
-          doppler-identity-id: ${{ vars.DOPPLER_IDENTITY_ID }}
-          doppler-project: ${{ vars.DOPPLER_PROJECT }}
-          doppler-config: ${{ vars.DOPPLER_CONFIG }}
+          doppler-token: ${{ secrets.DOPPLER_TOKEN }}
 
-      # ---------- signed path (Doppler configured) ----------
+      # ---------- signed path (Doppler token configured) ----------
       - name: Import Developer ID certificate into a temp keychain
-        if: ${{ vars.DOPPLER_IDENTITY_ID != '' }}
+        if: steps.signing.outputs.enabled == 'true'
         env:
           CODESIGN_P12_BASE64: ${{ steps.doppler.outputs.CODESIGN_P12_BASE64 }}
           CODESIGN_P12_PASSWORD: ${{ steps.doppler.outputs.CODESIGN_P12_PASSWORD }}
@@ -90,7 +99,7 @@ jobs:
           echo "CODESIGN_KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
 
       - name: Sign, notarize, and package a DMG
-        if: ${{ vars.DOPPLER_IDENTITY_ID != '' }}
+        if: steps.signing.outputs.enabled == 'true'
         env:
           CODESIGN_IDENTITY: ${{ steps.doppler.outputs.CODESIGN_IDENTITY }}
           # API-key notarization (default). Leave these empty in Doppler and set the Apple-ID trio
@@ -111,7 +120,7 @@ jobs:
           rm -f "$RUNNER_TEMP/notary.p8"
 
       - name: Publish GitHub Release (signed)
-        if: ${{ vars.DOPPLER_IDENTITY_ID != '' }}
+        if: steps.signing.outputs.enabled == 'true'
         uses: softprops/action-gh-release@v2
         with:
           files: dist/Clowder-*-macos.dmg
@@ -121,13 +130,13 @@ jobs:
 
             Open the `.dmg` and drag **Clowder** to **Applications**. No Gatekeeper workaround needed.
 
-      # ---------- unsigned fallback (Doppler not configured: forks / unconfigured repo) ----------
+      # ---------- unsigned fallback (no DOPPLER_TOKEN: forks / unconfigured repo) ----------
       - name: Zip the unsigned app bundle
-        if: ${{ vars.DOPPLER_IDENTITY_ID == '' }}
+        if: steps.signing.outputs.enabled != 'true'
         run: ditto -c -k --keepParent dist/Clowder.app "dist/Clowder-${GITHUB_REF_NAME}-macos.zip"
 
       - name: Publish GitHub Release (unsigned)
-        if: ${{ vars.DOPPLER_IDENTITY_ID == '' }}
+        if: steps.signing.outputs.enabled != 'true'
         uses: softprops/action-gh-release@v2
         with:
           files: dist/Clowder-*-macos.zip
@@ -140,5 +149,5 @@ jobs:
             > `xattr -dr com.apple.quarantine Clowder.app`.
 
       - name: Remove temp signing keychain
-        if: ${{ always() && vars.DOPPLER_IDENTITY_ID != '' }}
+        if: ${{ always() && steps.signing.outputs.enabled == 'true' }}
         run: security delete-keychain "$RUNNER_TEMP/clowder-signing.keychain-db" || true
