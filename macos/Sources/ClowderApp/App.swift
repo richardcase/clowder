@@ -96,13 +96,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Live backend swap (menu "Use local" / "Connect to remote"): stop the current backend, start the
     /// other, and reconfigure the SAME AppModel + SurfaceHost in place (SwiftUI keeps their references).
+    /// The menu only ever toggles to the OPPOSITE mode, so this is never a same-backend restart (which
+    /// could race the local daemon's single-instance flock).
     func switchBackend(to remoteHost: String?) {
+        // Build the new backend first: if we can't (unbundled dev), leave the current one untouched
+        // rather than stopping it and stranding the tray label.
+        guard let backend = makeBackendSupervisor(remoteHost: remoteHost) else { return }
         daemonSupervisor?.stop()
-        daemonSupervisor = nil
-        guard let backend = makeBackendSupervisor(remoteHost: remoteHost) else {
-            currentRemoteHost = nil   // unbundled dev: nothing to supervise
-            return
-        }
         daemonSupervisor = backend.supervisor
         currentRemoteHost = remoteHost
         backend.supervisor.start()

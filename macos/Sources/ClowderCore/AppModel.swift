@@ -99,7 +99,13 @@ public final class AppModel: ObservableObject {
     /// One connection attempt: build the transport, wire close→reconnect, hydrate. Throws on failure.
     private func attemptConnect() throws {
         let transport = try makeTransport()
-        transport.setOnClose { [weak self] in self?.handleClose() }
+        // Guard on connection identity: the real transport fires onClose ASYNCHRONOUSLY, so a
+        // transport we've already replaced (e.g. during a live backend swap) can deliver a late close
+        // — ignore it, or it would flip the healthy new connection back into reconnecting.
+        transport.setOnClose { [weak self, weak transport] in
+            guard let self, self.connection === transport else { return }
+            self.handleClose()
+        }
         let session = ControlSession(transport: transport, store: store)
         self.connection = transport
         self.session = session

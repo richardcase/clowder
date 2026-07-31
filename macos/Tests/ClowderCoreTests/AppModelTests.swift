@@ -16,7 +16,13 @@ final class FakeControlTransport: ControlTransport {
         sentLines.append(line)
     }
     func setOnClose(_ handler: @escaping () -> Void) { self.onClose = handler }
-    func disconnect() { disconnected = true; onClose?() }
+    /// The real UnixSocketConnection fires onClose ASYNCHRONOUSLY; set this to model that timing.
+    var deferClose = false
+    func disconnect() {
+        disconnected = true
+        let cb = onClose
+        if deferClose { DispatchQueue.main.async { cb?() } } else { cb?() }
+    }
     /// Test helper: simulate the daemon pushing a JSON line.
     func deliver(_ line: String) { receiver?(line) }
 }
@@ -84,6 +90,25 @@ final class AppModelTests: XCTestCase {
         XCTAssertTrue(model.store.agents.isEmpty)                          // old agents dropped
         XCTAssertEqual(model.connectionState, .live)                      // connected to the new transport
         XCTAssertTrue(second.sentLines.contains { $0.contains("\"type\":\"listAgents\"") })  // hydrated the new one
+        model.shutdown()
+    }
+
+    func testReconnectIgnoresLateAsyncCloseFromReplacedTransport() {
+        let first = FakeControlTransport()
+        first.deferClose = true                       // model the real transport's async onClose
+        let model = AppModel(makeTransport: { first })
+        model.connect()
+
+        let second = FakeControlTransport()
+        model.reconnect(makeTransport: { second })    // shutdown() disconnects `first` (defers its close)
+        XCTAssertEqual(model.connectionState, .live)
+
+        // Pump the main queue so `first`'s deferred onClose fires: the identity guard must ignore it,
+        // leaving the healthy new connection live (not flipped to .reconnecting).
+        let exp = expectation(description: "main queue pump")
+        DispatchQueue.main.async { exp.fulfill() }
+        wait(for: [exp], timeout: 1.0)
+        XCTAssertEqual(model.connectionState, .live)
         model.shutdown()
     }
 
