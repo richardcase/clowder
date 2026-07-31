@@ -70,23 +70,6 @@ final class ProcessDaemon: DaemonProcess {
     }
 }
 
-/// Build a supervisor that spawns the bundled daemon with per-user sockets + bundled bin/ on PATH.
-/// Returns nil when unbundled (dev `swift run`) so the developer keeps starting the daemon by hand.
-@MainActor
-func makeDaemonSupervisor() -> DaemonSupervisor? {
-    guard let daemonPath = ClowderPaths.bundledBin("clowder-daemon") else { return nil }
-    let socks = ClowderPaths.socketPaths()
-    var env = ProcessInfo.processInfo.environment
-    env["CLOWDER_SOCK"] = socks.client
-    env["CLOWDER_CONTROL_SOCK"] = socks.control
-    env["CLOWDER_HOOK_SOCK"] = socks.hook
-    // clowder-daemon's own dir (Contents/MacOS/) holds clowder + clowder-hook too, so putting it on
-    // PATH lets any bare-name lookup by the daemon or its children resolve the bundled copies.
-    let binDir = (daemonPath as NSString).deletingLastPathComponent
-    env["PATH"] = binDir + ":" + (env["PATH"] ?? "/usr/bin:/bin")
-    return DaemonSupervisor(spawn: { ProcessDaemon(execPath: daemonPath, env: env) })
-}
-
 /// Absolute dir where the M7b forwarder (`clowder connect`) binds its local sockets:
 /// `<control-sock parent>/remote`, matching the Rust `forward` derivation. Derived from the DEFAULT
 /// control path (not the forwarder's own socket) so it never becomes `.../remote/remote`.

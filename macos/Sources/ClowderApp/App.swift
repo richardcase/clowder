@@ -16,6 +16,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var windowCloseDelegate: HideOnCloseDelegate?
     private var statusBar: StatusBarController?
     private var daemonSupervisor: DaemonSupervisor?
+    /// The remote host the app is currently pointed at (nil = local daemon). Drives the tray label.
+    private(set) var currentRemoteHost: String?
 
     /// One-time libghostty + model initialization. Idempotent and main-thread-only; runs on
     /// whichever fires first — the SwiftUI scene body or `applicationDidFinishLaunching` — so
@@ -28,17 +30,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Bundled binary + per-user sockets (dev overrides via env/CLOWDER_BIN still honored).
         let socks = ClowderPaths.socketPaths()
-        let socketPath = socks.client
-        let controlPath = socks.control
         let clowderBinary = ProcessInfo.processInfo.environment["CLOWDER_BIN"]
             ?? ClowderPaths.bundledBin("clowder")
             ?? FileManager.default.currentDirectoryPath + "/../target/debug/clowder"
 
-        // Launch + supervise our own daemon when bundled (no-op / nil under `swift run`, where the
-        // developer starts the daemon by hand).
-        if let supervisor = makeDaemonSupervisor() {
-            daemonSupervisor = supervisor
-            supervisor.start()
+        // Config-driven backend: ask the clowder binary for the resolved [remote] host (it owns
+        // config.toml/env parsing). Non-nil → remote mode (supervise `clowder connect <host>` and
+        // connect to the forwarder's sockets); nil → local daemon. Default to the local socket paths;
+        // makeBackendSupervisor returns the mode's actual control/render sockets when bundled.
+        let remoteHost = resolveRemoteHost(clowderBinary: clowderBinary)
+        currentRemoteHost = remoteHost
+        var socketPath = socks.client
+        var controlPath = socks.control
+        if let backend = makeBackendSupervisor(remoteHost: remoteHost) {
+            daemonSupervisor = backend.supervisor
+            controlPath = backend.control
+            socketPath = backend.render
+            backend.supervisor.start()
         }
 
         // --- libghostty init (unchanged sequence, relocated from main.swift) ---
@@ -74,6 +82,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.connect()
         statusBar = StatusBarController(appModel: model, showWindow: { [weak self] in self?.showWindow() })
         return (model, host)
+    }
+
+    /// Ask the clowder binary for the resolved `[remote] host` (it owns config.toml/env parsing, which
+    /// the app can't do itself). Returns the trimmed host, or nil when empty / the query fails.
+    private func resolveRemoteHost(clowderBinary: String) -> String? {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: clowderBinary)
+        proc.arguments = ["remote-host"]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = FileHandle.nullDevice
+        do {
+            try proc.run()
+            proc.waitUntilExit()
+        } catch {
+            return nil
+        }
+        guard proc.terminationStatus == 0 else { return nil }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let host = (String(data: data, encoding: .utf8) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        return host.isEmpty ? nil : host
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
