@@ -18,6 +18,7 @@ crossterm = "0.28"
 clowder-daemon = { path = "../clowder-daemon" }
 clowder-workspace = { path = "../clowder-workspace" }
 tempfile = "3"
+tokio = { workspace = true, features = ["test-util"] }
 
 [[bin]]
 name = "clowder"

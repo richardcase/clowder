@@ -9,17 +9,22 @@ use tokio::net::TcpStream;
 pub async fn dial_with_backoff(host: &str) -> Result<TcpStream> {
     let mut delay = Duration::from_millis(500);
     let mut last_err = None;
-    for _ in 0..6 {
+    for attempt in 0..6 {
         match TcpStream::connect(host).await {
             Ok(s) => return Ok(s),
             Err(e) => {
                 last_err = Some(e);
-                tokio::time::sleep(delay).await;
-                delay = (delay * 2).min(Duration::from_secs(8));
+                if attempt < 5 {
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(Duration::from_secs(8));
+                }
             }
         }
     }
-    Err(anyhow::anyhow!("could not connect to remote {host}: {}", last_err.unwrap()))
+    Err(anyhow::anyhow!(
+        "could not connect to remote {host}: {}",
+        last_err.unwrap()
+    ))
 }
 
 /// Forward one local connection to the remote daemon: dial, send the channel hello, then
@@ -41,7 +46,8 @@ mod tests {
     use tokio::net::TcpListener;
 
     // A fake remote: reads the 1-byte hello, records it, then echoes the rest back.
-    async fn echo_remote_recording_hello() -> (std::net::SocketAddr, tokio::sync::oneshot::Receiver<u8>) {
+    async fn echo_remote_recording_hello(
+    ) -> (std::net::SocketAddr, tokio::sync::oneshot::Receiver<u8>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -53,7 +59,11 @@ mod tests {
             loop {
                 match sock.read(&mut buf).await {
                     Ok(0) | Err(_) => break,
-                    Ok(n) => { if sock.write_all(&buf[..n]).await.is_err() { break; } }
+                    Ok(n) => {
+                        if sock.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
                 }
             }
         });
@@ -71,14 +81,14 @@ mod tests {
         client.write_all(b"ping").await.unwrap();
         let mut got = [0u8; 4];
         client.read_exact(&mut got).await.unwrap();
-        assert_eq!(&got, b"ping");                       // bytes round-tripped through the remote echo
-        assert_eq!(hello_rx.await.unwrap(), 1);          // Control hello byte (Control == 1) reached the remote
+        assert_eq!(&got, b"ping"); // bytes round-tripped through the remote echo
+        assert_eq!(hello_rx.await.unwrap(), 1); // Control hello byte (Control == 1) reached the remote
 
         drop(client);
         let _ = fwd.await;
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn dial_with_backoff_errors_on_dead_host() {
         // 127.0.0.1:1 refuses quickly; assert we surface an error rather than hang forever.
         let r = dial_with_backoff("127.0.0.1:1").await;
