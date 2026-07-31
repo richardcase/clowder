@@ -16,6 +16,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var windowCloseDelegate: HideOnCloseDelegate?
     private var statusBar: StatusBarController?
     private var daemonSupervisor: DaemonSupervisor?
+    /// The remote host the app is currently pointed at (nil = local daemon). Drives the tray label.
+    private(set) var currentRemoteHost: String?
 
     /// One-time libghostty + model initialization. Idempotent and main-thread-only; runs on
     /// whichever fires first — the SwiftUI scene body or `applicationDidFinishLaunching` — so
@@ -28,17 +30,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Bundled binary + per-user sockets (dev overrides via env/CLOWDER_BIN still honored).
         let socks = ClowderPaths.socketPaths()
-        let socketPath = socks.client
-        let controlPath = socks.control
         let clowderBinary = ProcessInfo.processInfo.environment["CLOWDER_BIN"]
             ?? ClowderPaths.bundledBin("clowder")
             ?? FileManager.default.currentDirectoryPath + "/../target/debug/clowder"
 
-        // Launch + supervise our own daemon when bundled (no-op / nil under `swift run`, where the
-        // developer starts the daemon by hand).
-        if let supervisor = makeDaemonSupervisor() {
-            daemonSupervisor = supervisor
-            supervisor.start()
+        // Config-driven backend: ask the clowder binary for the resolved [remote] host (it owns
+        // config.toml/env parsing). Non-nil → remote mode (supervise `clowder connect <host>` and
+        // connect to the forwarder's sockets); nil → local daemon. Default to the local socket paths;
+        // makeBackendSupervisor returns the mode's actual control/render sockets when bundled.
+        let remoteHost = resolveRemoteHost(clowderBinary: clowderBinary)
+        var socketPath = socks.client
+        var controlPath = socks.control
+        if let backend = makeBackendSupervisor(remoteHost: remoteHost) {
+            daemonSupervisor = backend.supervisor
+            controlPath = backend.control
+            socketPath = backend.render
+            // Only claim "Remote" once a remote backend is actually running — otherwise the tray
+            // label could contradict the (local) sockets we wired up (e.g. unbundled dev).
+            currentRemoteHost = remoteHost
+            backend.supervisor.start()
         }
 
         // --- libghostty init (unchanged sequence, relocated from main.swift) ---
@@ -72,8 +82,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         surfaceHost = host
         appModel = model
         model.connect()
-        statusBar = StatusBarController(appModel: model, showWindow: { [weak self] in self?.showWindow() })
+        statusBar = StatusBarController(appModel: model,
+                                        showWindow: { [weak self] in self?.showWindow() },
+                                        remoteHost: { [weak self] in self?.currentRemoteHost })
         return (model, host)
+    }
+
+    /// Ask the clowder binary for the resolved `[remote] host` (it owns config.toml/env parsing, which
+    /// the app can't do itself). Returns the trimmed host, or nil when empty / the query fails.
+    private func resolveRemoteHost(clowderBinary: String) -> String? {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: clowderBinary)
+        proc.arguments = ["remote-host"]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = FileHandle.nullDevice
+        let data: Data
+        do {
+            try proc.run()
+            // Read BEFORE waiting: draining after waitUntilExit() can deadlock if the child fills the
+            // pipe buffer (output is one line today, but read-before-wait is the safe order).
+            data = pipe.fileHandleForReading.readDataToEndOfFile()
+            proc.waitUntilExit()
+        } catch {
+            return nil
+        }
+        guard proc.terminationStatus == 0 else { return nil }
+        let host = (String(data: data, encoding: .utf8) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        return host.isEmpty ? nil : host
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {

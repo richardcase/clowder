@@ -29,8 +29,14 @@ async fn main() -> Result<()> {
                 .join("remote");
             clowder_client::forward::forward(host, dir).await
         }
+        Some("remote-host") => {
+            // Print the resolved [remote] host (or an empty line) so the macOS app can decide
+            // local-vs-remote mode without parsing config.toml itself.
+            println!("{}", clowder_config::Config::load().remote_host.unwrap_or_default());
+            Ok(())
+        }
         // Legacy: `clowder <pane-id>` still attaches.
         Some(other) if other.parse::<u64>().is_ok() => attach(other.parse().unwrap()).await,
-        _ => Err(anyhow!("usage: clowder <spawn|attach|connect> ...")),
+        _ => Err(anyhow!("usage: clowder <spawn|attach|connect|remote-host> ...")),
     }
 }
