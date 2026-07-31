@@ -19,7 +19,9 @@ ZIG_VER="$(zig version)"
 [ "$ZIG_VER" = "0.16.0" ] || echo "warning: zig $ZIG_VER (recipe verified with 0.16.0)"
 xcodesel="$(xcode-select -p 2>/dev/null || true)"
 case "$xcodesel" in
-  *Xcode.app*) : ;;
+  # Match plain, versioned, and beta Xcode installs (e.g. Xcode.app, Xcode_16.4.app, Xcode-beta.app);
+  # the `xcrun metal` check below is the authoritative CLT-vs-full-Xcode gate.
+  *Xcode*.app*) : ;;
   *) echo "error: full Xcode required (xcode-select -p = '$xcodesel'); the Metal shader compiler is not in CLT" >&2; exit 1 ;;
 esac
 xcrun metal --version >/dev/null 2>&1 || { echo "error: 'xcrun metal' unavailable — full Xcode + accepted license needed" >&2; exit 1; }
