@@ -24,6 +24,6 @@ attaches a **signed + notarized `Clowder-vX.Y.Z-macos.dmg`**; otherwise it falls
 zipped `.app` (Gatekeeper-quarantined on download — right-click → Open, or
 `xattr -dr com.apple.quarantine Clowder.app`).
 
-Signing/notarization and its one-time setup (signing material fetched from Doppler over GitHub OIDC — no
-secrets stored in GitHub) are documented in [`code-signing.md`](code-signing.md). A Homebrew cask lands
+Signing/notarization and its one-time setup (signing material fetched from Doppler with a single
+read-only service token) are documented in [`code-signing.md`](code-signing.md). A Homebrew cask lands
 in M6f.

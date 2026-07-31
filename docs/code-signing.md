@@ -1,8 +1,8 @@
 # Code signing, notarization & release
 
 How `Clowder.app` is signed with a Developer ID, notarized by Apple, packaged as a DMG, and released —
-plus the one-time setup to enable it. Releases fetch all signing material from **Doppler** over **GitHub
-OIDC**, so **no signing secret and no Doppler token are ever stored in GitHub**.
+plus the one-time setup to enable it. Releases fetch all signing material from **Doppler**; GitHub stores
+only a single read-only, revocable **Doppler service token** — **no Apple signing material lives in GitHub**.
 
 ## The pipeline
 
@@ -29,25 +29,30 @@ scripts run locally and in CI — only how the env is populated differs.
 `package-dmg.sh` auto-selects the first fully-present notary credential set (`NOTARY_PROFILE` › API key ›
 Apple ID); with none set it builds + signs the DMG but skips notarize/staple.
 
-## CI: Doppler via GitHub OIDC
+## CI: Doppler via a service token
 
-`.github/workflows/release.yml` (on a `v*` tag) builds the app, then — **only when the repository
-Variable `DOPPLER_IDENTITY_ID` is set** — signs and notarizes:
+`.github/workflows/release.yml` (on a `v*` tag) builds the app, then — **only when the `DOPPLER_TOKEN`
+secret is set** — fetches the signing material from Doppler, signs, and notarizes:
 
 ```
-GitHub Actions (id-token: write)
-  └─ requests a short-lived OIDC JWT from GitHub
-       └─ dopplerhq/secrets-fetch-action (auth-method: oidc) exchanges it with Doppler for a
-          short-lived token bound to a Service Account Identity
-            └─ fetches the signing secrets as auto-masked step outputs
-                 └─ mapped into env → sign-app.sh + package-dmg.sh → notarized DMG on the Release
+GitHub Actions
+  └─ dopplerhq/secrets-fetch-action authenticates with a read-only Doppler SERVICE TOKEN
+     (secrets.DOPPLER_TOKEN — scoped to one project+config)
+       └─ fetches the signing secrets as auto-masked step outputs
+            └─ mapped into env → sign-app.sh + package-dmg.sh → notarized DMG on the Release
 ```
 
-- **No secrets in GitHub.** The only GitHub-side config is three non-secret **Variables**:
-  `DOPPLER_IDENTITY_ID`, `DOPPLER_PROJECT`, `DOPPLER_CONFIG`. All signing material lives in Doppler.
-- **The gate.** `DOPPLER_IDENTITY_ID` being present selects the signed path; a fork pushing a tag has no
-  such Variable, so the workflow falls back to publishing an **unsigned `.zip`**.
+- **Only one credential in GitHub:** the `DOPPLER_TOKEN` **secret** — a read-only, config-scoped,
+  revocable Doppler service token. No Apple signing material is stored in GitHub; it all lives in Doppler.
+  (Project/config are baked into the token's scope, so no other GitHub config is needed.)
+- **The gate.** `DOPPLER_TOKEN` being present selects the signed path; a fork / a repo without it falls
+  back to publishing an **unsigned `.zip`**.
 - Fetched secret values are masked in the Actions log by the fetch action.
+
+> **Why a service token, not OIDC?** OIDC (no stored token) needs a Doppler **Service Account Identity**,
+> which is a **Team/Enterprise** feature. On the free Developer plan, a service token is the way. If you
+> upgrade to a Team plan, `secrets-fetch-action` also supports `auth-method: oidc` (identity + `id-token:
+> write`, no stored token) — see the action's docs.
 
 ## One-time setup
 
@@ -110,34 +115,27 @@ the scripts read:
 - plus your chosen notary set: `NOTARY_KEY_BASE64` + `NOTARY_KEY_ID` + `NOTARY_ISSUER`, **or**
   `NOTARY_APPLE_ID` + `NOTARY_PASSWORD` + `NOTARY_TEAM_ID`.
 
-### c. Create a Doppler Service Account + OIDC Identity
+### c. Create a Doppler service token
 
-1. Create a **Service Account** with **read** access to the release config.
-2. Add a **Service Account Identity** using the **GitHub** OIDC provider, and configure its claim rules to
-   trust this repo's OIDC token:
-   - **Audience** — per Doppler's
-     [GitHub OIDC examples](https://docs.doppler.com/docs/github-oidc-examples), typically
-     `https://github.com/richardcase`.
-   - **Subject / repository** — restrict to `richardcase/clowder` (optionally further to
-     `ref:refs/tags/*` so only tag builds can authenticate).
-3. Copy the Identity's **UUID**.
+In the Doppler dashboard → your project → the **release config** → **Access → Service Tokens →
+Generate** → give it **read-only** access. Copy the token (starts with `dp.st.`). It is scoped to that
+one config, so nothing else about the project needs to be configured in GitHub.
 
-See Doppler's [Service Account Identities (OIDC)](https://docs.doppler.com/docs/service-account-identities)
-for the exact UI.
+(See Doppler's [Service Tokens](https://docs.doppler.com/docs/service-tokens) docs. OIDC — no stored
+token — instead needs a Service Account, which is a Team/Enterprise feature; see the note in the CI
+section above.)
 
-### d. Set the GitHub repository Variables
+### d. Set the GitHub secret
 
-GitHub → **Settings → Secrets and variables → Actions → _Variables_** (the **Variables** tab, **not**
-Secrets):
+GitHub → **Settings → Secrets and variables → Actions → _Secrets_** (the **Secrets** tab) → **New
+repository secret**:
 
-| Variable | Value |
+| Secret | Value |
 |---|---|
-| `DOPPLER_IDENTITY_ID` | the Service Account Identity UUID (also the signing gate) |
-| `DOPPLER_PROJECT` | the Doppler project name |
-| `DOPPLER_CONFIG` | the Doppler config name |
+| `DOPPLER_TOKEN` | the read-only Doppler service token from (c) (also the signing gate) |
 
-Until `DOPPLER_IDENTITY_ID` exists the release stays unsigned. Once the first signed release succeeds,
-delete any legacy signing **secrets** from the repo — none are needed anymore.
+Until `DOPPLER_TOKEN` is set the release stays unsigned. It's the **only** credential GitHub holds — a
+read-only, config-scoped, revocable token; no Apple signing material lives in GitHub.
 
 ### e. Cut a signed release
 
@@ -148,8 +146,8 @@ git tag -a v0.2.0 -m "v0.2.0"       # annotated (plain `git tag` is rejected in 
 git push && git push origin v0.2.0
 ```
 
-`release.yml` builds, authenticates to Doppler over OIDC, signs + notarizes, and attaches a
-`Clowder-vX.Y.Z-macos.dmg` to the GitHub Release.
+`release.yml` builds, fetches the signing material from Doppler with the service token, signs +
+notarizes, and attaches a `Clowder-vX.Y.Z-macos.dmg` to the GitHub Release.
 
 ## Local signing & notarization
 
@@ -179,6 +177,7 @@ For a credential-free structural smoke test (no Apple account), ad-hoc sign:
 
 - Apple — [Signing Mac software with Developer ID](https://developer.apple.com/developer-id/),
   [Certificates overview](https://developer.apple.com/support/certificates/)
-- Doppler — [GitHub OIDC examples](https://docs.doppler.com/docs/github-oidc-examples),
-  [Service Account Identities](https://docs.doppler.com/docs/service-account-identities),
-  [secrets-fetch-action](https://github.com/DopplerHQ/secrets-fetch-action)
+- Doppler — [Service Tokens](https://docs.doppler.com/docs/service-tokens),
+  [secrets-fetch-action](https://github.com/DopplerHQ/secrets-fetch-action); OIDC upgrade path (Team plan):
+  [GitHub OIDC examples](https://docs.doppler.com/docs/github-oidc-examples) /
+  [Service Account Identities](https://docs.doppler.com/docs/service-account-identities)
