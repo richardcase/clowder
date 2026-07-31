@@ -669,7 +669,7 @@ dependencies = [
 
 [[package]]
 name = "muxy-client"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "crossterm",
@@ -684,7 +684,7 @@ dependencies = [
 
 [[package]]
 name = "muxy-config"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "serde",
  "tempfile",
@@ -693,7 +693,7 @@ dependencies = [
 
 [[package]]
 name = "muxy-daemon"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "muxy-config",
@@ -713,7 +713,7 @@ dependencies = [
 
 [[package]]
 name = "muxy-hook"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "muxy-proto",
@@ -723,7 +723,7 @@ dependencies = [
 
 [[package]]
 name = "muxy-proto"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -737,14 +737,14 @@ dependencies = [
 
 [[package]]
 name = "muxy-vt"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "vte",
 ]
 
 [[package]]
 name = "muxy-workspace"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "tempfile",
