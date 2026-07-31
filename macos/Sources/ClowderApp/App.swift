@@ -18,6 +18,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var daemonSupervisor: DaemonSupervisor?
     /// The remote host the app is currently pointed at (nil = local daemon). Drives the tray label.
     private(set) var currentRemoteHost: String?
+    /// The remote host from config (resolved once at startup), so a local session can still offer
+    /// "Connect to <host>". nil = no `[remote] host` configured.
+    private var configuredRemoteHost: String?
 
     /// One-time libghostty + model initialization. Idempotent and main-thread-only; runs on
     /// whichever fires first — the SwiftUI scene body or `applicationDidFinishLaunching` — so
@@ -39,6 +42,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // connect to the forwarder's sockets); nil → local daemon. Default to the local socket paths;
         // makeBackendSupervisor returns the mode's actual control/render sockets when bundled.
         let remoteHost = resolveRemoteHost(clowderBinary: clowderBinary)
+        configuredRemoteHost = remoteHost
         var socketPath = socks.client
         var controlPath = socks.control
         if let backend = makeBackendSupervisor(remoteHost: remoteHost) {
@@ -84,8 +88,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.connect()
         statusBar = StatusBarController(appModel: model,
                                         showWindow: { [weak self] in self?.showWindow() },
-                                        remoteHost: { [weak self] in self?.currentRemoteHost })
+                                        remoteHost: { [weak self] in self?.currentRemoteHost },
+                                        configuredRemoteHost: { [weak self] in self?.configuredRemoteHost },
+                                        switchBackend: { [weak self] host in self?.switchBackend(to: host) })
         return (model, host)
+    }
+
+    /// Live backend swap (menu "Use local" / "Connect to remote"): stop the current backend, start the
+    /// other, and reconfigure the SAME AppModel + SurfaceHost in place (SwiftUI keeps their references).
+    func switchBackend(to remoteHost: String?) {
+        daemonSupervisor?.stop()
+        daemonSupervisor = nil
+        guard let backend = makeBackendSupervisor(remoteHost: remoteHost) else {
+            currentRemoteHost = nil   // unbundled dev: nothing to supervise
+            return
+        }
+        daemonSupervisor = backend.supervisor
+        currentRemoteHost = remoteHost
+        backend.supervisor.start()
+        appModel?.reconnect(makeTransport: { try UnixSocketConnection(path: backend.control) })
+        surfaceHost?.retarget(socketPath: backend.render)
     }
 
     /// Ask the clowder binary for the resolved `[remote] host` (it owns config.toml/env parsing, which
