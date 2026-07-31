@@ -7,12 +7,15 @@ import ClowderCore
 final class StatusBarController: NSObject {
     private let appModel: AppModel
     private let showWindow: () -> Void
+    /// The current remote host (nil = local daemon). Read on menu open so it reflects live swaps.
+    private let remoteHost: () -> String?
     private let statusItem: NSStatusItem
     private var cancellable: AnyCancellable?
 
-    init(appModel: AppModel, showWindow: @escaping () -> Void) {
+    init(appModel: AppModel, showWindow: @escaping () -> Void, remoteHost: @escaping () -> String?) {
         self.appModel = appModel
         self.showWindow = showWindow
+        self.remoteHost = remoteHost
         self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         super.init()
         let menu = NSMenu()
@@ -60,6 +63,14 @@ final class StatusBarController: NSObject {
 extension StatusBarController: NSMenuDelegate {
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
+
+        // Backend status header (disabled): "Remote: <host>" or "Local".
+        let backendLabel = remoteHost().map { "Remote: \($0)" } ?? "Local"
+        let backendItem = NSMenuItem(title: backendLabel, action: nil, keyEquivalent: "")
+        backendItem.isEnabled = false
+        menu.addItem(backendItem)
+        menu.addItem(.separator())
+
         let needy = appModel.store.agentsNeedingAttention
         if needy.isEmpty {
             let item = NSMenuItem(title: "No agents need attention", action: nil, keyEquivalent: "")

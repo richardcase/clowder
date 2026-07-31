@@ -80,7 +80,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         surfaceHost = host
         appModel = model
         model.connect()
-        statusBar = StatusBarController(appModel: model, showWindow: { [weak self] in self?.showWindow() })
+        statusBar = StatusBarController(appModel: model,
+                                        showWindow: { [weak self] in self?.showWindow() },
+                                        remoteHost: { [weak self] in self?.currentRemoteHost })
         return (model, host)
     }
 
