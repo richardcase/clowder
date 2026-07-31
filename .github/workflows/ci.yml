@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: build + test (macOS, unsigned)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode (Metal shader compiler needs full Xcode)
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          # Pin to Xcode 16.x (latest minor on the runner): the recipe was verified on Xcode 16, and
+          # this avoids drift to a toolchain where the Metal compiler is a separate download.
+          xcode-version: '16'
+
+      - name: Verify toolchain
+        run: |
+          xcode-select -p
+          xcrun metal --version
+          swift --version
+
+      - name: Install zig (Homebrew — reliable bottle CDN; the zig download mirrors are flaky in CI)
+        run: |
+          brew install zig
+          zig version
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Cache libghostty (built once per pin/patch)
+        id: libghostty-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            macos/vendor/libghostty/ghostty-internal.a
+            macos/Sources/GhosttyKit/include/ghostty.h
+          key: libghostty-${{ runner.os }}-${{ hashFiles('scripts/build-libghostty.sh', 'scripts/libghostty-darwin-install.patch') }}
+
+      - name: Build libghostty (cache miss only)
+        if: steps.libghostty-cache.outputs.cache-hit != 'true'
+        run: scripts/build-libghostty.sh
+
+      - name: Rust tests (whole workspace)
+        run: cargo test --workspace --locked
+
+      - name: Swift tests (MuxyCore)
+        run: swift test
+        working-directory: macos
+
+      - name: Assemble unsigned Muxy.app
+        run: scripts/build-app.sh
+
+      - name: Upload unsigned app artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Muxy-app-unsigned
+          # Upload the `dist` root so the artifact keeps the `Muxy.app/Contents/...` bundle structure
+          # (pointing at `dist/Muxy.app` would strip the top `.app` dir, yielding an unusable bundle).
+          path: dist
+          if-no-files-found: error
