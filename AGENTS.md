@@ -24,7 +24,7 @@ socket drives the app's sidebar, spawning, and splits.
 | `crates/clowder-workspace` | Per-agent worktree provisioning: `WorkspaceDriver` (`GitWorktreeDriver` / jj), `WorkspaceKind {Git, Jj}`, provision/land/discard | lib |
 | `macos/` | SwiftPM package: `ClowderCore` (lib, libghostty-free, unit-tested) + `clowder-app` (exe, links vendored libghostty via `GhosttyKit`) | — |
 | `scripts/` | `build-app.sh`, `build-libghostty.sh`, `set-version.sh`, `gen-icon.swift` | — |
-| `docs/` | `superpowers/` (design specs + plans), `versioning.md`, `building-libghostty.md` | — |
+| `docs/` | `superpowers/` (design specs + plans), `versioning.md`, `building-libghostty.md`, `code-signing.md` | — |
 
 ## Build & test
 

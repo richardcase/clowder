@@ -18,11 +18,14 @@ APP_EXE="$ROOT/macos/.build/release/clowder-app"
 
 echo "==> Assembling $APP (version $VERSION)"
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/bin"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
+# All executables live in Contents/MacOS/ (the standard nesting location): the app exe plus the three
+# Rust binaries. Keeping clowder-daemon + clowder-hook co-located lets the daemon resolve clowder-hook
+# as an exe-sibling (agent.rs), and the app resolves clowder next to its own executable.
 cp "$APP_EXE" "$APP/Contents/MacOS/clowder-app"
 for bin in clowder-daemon clowder clowder-hook; do
-  cp "$ROOT/target/release/$bin" "$APP/Contents/Resources/bin/$bin"
+  cp "$ROOT/target/release/$bin" "$APP/Contents/MacOS/$bin"
 done
 
 echo "==> Generating placeholder icon"
