@@ -234,6 +234,7 @@ impl Daemon {
             workspace_kind: ws_kind.as_str().to_string(),
             cols: self.default_cols,
             rows: self.default_rows,
+            tree: None,
         });
         self.finalize_agent(id, pane, ws, task, adapter);
 
