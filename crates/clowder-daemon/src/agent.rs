@@ -160,11 +160,17 @@ pub fn adapter_descriptors() -> &'static [AdapterDescriptor] {
 }
 
 /// Construct an adapter by id, or `None` for an unknown id.
+///
+/// Accepts both the CLI-facing spawn id ("shell", the descriptor a client picks from
+/// `adapter_descriptors()`) and "synthetic" (what `SyntheticAdapter::id()` self-reports and
+/// therefore what `spawn_agent` persists into the registry for a shell-spawned agent) — both
+/// resolve to the same default env-`$SHELL` adapter, so `reconcile` can round-trip a shell
+/// agent's `adapter_id` back into a spawnable adapter after a restart.
 pub fn build_adapter(id: &str) -> Option<Box<dyn AgentAdapter>> {
     match id {
         "claude" => Some(Box::new(ClaudeAdapter)),
         "codex" => Some(Box::new(CodexAdapter)),
-        "shell" => {
+        "shell" | "synthetic" => {
             let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
             Some(Box::new(SyntheticAdapter {
                 command: PaneCommand { program: shell, args: vec![], cwd: None, env: vec![] },

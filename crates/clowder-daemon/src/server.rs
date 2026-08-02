@@ -124,6 +124,64 @@ impl Daemon {
         PaneId(self.next_id.fetch_add(1, Ordering::Relaxed))
     }
 
+    /// Ensure future `alloc_id` calls never collide with an id already restored by `reconcile`.
+    fn bump_next_id_above(&self, n: u64) {
+        self.next_id.fetch_max(n + 1, Ordering::Relaxed);
+    }
+
+    /// Re-spawn every agent recorded in the registry (agents survive a daemon restart). Prunes
+    /// records whose worktree is gone or whose adapter/resume fails; never panics.
+    pub fn reconcile(self: &Arc<Self>) {
+        let records = self.registry.load();
+        let mut max_id = 0u64;
+        for rec in records {
+            max_id = max_id.max(rec.agent_id);
+            let id = PaneId(rec.agent_id);
+            if !rec.worktree_path.exists() {
+                tracing::warn!(
+                    "agent {} worktree {} is gone; pruning",
+                    rec.agent_id,
+                    rec.worktree_path.display()
+                );
+                self.registry.remove(rec.agent_id);
+                continue;
+            }
+            let Some(kind) = clowder_workspace::WorkspaceKind::from_str(&rec.workspace_kind) else {
+                tracing::warn!("agent {} has unknown workspace kind {:?}; pruning", rec.agent_id, rec.workspace_kind);
+                self.registry.remove(rec.agent_id);
+                continue;
+            };
+            let Some(adapter) = crate::agent::build_adapter(&rec.adapter_id) else {
+                tracing::warn!("agent {} has unknown adapter {:?}; pruning", rec.agent_id, rec.adapter_id);
+                self.registry.remove(rec.agent_id);
+                continue;
+            };
+            let ws = Workspace {
+                path: rec.worktree_path.clone(),
+                branch: rec.branch.clone(),
+                project: rec.project.clone(),
+                kind,
+            };
+            let spawn = (|| -> Result<Pane> {
+                adapter.provision_hooks(&ws.path, id, &self.hook_sock)?;
+                let mut cmd = adapter.resume_command(&ws.path);
+                cmd.cwd = Some(ws.path.clone());
+                cmd.env.push(("CLOWDER_AGENT_ID".into(), id.0.to_string()));
+                cmd.env.push(("CLOWDER_HOOK_SOCK".into(), self.hook_sock.to_string_lossy().to_string()));
+                Pane::spawn(id, cmd, rec.cols, rec.rows, self.backlog_cap)
+            })();
+            match spawn {
+                Ok(pane) => self.finalize_agent(id, pane, ws, &rec.task, adapter.as_ref()),
+                Err(e) => {
+                    tracing::warn!("resume agent {} failed: {e}; pruning", rec.agent_id);
+                    self.registry.remove(rec.agent_id);
+                }
+            }
+        }
+        // New spawns must not collide with restored ids.
+        self.bump_next_id_above(max_id);
+    }
+
     fn register_pane(&self, id: PaneId, pane: Pane) {
         self.panes.lock().insert(id, Arc::new(pane));
     }
@@ -984,6 +1042,80 @@ mod tests {
 
         daemon.discard_agent(id).unwrap();
         assert!(crate::registry::Registry::new(statedir.path().join("agents.json")).load().is_empty());
+
+        std::env::remove_var("CLOWDER_STATE_FILE");
+    }
+
+    #[tokio::test]
+    async fn reconcile_respawns_recorded_agents_and_prunes_missing() {
+        use crate::{FakeNotifier, SyntheticAdapter};
+        use std::process::Command as PCommand;
+
+        let repo = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            assert!(PCommand::new("git").arg("-C").arg(repo.path()).args(args).status().unwrap().success());
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@t.test"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(repo.path().join("README.md"), b"hi").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-qm", "init"]);
+
+        let statedir = tempfile::tempdir().unwrap();
+        std::env::set_var("CLOWDER_STATE_FILE", statedir.path().join("agents.json"));
+        let state_path = statedir.path().join("agents.json");
+
+        // First daemon: spawn an agent so a worktree + registry record exist.
+        let daemon = Arc::new(Daemon::new_with(
+            Arc::new(FakeNotifier::new()),
+            std::path::PathBuf::from("/tmp/unused-reconcile1.sock"),
+        ));
+        let adapter = SyntheticAdapter {
+            command: crate::PaneCommand {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), "sleep 30".into()],
+                cwd: None,
+                env: vec![],
+            },
+        };
+        let id = daemon.spawn_agent(repo.path(), &adapter, "demo").unwrap();
+        let worktree_path = daemon.workspace_of(id).unwrap().path;
+
+        // Simulate a fresh daemon (e.g. after a restart): a NEW Daemon on the same state file,
+        // with no in-memory agents, reconciling from the registry alone.
+        let d2 = Arc::new(Daemon::new_with(
+            Arc::new(FakeNotifier::new()),
+            std::path::PathBuf::from("/tmp/unused-reconcile2.sock"),
+        ));
+        d2.reconcile();
+        let list = d2.list_agents();
+        assert_eq!(list.len(), 1, "reconcile must re-register the recorded agent");
+        assert_eq!(list[0].pane, id, "re-registered under the original id");
+        assert_eq!(list[0].task, "demo");
+
+        // New spawns on d2 must not collide with the restored id.
+        let fresh = d2.spawn_agent(repo.path(), &adapter, "fresh").unwrap();
+        assert_ne!(fresh, id, "next_id must be bumped above restored ids");
+        d2.shutdown();
+
+        // Now corrupt: remove the worktree dir out from under the registry, then reconcile a
+        // third daemon → the stale record is pruned, both in memory and on disk.
+        std::fs::remove_dir_all(&worktree_path).unwrap();
+        let d3 = Arc::new(Daemon::new_with(
+            Arc::new(FakeNotifier::new()),
+            std::path::PathBuf::from("/tmp/unused-reconcile3.sock"),
+        ));
+        d3.reconcile();
+        assert!(
+            d3.list_agents().iter().all(|a| a.pane != id),
+            "agent whose worktree is gone must be pruned"
+        );
+        assert!(
+            crate::registry::Registry::new(state_path).load().iter().all(|r| r.agent_id != id.0),
+            "pruned record must not survive on disk"
+        );
+        d3.shutdown();
 
         std::env::remove_var("CLOWDER_STATE_FILE");
     }
