@@ -421,6 +421,18 @@ impl Daemon {
         }
     }
 
+    /// Persist the agent's current split tree to its registry record. A bare agent leaf is stored as
+    /// `None` (keeps records small); anything with companions is stored literally. Called on every
+    /// structural tree change (split/close/reap); ratio drags persist via the coalesced flush instead.
+    fn persist_tree(&self, agent: PaneId) {
+        let opt = match self.trees.lock().get(&agent) {
+            Some(PaneTree::Leaf { pane }) if *pane == agent => None,
+            Some(tree) => Some(tree.clone()),
+            None => None,
+        };
+        self.registry.set_tree(agent.0, opt);
+    }
+
     fn alloc_split_id(&self) -> SplitId {
         SplitId(self.next_split_id.fetch_add(1, Ordering::Relaxed))
     }
@@ -456,6 +468,7 @@ impl Daemon {
         }
         self.owner.lock().insert(companion, agent);
         self.broadcast_tree(agent);
+        self.persist_tree(agent);
 
         // Reap the companion if its process exits/crashes (mirrors the per-agent watcher). Registered
         // after owner+tree are set so `reap_companion` always finds the owner. `wait_exit()` returns
@@ -493,6 +506,7 @@ impl Daemon {
         self.owner.lock().remove(&pane);
         self.companion_watchers.lock().remove(&pane);
         self.broadcast_tree(agent);
+        self.persist_tree(agent);
     }
 
     /// Close a companion pane (collapsing the tree), or teardown the agent if `pane` is one.
@@ -522,6 +536,7 @@ impl Daemon {
         }
         self.owner.lock().remove(&pane);
         self.broadcast_tree(agent);
+        self.persist_tree(agent);
         Ok(Some(agent))
     }
 
@@ -1118,6 +1133,55 @@ mod tests {
         );
         d3.shutdown();
 
+        std::env::remove_var("CLOWDER_STATE_FILE");
+    }
+
+    #[tokio::test]
+    async fn split_and_close_persist_the_tree() {
+        use crate::{FakeNotifier, SyntheticAdapter};
+        use std::process::Command as PCommand;
+        use clowder_proto::SplitDirection;
+
+        let repo = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            assert!(PCommand::new("git").arg("-C").arg(repo.path()).args(args).status().unwrap().success());
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@t.test"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(repo.path().join("README.md"), b"hi").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-qm", "init"]);
+
+        let statedir = tempfile::tempdir().unwrap();
+        let state_path = statedir.path().join("agents.json");
+        std::env::set_var("CLOWDER_STATE_FILE", &state_path);
+
+        let daemon = Arc::new(Daemon::new_with(
+            Arc::new(FakeNotifier::new()),
+            std::path::PathBuf::from("/tmp/unused-persist.sock"),
+        ));
+        let adapter = SyntheticAdapter {
+            command: crate::PaneCommand {
+                program: "/bin/sh".into(), args: vec!["-c".into(), "sleep 30".into()],
+                cwd: None, env: vec![],
+            },
+        };
+        let id = daemon.spawn_agent(repo.path(), &adapter, "demo").unwrap();
+
+        // After a split, the record's tree is a 2-leaf split.
+        let companion = daemon.split_pane(id, SplitDirection::Right).unwrap();
+        let recs = crate::registry::Registry::new(state_path.clone()).load();
+        let tree = recs.iter().find(|r| r.agent_id == id.0).unwrap().tree.clone();
+        assert!(matches!(tree, Some(clowder_proto::PaneTree::Split { .. })), "split persisted: {tree:?}");
+        assert_eq!(crate::split_tree::leaves(tree.as_ref().unwrap()).len(), 2);
+
+        // After closing the companion, the tree collapses back and is persisted as None (bare leaf).
+        daemon.close_pane(companion).unwrap();
+        let recs = crate::registry::Registry::new(state_path.clone()).load();
+        assert_eq!(recs.iter().find(|r| r.agent_id == id.0).unwrap().tree, None);
+
+        daemon.shutdown();
         std::env::remove_var("CLOWDER_STATE_FILE");
     }
 
