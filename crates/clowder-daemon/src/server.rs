@@ -767,18 +767,6 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    /// `CLOWDER_STATE_FILE` is process-global; tests that point it at a scratch dir must not run
-    /// concurrently with each other (cargo test runs test fns in parallel by default) or one test's
-    /// `set_var`/`remove_var` races another's `Registry::default_path()` read inside `new_with`.
-    /// Every test that touches the env var takes this lock for its full env-var-dependent span.
-    static STATE_FILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Acquire `STATE_FILE_LOCK`, ignoring poison: an assertion failure in one test while holding
-    /// the lock must not cascade into spurious failures for every later test in this module.
-    fn lock_state_file_env() -> std::sync::MutexGuard<'static, ()> {
-        STATE_FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
     fn sh(script: &str) -> PaneCommand {
         PaneCommand {
             program: "/bin/sh".into(),
@@ -1084,7 +1072,7 @@ mod tests {
         run(&["commit", "-qm", "init"]);
 
         let statedir = tempfile::tempdir().unwrap();
-        let _state_lock = lock_state_file_env();
+        let _state_lock = crate::STATE_FILE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLOWDER_STATE_FILE", statedir.path().join("agents.json"));
 
         let daemon = Arc::new(Daemon::new_with(
@@ -1128,7 +1116,7 @@ mod tests {
         run(&["commit", "-qm", "init"]);
 
         let statedir = tempfile::tempdir().unwrap();
-        let _state_lock = lock_state_file_env();
+        let _state_lock = crate::STATE_FILE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLOWDER_STATE_FILE", statedir.path().join("agents.json"));
         let state_path = statedir.path().join("agents.json");
 
@@ -1205,7 +1193,7 @@ mod tests {
 
         let statedir = tempfile::tempdir().unwrap();
         let state_path = statedir.path().join("agents.json");
-        let _state_lock = lock_state_file_env();
+        let _state_lock = crate::STATE_FILE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLOWDER_STATE_FILE", &state_path);
 
         let daemon = Arc::new(Daemon::new_with(
@@ -1936,7 +1924,7 @@ mod tests {
 
         let statedir = tempfile::tempdir().unwrap();
         let state_path = statedir.path().join("agents.json");
-        let _state_lock = lock_state_file_env();
+        let _state_lock = crate::STATE_FILE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLOWDER_STATE_FILE", &state_path);
 
         let daemon = Arc::new(Daemon::new_with(

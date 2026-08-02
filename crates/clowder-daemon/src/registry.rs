@@ -161,6 +161,9 @@ mod tests {
 
     #[test]
     fn default_path_honors_env() {
+        // Shared with server::tests: CLOWDER_STATE_FILE is process-global, so any test in the
+        // crate that mutates it must hold this lock for the whole env-var-dependent span.
+        let _g = crate::STATE_FILE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLOWDER_STATE_FILE", "/tmp/x/agents.json");
         assert_eq!(Registry::default_path(), Path::new("/tmp/x/agents.json"));
         std::env::remove_var("CLOWDER_STATE_FILE");
