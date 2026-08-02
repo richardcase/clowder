@@ -19,7 +19,6 @@ use tokio::sync::broadcast;
 struct AgentMeta {
     project: String,
     task: String,
-    adapter_id: String,
 }
 
 /// The command for a companion pane: the login shell, rooted in the worktree, with no hook env.
@@ -175,7 +174,7 @@ impl Daemon {
             .unwrap_or_else(|| project.to_string_lossy().to_string());
         self.agents.lock().insert(
             id,
-            AgentMeta { project: project_name, task: task.to_string(), adapter_id: adapter.id().to_string() },
+            AgentMeta { project: project_name, task: task.to_string() },
         );
         self.registry.upsert(crate::registry::AgentRecord {
             agent_id: id.0,
