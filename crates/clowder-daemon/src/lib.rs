@@ -7,6 +7,7 @@ pub mod notify;
 pub mod attention;
 pub mod control_json;
 pub mod remote;
+pub mod registry;
 mod split_tree;
 pub use agent::{
     adapter_descriptors, build_adapter, AdapterDescriptor, AgentAdapter, ClaudeAdapter, CodexAdapter,
