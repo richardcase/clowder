@@ -495,8 +495,18 @@ impl Daemon {
         let (rebuilt, companions) =
             crate::split_tree::rebuild_for_restore(&tree, agent, &mut spawn_companion, &mut alloc_split);
 
+        // Install owner + tree + broadcast BEFORE spawning any reap watcher (mirrors `split_pane`):
+        // `wait_exit()` returns immediately if the child already exited, so no exit is missed even
+        // when the watcher registers late — but registering it early risks `reap_companion` firing
+        // against the still-bare pre-restore tree and dropping a companion the rebuilt tree still
+        // references, leaving a phantom leaf.
+        for c in &companions {
+            self.owner.lock().insert(*c, agent);
+        }
+        self.trees.lock().insert(agent, rebuilt);
+        self.broadcast_tree(agent);
+
         for c in companions {
-            self.owner.lock().insert(c, agent);
             if let Some(pane_arc) = self.get(c) {
                 let me = Arc::clone(self);
                 let handle = tokio::spawn(async move {
@@ -506,8 +516,6 @@ impl Daemon {
                 self.companion_watchers.lock().insert(c, handle);
             }
         }
-        self.trees.lock().insert(agent, rebuilt);
-        self.broadcast_tree(agent);
     }
 
     /// Split `target` (a leaf) by spawning a companion shell in its agent's worktree.
