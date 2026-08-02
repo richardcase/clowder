@@ -46,6 +46,12 @@ async fn main() -> Result<()> {
         "clowder-daemon listening"
     );
 
+    // Agents don't survive their daemon's PTYs dying with it; re-spawn every agent still
+    // recorded in the durable registry (pruning any whose worktree/adapter is gone) before
+    // serving clients, so a restarted daemon comes back up with its fleet intact.
+    tracing::info!("reconciling agent registry");
+    daemon.reconcile();
+
     if let Some(addr_str) = remote_listen {
         let addr: std::net::SocketAddr = addr_str
             .parse()

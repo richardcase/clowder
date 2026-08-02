@@ -280,6 +280,7 @@ dependencies = [
  "parking_lot",
  "portable-pty",
  "rustix 0.38.44",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

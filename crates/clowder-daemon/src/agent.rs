@@ -9,6 +9,11 @@ pub trait AgentAdapter: Send + Sync {
     fn provision_hooks(&self, worktree: &Path, agent_id: PaneId, hook_sock: &Path) -> Result<()>;
     /// The command to launch the agent (cwd/env are filled in by the daemon).
     fn launch_command(&self, worktree: &Path) -> PaneCommand;
+    /// The command to RESUME an existing agent in its worktree on a daemon-restart reconcile.
+    /// Defaults to a fresh launch; adapters override to continue a prior session.
+    fn resume_command(&self, worktree: &Path) -> PaneCommand {
+        self.launch_command(worktree)
+    }
     /// Whether this adapter injects tool-native attention hooks. If false, the daemon runs the
     /// VT-signal fallback scanner for the agent instead.
     fn provides_hooks(&self) -> bool;
@@ -72,6 +77,11 @@ impl AgentAdapter for ClaudeAdapter {
 
     fn launch_command(&self, _worktree: &Path) -> PaneCommand {
         PaneCommand { program: "claude".into(), args: vec![], cwd: None, env: vec![] }
+    }
+
+    fn resume_command(&self, _worktree: &Path) -> PaneCommand {
+        // `claude --continue` resumes the most recent conversation in this worktree.
+        PaneCommand { program: "claude".into(), args: vec!["--continue".into()], cwd: None, env: vec![] }
     }
 
     fn provides_hooks(&self) -> bool {
@@ -150,11 +160,17 @@ pub fn adapter_descriptors() -> &'static [AdapterDescriptor] {
 }
 
 /// Construct an adapter by id, or `None` for an unknown id.
+///
+/// Accepts both the CLI-facing spawn id ("shell", the descriptor a client picks from
+/// `adapter_descriptors()`) and "synthetic" (what `SyntheticAdapter::id()` self-reports and
+/// therefore what `spawn_agent` persists into the registry for a shell-spawned agent) — both
+/// resolve to the same default env-`$SHELL` adapter, so `reconcile` can round-trip a shell
+/// agent's `adapter_id` back into a spawnable adapter after a restart.
 pub fn build_adapter(id: &str) -> Option<Box<dyn AgentAdapter>> {
     match id {
         "claude" => Some(Box::new(ClaudeAdapter)),
         "codex" => Some(Box::new(CodexAdapter)),
-        "shell" => {
+        "shell" | "synthetic" => {
             let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
             Some(Box::new(SyntheticAdapter {
                 command: PaneCommand { program: shell, args: vec![], cwd: None, env: vec![] },
@@ -239,5 +255,14 @@ mod tests {
     fn registry_descriptors_list_claude_codex_shell() {
         let ids: Vec<&str> = adapter_descriptors().iter().map(|d| d.id).collect();
         assert!(ids.contains(&"claude") && ids.contains(&"codex") && ids.contains(&"shell"));
+    }
+
+    #[test]
+    fn claude_resume_uses_continue_and_default_is_fresh() {
+        let c = ClaudeAdapter;
+        assert!(c.resume_command(std::path::Path::new("/w")).args.iter().any(|a| a == "--continue"));
+        // an adapter without an override resumes exactly as it launches
+        let s = CodexAdapter;
+        assert_eq!(s.resume_command(std::path::Path::new("/w")).args, s.launch_command(std::path::Path::new("/w")).args);
     }
 }

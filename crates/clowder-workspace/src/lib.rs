@@ -6,6 +6,15 @@ use std::sync::Arc;
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum WorkspaceKind { Git, Jj }
 
+impl WorkspaceKind {
+    pub fn as_str(&self) -> &'static str {
+        match self { WorkspaceKind::Git => "git", WorkspaceKind::Jj => "jj" }
+    }
+    pub fn from_str(s: &str) -> Option<WorkspaceKind> {
+        match s { "git" => Some(WorkspaceKind::Git), "jj" => Some(WorkspaceKind::Jj), _ => None }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Workspace {
     pub path: PathBuf,
@@ -352,5 +361,13 @@ mod tests {
     fn driver_for_kind_maps_both() {
         assert_eq!(driver_for_kind(WorkspaceKind::Git).kind(), WorkspaceKind::Git);
         assert_eq!(driver_for_kind(WorkspaceKind::Jj).kind(), WorkspaceKind::Jj);
+    }
+
+    #[test]
+    fn workspace_kind_string_roundtrip() {
+        for k in [WorkspaceKind::Git, WorkspaceKind::Jj] {
+            assert_eq!(WorkspaceKind::from_str(k.as_str()), Some(k));
+        }
+        assert_eq!(WorkspaceKind::from_str("nope"), None);
     }
 }
