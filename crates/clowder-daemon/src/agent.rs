@@ -9,6 +9,11 @@ pub trait AgentAdapter: Send + Sync {
     fn provision_hooks(&self, worktree: &Path, agent_id: PaneId, hook_sock: &Path) -> Result<()>;
     /// The command to launch the agent (cwd/env are filled in by the daemon).
     fn launch_command(&self, worktree: &Path) -> PaneCommand;
+    /// The command to RESUME an existing agent in its worktree on a daemon-restart reconcile.
+    /// Defaults to a fresh launch; adapters override to continue a prior session.
+    fn resume_command(&self, worktree: &Path) -> PaneCommand {
+        self.launch_command(worktree)
+    }
     /// Whether this adapter injects tool-native attention hooks. If false, the daemon runs the
     /// VT-signal fallback scanner for the agent instead.
     fn provides_hooks(&self) -> bool;
@@ -72,6 +77,11 @@ impl AgentAdapter for ClaudeAdapter {
 
     fn launch_command(&self, _worktree: &Path) -> PaneCommand {
         PaneCommand { program: "claude".into(), args: vec![], cwd: None, env: vec![] }
+    }
+
+    fn resume_command(&self, _worktree: &Path) -> PaneCommand {
+        // `claude --continue` resumes the most recent conversation in this worktree.
+        PaneCommand { program: "claude".into(), args: vec!["--continue".into()], cwd: None, env: vec![] }
     }
 
     fn provides_hooks(&self) -> bool {
@@ -239,5 +249,14 @@ mod tests {
     fn registry_descriptors_list_claude_codex_shell() {
         let ids: Vec<&str> = adapter_descriptors().iter().map(|d| d.id).collect();
         assert!(ids.contains(&"claude") && ids.contains(&"codex") && ids.contains(&"shell"));
+    }
+
+    #[test]
+    fn claude_resume_uses_continue_and_default_is_fresh() {
+        let c = ClaudeAdapter;
+        assert!(c.resume_command(std::path::Path::new("/w")).args.iter().any(|a| a == "--continue"));
+        // an adapter without an override resumes exactly as it launches
+        let s = CodexAdapter;
+        assert_eq!(s.resume_command(std::path::Path::new("/w")).args, s.launch_command(std::path::Path::new("/w")).args);
     }
 }
