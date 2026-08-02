@@ -19,6 +19,7 @@ use tokio::sync::broadcast;
 struct AgentMeta {
     project: String,
     task: String,
+    adapter_id: String,
 }
 
 /// The command for a companion pane: the login shell, rooted in the worktree, with no hook env.
@@ -48,6 +49,7 @@ pub struct Daemon {
     pub(crate) default_cols: u16,
     pub(crate) default_rows: u16,
     pub(crate) shell: String,
+    registry: Arc<crate::registry::Registry>,
 }
 
 impl Daemon {
@@ -81,6 +83,7 @@ impl Daemon {
             default_cols: 80,
             default_rows: 24,
             shell: std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()),
+            registry: Arc::new(crate::registry::Registry::new(crate::registry::Registry::default_path())),
         }
     }
 
@@ -161,6 +164,10 @@ impl Daemon {
             }
         };
         self.register_pane(id, pane);
+        let ws_project = ws.project.clone();
+        let ws_path = ws.path.clone();
+        let ws_branch = ws.branch.clone();
+        let ws_kind = ws.kind;
         self.workspaces.lock().insert(id, ws);
         let project_name = project
             .file_name()
@@ -168,8 +175,19 @@ impl Daemon {
             .unwrap_or_else(|| project.to_string_lossy().to_string());
         self.agents.lock().insert(
             id,
-            AgentMeta { project: project_name, task: task.to_string() },
+            AgentMeta { project: project_name, task: task.to_string(), adapter_id: adapter.id().to_string() },
         );
+        self.registry.upsert(crate::registry::AgentRecord {
+            agent_id: id.0,
+            project: ws_project,
+            task: task.to_string(),
+            adapter_id: adapter.id().to_string(),
+            worktree_path: ws_path,
+            branch: ws_branch,
+            workspace_kind: ws_kind.as_str().to_string(),
+            cols: self.default_cols,
+            rows: self.default_rows,
+        });
         self.set_attention(id, AttentionState::Working);
 
         if !adapter.provides_hooks() {
@@ -267,6 +285,7 @@ impl Daemon {
         self.panes.lock().remove(&pane);
         self.attention.lock().remove(&pane);
         self.agents.lock().remove(&pane);
+        self.registry.remove(pane.0);
         let _ = self.removed_tx.send(pane);
         Ok(())
     }
@@ -909,6 +928,49 @@ mod tests {
 
         daemon.teardown_agent(pane).unwrap();
         assert!(daemon.list_agents().is_empty());
+    }
+
+    #[tokio::test]
+    async fn spawn_writes_registry_and_finish_removes_it() {
+        use crate::{FakeNotifier, SyntheticAdapter};
+        use std::process::Command as PCommand;
+
+        let repo = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            assert!(PCommand::new("git").arg("-C").arg(repo.path()).args(args).status().unwrap().success());
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@t.test"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(repo.path().join("README.md"), b"hi").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-qm", "init"]);
+
+        let statedir = tempfile::tempdir().unwrap();
+        std::env::set_var("CLOWDER_STATE_FILE", statedir.path().join("agents.json"));
+
+        let daemon = Arc::new(Daemon::new_with(
+            Arc::new(FakeNotifier::new()),
+            std::path::PathBuf::from("/tmp/unused-m9.sock"),
+        ));
+        let adapter = SyntheticAdapter {
+            command: crate::PaneCommand {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), "sleep 30".into()],
+                cwd: None,
+                env: vec![],
+            },
+        };
+        let id = daemon.spawn_agent(repo.path(), &adapter, "demo").unwrap();
+
+        let recs = crate::registry::Registry::new(statedir.path().join("agents.json")).load();
+        assert_eq!(recs.iter().filter(|r| r.agent_id == id.0).count(), 1);
+        assert_eq!(recs[0].adapter_id, "synthetic");
+
+        daemon.discard_agent(id).unwrap();
+        assert!(crate::registry::Registry::new(statedir.path().join("agents.json")).load().is_empty());
+
+        std::env::remove_var("CLOWDER_STATE_FILE");
     }
 
     #[tokio::test]
