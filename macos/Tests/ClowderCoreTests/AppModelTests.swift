@@ -93,6 +93,22 @@ final class AppModelTests: XCTestCase {
         model.shutdown()
     }
 
+    func testResetDropsAllPerBackendState() {
+        let store = AgentStore()
+        store.apply(.adapterList([AdapterInfo(id: "codex", displayName: "Codex")]))
+        store.apply(.agentSpawned(pane: 5))   // sets needsRefresh = true
+        XCTAssertTrue(store.needsRefresh)
+        XCTAssertEqual(store.adapters, [AdapterInfo(id: "codex", displayName: "Codex")])
+
+        store.reset()
+
+        XCTAssertTrue(store.agents.isEmpty)
+        XCTAssertTrue(store.trees.isEmpty)
+        XCTAssertNil(store.lastError)
+        XCTAssertFalse(store.needsRefresh)                          // no stale refresh into the new session
+        XCTAssertEqual(store.adapters, AgentStore.defaultAdapters)  // no stale adapter list
+    }
+
     func testReconnectIgnoresLateAsyncCloseFromReplacedTransport() {
         let first = FakeControlTransport()
         first.deferClose = true                       // model the real transport's async onClose

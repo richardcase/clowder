@@ -9,7 +9,10 @@ public final class AgentStore: ObservableObject {
     @Published public private(set) var needsRefresh: Bool = false
     @Published public private(set) var lastError: String?
     @Published public private(set) var trees: [UInt64: PaneTree] = [:]
-    @Published public private(set) var adapters: [AdapterInfo] = [AdapterInfo(id: "claude", displayName: "Claude Code")]
+    @Published public private(set) var adapters: [AdapterInfo] = AgentStore.defaultAdapters
+
+    /// The adapter list shown before a connection reports its own via `adapterList`.
+    static let defaultAdapters = [AdapterInfo(id: "claude", displayName: "Claude Code")]
 
     public init() {}
 
@@ -45,11 +48,13 @@ public final class AgentStore: ObservableObject {
     public func clearLastError() { lastError = nil }
 
     /// Drop all per-backend state (used when the app swaps between the local daemon and the remote
-    /// forwarder). Adapters re-hydrate from the new connection's adapterList.
+    /// forwarder). Adapters fall back to the default until the new connection reports its own list.
     public func reset() {
         agents = [:]
         trees = [:]
         lastError = nil
+        needsRefresh = false
+        adapters = AgentStore.defaultAdapters
     }
 
     /// Agents grouped by project (projects sorted; agents within a project sorted by pane).
