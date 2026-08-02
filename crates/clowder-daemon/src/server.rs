@@ -139,9 +139,11 @@ impl Daemon {
     /// records whose worktree is gone or whose adapter/resume fails; never panics.
     pub fn reconcile(self: &Arc<Self>) {
         let records = self.registry.load();
-        let mut max_id = 0u64;
+        // Bump BEFORE restoring: companion `alloc_id()`s during layout restore must not collide with
+        // a not-yet-restored agent's fixed id. (Agents re-spawn under `PaneId(rec.agent_id)`.)
+        let max_id = records.iter().map(|r| r.agent_id).max().unwrap_or(0);
+        self.bump_next_id_above(max_id);
         for rec in records {
-            max_id = max_id.max(rec.agent_id);
             let id = PaneId(rec.agent_id);
             if !rec.worktree_path.exists() {
                 tracing::warn!(
@@ -177,15 +179,19 @@ impl Daemon {
                 Pane::spawn(id, cmd, rec.cols, rec.rows, self.backlog_cap)
             })();
             match spawn {
-                Ok(pane) => self.finalize_agent(id, pane, ws, &rec.task, adapter.as_ref()),
+                Ok(pane) => {
+                    let restore_cwd = ws.path.clone();
+                    self.finalize_agent(id, pane, ws, &rec.task, adapter.as_ref());
+                    if let Some(tree) = rec.tree.clone() {
+                        self.restore_layout(id, tree, restore_cwd);
+                    }
+                }
                 Err(e) => {
                     tracing::warn!("resume agent {} failed: {e}; pruning", rec.agent_id);
                     self.registry.remove(rec.agent_id);
                 }
             }
         }
-        // New spawns must not collide with restored ids.
-        self.bump_next_id_above(max_id);
     }
 
     fn register_pane(&self, id: PaneId, pane: Pane) {
@@ -470,6 +476,38 @@ impl Daemon {
 
     fn alloc_split_id(&self) -> SplitId {
         SplitId(self.next_split_id.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Rebuild an agent's companion layout on reconcile: spawn a fresh shell per companion leaf,
+    /// wire owner + reap watchers, install the rebuilt tree, and broadcast. Best-effort — a companion
+    /// that fails to spawn collapses only its leaf; a bare agent leaf is a no-op (finalize already set
+    /// the single-leaf tree).
+    fn restore_layout(self: &Arc<Self>, agent: PaneId, tree: PaneTree, cwd: std::path::PathBuf) {
+        if matches!(&tree, PaneTree::Leaf { pane } if *pane == agent) {
+            return;
+        }
+        let shell = self.shell.clone();
+        let (cols, rows) = (self.default_cols, self.default_rows);
+        let mut spawn_companion = || -> Option<PaneId> {
+            self.spawn_pane(companion_command(shell.clone(), cwd.clone()), cols, rows).ok()
+        };
+        let mut alloc_split = || self.alloc_split_id();
+        let (rebuilt, companions) =
+            crate::split_tree::rebuild_for_restore(&tree, agent, &mut spawn_companion, &mut alloc_split);
+
+        for c in companions {
+            self.owner.lock().insert(c, agent);
+            if let Some(pane_arc) = self.get(c) {
+                let me = Arc::clone(self);
+                let handle = tokio::spawn(async move {
+                    pane_arc.wait_exit().await;
+                    me.reap_companion(c);
+                });
+                self.companion_watchers.lock().insert(c, handle);
+            }
+        }
+        self.trees.lock().insert(agent, rebuilt);
+        self.broadcast_tree(agent);
     }
 
     /// Split `target` (a leaf) by spawning a companion shell in its agent's worktree.
@@ -1171,6 +1209,66 @@ mod tests {
         );
         d3.shutdown();
 
+        std::env::remove_var("CLOWDER_STATE_FILE");
+    }
+
+    #[tokio::test]
+    async fn reconcile_restores_split_layout() {
+        use crate::{FakeNotifier, SyntheticAdapter};
+        use std::process::Command as PCommand;
+        use clowder_proto::{PaneTree, SplitDirection};
+
+        let repo = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            assert!(PCommand::new("git").arg("-C").arg(repo.path()).args(args).status().unwrap().success());
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@t.test"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(repo.path().join("README.md"), b"hi").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-qm", "init"]);
+
+        let statedir = tempfile::tempdir().unwrap();
+        let _state_lock = crate::STATE_FILE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("CLOWDER_STATE_FILE", statedir.path().join("agents.json"));
+
+        let d1 = Arc::new(Daemon::new_with(
+            Arc::new(FakeNotifier::new()),
+            std::path::PathBuf::from("/tmp/unused-restore1.sock"),
+        ));
+        let adapter = SyntheticAdapter {
+            command: crate::PaneCommand {
+                program: "/bin/sh".into(), args: vec!["-c".into(), "sleep 30".into()],
+                cwd: None, env: vec![],
+            },
+        };
+        let id = d1.spawn_agent(repo.path(), &adapter, "demo").unwrap();
+        d1.split_pane(id, SplitDirection::Right).unwrap();
+        // set + flush a non-default ratio so we can assert it round-trips.
+        let sid = match d1.split_tree_of(id).unwrap() { PaneTree::Split { id, .. } => id, _ => panic!() };
+        d1.set_split_ratio(sid, 0.3).unwrap();
+        d1.flush_dirty_layouts();
+
+        // Fresh daemon over the same state file → reconcile rebuilds the layout.
+        let d2 = Arc::new(Daemon::new_with(
+            Arc::new(FakeNotifier::new()),
+            std::path::PathBuf::from("/tmp/unused-restore2.sock"),
+        ));
+        d2.reconcile();
+
+        let tree = d2.split_tree_of(id).expect("agent tree restored");
+        let ls = crate::split_tree::leaves(&tree);
+        assert_eq!(ls.len(), 2, "two leaves restored");
+        assert!(ls.contains(&id), "agent leaf id preserved");
+        match tree {
+            PaneTree::Split { ratio, first, .. } => {
+                assert!((ratio - 0.3).abs() < 1e-6, "ratio restored: {ratio}");
+                assert_eq!(*first, PaneTree::Leaf { pane: id }, "agent is the first leaf");
+            }
+            _ => panic!("expected split"),
+        }
+        d2.shutdown();
         std::env::remove_var("CLOWDER_STATE_FILE");
     }
 
