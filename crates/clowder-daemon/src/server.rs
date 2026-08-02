@@ -2056,4 +2056,105 @@ mod tests {
         daemon.shutdown();
         std::env::remove_var("CLOWDER_STATE_FILE");
     }
+
+    #[tokio::test]
+    async fn reconcile_restored_companion_ids_never_collide_with_agents() {
+        use crate::{FakeNotifier, SyntheticAdapter};
+        use std::process::Command as PCommand;
+        use clowder_proto::SplitDirection;
+
+        let repo = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            assert!(PCommand::new("git").arg("-C").arg(repo.path()).args(args).status().unwrap().success());
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@t.test"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(repo.path().join("README.md"), b"hi").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-qm", "init"]);
+
+        let statedir = tempfile::tempdir().unwrap();
+        let _state_lock = crate::STATE_FILE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("CLOWDER_STATE_FILE", statedir.path().join("agents.json"));
+
+        let d1 = Arc::new(Daemon::new_with(
+            Arc::new(FakeNotifier::new()),
+            std::path::PathBuf::from("/tmp/unused-collide1.sock"),
+        ));
+        let adapter = SyntheticAdapter {
+            command: crate::PaneCommand {
+                program: "/bin/sh".into(), args: vec!["-c".into(), "sleep 30".into()],
+                cwd: None, env: vec![],
+            },
+        };
+        // Agent A (low id) with a companion, then agent B (higher id).
+        let a = d1.spawn_agent(repo.path(), &adapter, "aaa").unwrap();
+        d1.split_pane(a, SplitDirection::Right).unwrap();
+        let b = d1.spawn_agent(repo.path(), &adapter, "bbb").unwrap();
+
+        // Fresh daemon reconciles A (with layout) then B. Without the early next_id bump, A's
+        // restored companion could grab B's id.
+        let d2 = Arc::new(Daemon::new_with(
+            Arc::new(FakeNotifier::new()),
+            std::path::PathBuf::from("/tmp/unused-collide2.sock"),
+        ));
+        d2.reconcile();
+
+        // Both agents came back under their original ids.
+        let ids: std::collections::HashSet<_> = d2.list_agents().iter().map(|x| x.pane).collect();
+        assert!(ids.contains(&a) && ids.contains(&b), "both agents restored: {ids:?}");
+
+        // A's companion leaf id differs from BOTH agent ids.
+        let tree = d2.split_tree_of(a).unwrap();
+        let comp = crate::split_tree::leaves(&tree).into_iter().find(|p| *p != a).unwrap();
+        assert_ne!(comp, a, "companion != agent A");
+        assert_ne!(comp, b, "companion must not collide with agent B");
+
+        d2.shutdown();
+        std::env::remove_var("CLOWDER_STATE_FILE");
+    }
+
+    #[tokio::test]
+    async fn reconcile_m9a_record_without_tree_restores_single_leaf() {
+        use crate::{FakeNotifier, SyntheticAdapter};
+        use std::process::Command as PCommand;
+
+        let repo = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            assert!(PCommand::new("git").arg("-C").arg(repo.path()).args(args).status().unwrap().success());
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@t.test"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(repo.path().join("README.md"), b"hi").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-qm", "init"]);
+
+        let statedir = tempfile::tempdir().unwrap();
+        let _state_lock = crate::STATE_FILE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("CLOWDER_STATE_FILE", statedir.path().join("agents.json"));
+
+        let d1 = Arc::new(Daemon::new_with(
+            Arc::new(FakeNotifier::new()),
+            std::path::PathBuf::from("/tmp/unused-nolt1.sock"),
+        ));
+        let adapter = SyntheticAdapter {
+            command: crate::PaneCommand {
+                program: "/bin/sh".into(), args: vec!["-c".into(), "sleep 30".into()],
+                cwd: None, env: vec![],
+            },
+        };
+        // A plain agent, never split → its record's tree is None (the M9a shape).
+        let id = d1.spawn_agent(repo.path(), &adapter, "demo").unwrap();
+
+        let d2 = Arc::new(Daemon::new_with(
+            Arc::new(FakeNotifier::new()),
+            std::path::PathBuf::from("/tmp/unused-nolt2.sock"),
+        ));
+        d2.reconcile();
+        assert_eq!(d2.split_tree_of(id), Some(clowder_proto::PaneTree::Leaf { pane: id }));
+        d2.shutdown();
+        std::env::remove_var("CLOWDER_STATE_FILE");
+    }
 }
