@@ -9,13 +9,23 @@ final class StatusBarController: NSObject {
     private let showWindow: () -> Void
     /// The current remote host (nil = local daemon). Read on menu open so it reflects live swaps.
     private let remoteHost: () -> String?
+    /// The remote host from config (target for "Connect to remote" while in local mode).
+    private let configuredRemoteHost: () -> String?
+    /// Switch the backend live (nil = local daemon, non-nil = that remote host).
+    private let switchBackend: (String?) -> Void
     private let statusItem: NSStatusItem
     private var cancellable: AnyCancellable?
 
-    init(appModel: AppModel, showWindow: @escaping () -> Void, remoteHost: @escaping () -> String?) {
+    init(appModel: AppModel,
+         showWindow: @escaping () -> Void,
+         remoteHost: @escaping () -> String?,
+         configuredRemoteHost: @escaping () -> String?,
+         switchBackend: @escaping (String?) -> Void) {
         self.appModel = appModel
         self.showWindow = showWindow
         self.remoteHost = remoteHost
+        self.configuredRemoteHost = configuredRemoteHost
+        self.switchBackend = switchBackend
         self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         super.init()
         let menu = NSMenu()
@@ -58,6 +68,8 @@ final class StatusBarController: NSObject {
     }
     @objc private func showWindowAction() { showWindow() }
     @objc private func quitAction() { NSApp.terminate(nil) }
+    @objc private func useLocalAction() { switchBackend(nil) }
+    @objc private func useRemoteAction(_ sender: NSMenuItem) { switchBackend(sender.representedObject as? String) }
 }
 
 extension StatusBarController: NSMenuDelegate {
@@ -69,6 +81,15 @@ extension StatusBarController: NSMenuDelegate {
         let backendItem = NSMenuItem(title: backendLabel, action: nil, keyEquivalent: "")
         backendItem.isEnabled = false
         menu.addItem(backendItem)
+
+        // Live backend swap: offer the other mode. When remote → "Use local"; when local with a
+        // configured remote host → "Connect to <host>". When local + none configured, no swap item.
+        if remoteHost() != nil {
+            addItem(to: menu, "Use local", #selector(useLocalAction))
+        } else if let configured = configuredRemoteHost() {
+            let item = addItem(to: menu, "Connect to \(configured)", #selector(useRemoteAction(_:)))
+            item.representedObject = configured
+        }
         menu.addItem(.separator())
 
         let needy = appModel.store.agentsNeedingAttention

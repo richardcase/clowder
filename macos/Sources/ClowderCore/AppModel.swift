@@ -40,7 +40,7 @@ public final class AppModel: ObservableObject {
     @Published public var showingSpawn: Bool = false
     @Published public var pendingLifecycle: PendingLifecycle?
 
-    private let makeTransport: () throws -> ControlTransport
+    private var makeTransport: () throws -> ControlTransport
     private var connection: ControlTransport?
     private var session: ControlSession?
     private var storeSubscription: AnyCancellable?
@@ -77,10 +77,35 @@ public final class AppModel: ObservableObject {
         }
     }
 
+    /// Point the control channel at a different backend (a live local↔remote swap): tear down the
+    /// current connection + reconnect loop, drop the previous backend's agents, then connect to the
+    /// new transport. Keeps the same `AppModel` instance so SwiftUI views stay bound.
+    public func reconnect(makeTransport newMakeTransport: @escaping () throws -> ControlTransport) {
+        shutdown()                       // cancel reconnect, disconnect, clear session/connection
+        store.reset()                    // drop the previous backend's agents/trees
+        selectedPane = nil
+        self.makeTransport = newMakeTransport
+        isShuttingDown = false
+        connectionState = .connecting
+        do {
+            try attemptConnect()
+        } catch {
+            // The freshly-started backend may still be binding its socket — retry with backoff
+            // (the same bounded loop as a live drop) rather than giving up in `.closed`.
+            scheduleReconnect()
+        }
+    }
+
     /// One connection attempt: build the transport, wire close→reconnect, hydrate. Throws on failure.
     private func attemptConnect() throws {
         let transport = try makeTransport()
-        transport.setOnClose { [weak self] in self?.handleClose() }
+        // Guard on connection identity: the real transport fires onClose ASYNCHRONOUSLY, so a
+        // transport we've already replaced (e.g. during a live backend swap) can deliver a late close
+        // — ignore it, or it would flip the healthy new connection back into reconnecting.
+        transport.setOnClose { [weak self, weak transport] in
+            guard let self, self.connection === transport else { return }
+            self.handleClose()
+        }
         let session = ControlSession(transport: transport, store: store)
         self.connection = transport
         self.session = session

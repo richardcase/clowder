@@ -16,7 +16,13 @@ final class FakeControlTransport: ControlTransport {
         sentLines.append(line)
     }
     func setOnClose(_ handler: @escaping () -> Void) { self.onClose = handler }
-    func disconnect() { disconnected = true; onClose?() }
+    /// The real UnixSocketConnection fires onClose ASYNCHRONOUSLY; set this to model that timing.
+    var deferClose = false
+    func disconnect() {
+        disconnected = true
+        let cb = onClose
+        if deferClose { DispatchQueue.main.async { cb?() } } else { cb?() }
+    }
     /// Test helper: simulate the daemon pushing a JSON line.
     func deliver(_ line: String) { receiver?(line) }
 }
@@ -68,6 +74,58 @@ final class AppModelTests: XCTestCase {
         model.connect()
         model.shutdown()
         XCTAssertTrue(fake.disconnected)
+    }
+
+    func testReconnectSwapsTransportClearsStoreAndReconnects() {
+        let first = FakeControlTransport()
+        let model = AppModel(makeTransport: { first })
+        model.connect()
+        first.deliver(#"{"type":"agentList","agents":[{"pane":1,"project":"/p","task":"t","state":"Working"}]}"#)
+        XCTAssertFalse(model.store.agents.isEmpty)
+
+        let second = FakeControlTransport()
+        model.reconnect(makeTransport: { second })
+
+        XCTAssertTrue(first.disconnected)                                  // old backend torn down
+        XCTAssertTrue(model.store.agents.isEmpty)                          // old agents dropped
+        XCTAssertEqual(model.connectionState, .live)                      // connected to the new transport
+        XCTAssertTrue(second.sentLines.contains { $0.contains("\"type\":\"listAgents\"") })  // hydrated the new one
+        model.shutdown()
+    }
+
+    func testResetDropsAllPerBackendState() {
+        let store = AgentStore()
+        store.apply(.adapterList([AdapterInfo(id: "codex", displayName: "Codex")]))
+        store.apply(.agentSpawned(pane: 5))   // sets needsRefresh = true
+        XCTAssertTrue(store.needsRefresh)
+        XCTAssertEqual(store.adapters, [AdapterInfo(id: "codex", displayName: "Codex")])
+
+        store.reset()
+
+        XCTAssertTrue(store.agents.isEmpty)
+        XCTAssertTrue(store.trees.isEmpty)
+        XCTAssertNil(store.lastError)
+        XCTAssertFalse(store.needsRefresh)                          // no stale refresh into the new session
+        XCTAssertEqual(store.adapters, AgentStore.defaultAdapters)  // no stale adapter list
+    }
+
+    func testReconnectIgnoresLateAsyncCloseFromReplacedTransport() {
+        let first = FakeControlTransport()
+        first.deferClose = true                       // model the real transport's async onClose
+        let model = AppModel(makeTransport: { first })
+        model.connect()
+
+        let second = FakeControlTransport()
+        model.reconnect(makeTransport: { second })    // shutdown() disconnects `first` (defers its close)
+        XCTAssertEqual(model.connectionState, .live)
+
+        // Pump the main queue so `first`'s deferred onClose fires: the identity guard must ignore it,
+        // leaving the healthy new connection live (not flipped to .reconnecting).
+        let exp = expectation(description: "main queue pump")
+        DispatchQueue.main.async { exp.fulfill() }
+        wait(for: [exp], timeout: 1.0)
+        XCTAssertEqual(model.connectionState, .live)
+        model.shutdown()
     }
 
     func testAppliedEventsFlowToStore() {
