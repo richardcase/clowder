@@ -21,6 +21,9 @@ struct AgentMeta {
     task: String,
 }
 
+/// How often the coalesced layout flusher persists agents whose divider ratios changed.
+const LAYOUT_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(750);
+
 /// The command for a companion pane: the login shell, rooted in the worktree, with no hook env.
 pub(crate) fn companion_command(shell: String, cwd: std::path::PathBuf) -> PaneCommand {
     PaneCommand { program: shell, args: vec![], cwd: Some(cwd), env: vec![] }
@@ -49,6 +52,8 @@ pub struct Daemon {
     pub(crate) default_rows: u16,
     pub(crate) shell: String,
     registry: Arc<crate::registry::Registry>,
+    /// Agents whose ratios changed since the last flush; drained by the periodic layout flusher.
+    layout_dirty: Arc<Mutex<std::collections::HashSet<PaneId>>>,
 }
 
 impl Daemon {
@@ -83,6 +88,7 @@ impl Daemon {
             default_rows: 24,
             shell: std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()),
             registry: Arc::new(crate::registry::Registry::new(crate::registry::Registry::default_path())),
+            layout_dirty: Arc::new(Mutex::new(std::collections::HashSet::new())),
         }
     }
 
@@ -433,6 +439,35 @@ impl Daemon {
         self.registry.set_tree(agent.0, opt);
     }
 
+    /// Mark an agent's layout dirty (a ratio drag). Coalesced: the periodic flusher persists it.
+    fn mark_layout_dirty(&self, agent: PaneId) {
+        self.layout_dirty.lock().insert(agent);
+    }
+
+    /// Persist every dirty agent's current tree, then clear the dirty set. Skips agents no longer
+    /// live (landed/discarded since being marked). Safe to call directly (used by tests + the flusher).
+    pub fn flush_dirty_layouts(&self) {
+        let dirty: Vec<PaneId> = self.layout_dirty.lock().drain().collect();
+        for agent in dirty {
+            if self.trees.lock().contains_key(&agent) {
+                self.persist_tree(agent);
+            }
+        }
+    }
+
+    /// Spawn the background task that flushes coalesced ratio changes every `LAYOUT_FLUSH_INTERVAL`.
+    /// Runs for the daemon's lifetime.
+    pub fn spawn_layout_flusher(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let me = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(LAYOUT_FLUSH_INTERVAL);
+            loop {
+                ticker.tick().await;
+                me.flush_dirty_layouts();
+            }
+        })
+    }
+
     fn alloc_split_id(&self) -> SplitId {
         SplitId(self.next_split_id.fetch_add(1, Ordering::Relaxed))
     }
@@ -554,6 +589,7 @@ impl Daemon {
         }
         let agent = found.ok_or_else(|| anyhow::anyhow!("unknown split {split:?}"))?;
         self.broadcast_tree(agent);
+        self.mark_layout_dirty(agent);
         Ok(agent)
     }
 
@@ -730,6 +766,18 @@ impl Daemon {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// `CLOWDER_STATE_FILE` is process-global; tests that point it at a scratch dir must not run
+    /// concurrently with each other (cargo test runs test fns in parallel by default) or one test's
+    /// `set_var`/`remove_var` races another's `Registry::default_path()` read inside `new_with`.
+    /// Every test that touches the env var takes this lock for its full env-var-dependent span.
+    static STATE_FILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Acquire `STATE_FILE_LOCK`, ignoring poison: an assertion failure in one test while holding
+    /// the lock must not cascade into spurious failures for every later test in this module.
+    fn lock_state_file_env() -> std::sync::MutexGuard<'static, ()> {
+        STATE_FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     fn sh(script: &str) -> PaneCommand {
         PaneCommand {
@@ -1036,6 +1084,7 @@ mod tests {
         run(&["commit", "-qm", "init"]);
 
         let statedir = tempfile::tempdir().unwrap();
+        let _state_lock = lock_state_file_env();
         std::env::set_var("CLOWDER_STATE_FILE", statedir.path().join("agents.json"));
 
         let daemon = Arc::new(Daemon::new_with(
@@ -1079,6 +1128,7 @@ mod tests {
         run(&["commit", "-qm", "init"]);
 
         let statedir = tempfile::tempdir().unwrap();
+        let _state_lock = lock_state_file_env();
         std::env::set_var("CLOWDER_STATE_FILE", statedir.path().join("agents.json"));
         let state_path = statedir.path().join("agents.json");
 
@@ -1155,6 +1205,7 @@ mod tests {
 
         let statedir = tempfile::tempdir().unwrap();
         let state_path = statedir.path().join("agents.json");
+        let _state_lock = lock_state_file_env();
         std::env::set_var("CLOWDER_STATE_FILE", &state_path);
 
         let daemon = Arc::new(Daemon::new_with(
@@ -1864,5 +1915,59 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(dead, "shutdown must kill the child PTY process");
+    }
+
+    #[tokio::test]
+    async fn ratio_change_is_persisted_by_flush() {
+        use crate::{FakeNotifier, SyntheticAdapter};
+        use std::process::Command as PCommand;
+        use clowder_proto::{PaneTree, SplitDirection};
+
+        let repo = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            assert!(PCommand::new("git").arg("-C").arg(repo.path()).args(args).status().unwrap().success());
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@t.test"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(repo.path().join("README.md"), b"hi").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-qm", "init"]);
+
+        let statedir = tempfile::tempdir().unwrap();
+        let state_path = statedir.path().join("agents.json");
+        let _state_lock = lock_state_file_env();
+        std::env::set_var("CLOWDER_STATE_FILE", &state_path);
+
+        let daemon = Arc::new(Daemon::new_with(
+            Arc::new(FakeNotifier::new()),
+            std::path::PathBuf::from("/tmp/unused-ratio.sock"),
+        ));
+        let adapter = SyntheticAdapter {
+            command: crate::PaneCommand {
+                program: "/bin/sh".into(), args: vec!["-c".into(), "sleep 30".into()],
+                cwd: None, env: vec![],
+            },
+        };
+        let id = daemon.spawn_agent(repo.path(), &adapter, "demo").unwrap();
+        daemon.split_pane(id, SplitDirection::Right).unwrap();
+
+        // Find the split id, move its divider, then flush explicitly (no wall-clock dependence).
+        let sid = match daemon.split_tree_of(id).unwrap() {
+            PaneTree::Split { id, .. } => id,
+            _ => panic!("expected split"),
+        };
+        daemon.set_split_ratio(sid, 0.3).unwrap();
+        daemon.flush_dirty_layouts();
+
+        let recs = crate::registry::Registry::new(state_path.clone()).load();
+        let tree = recs.iter().find(|r| r.agent_id == id.0).unwrap().tree.clone().unwrap();
+        match tree {
+            PaneTree::Split { ratio, .. } => assert!((ratio - 0.3).abs() < 1e-6, "ratio persisted: {ratio}"),
+            _ => panic!("expected split"),
+        }
+
+        daemon.shutdown();
+        std::env::remove_var("CLOWDER_STATE_FILE");
     }
 }
