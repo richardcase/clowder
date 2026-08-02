@@ -162,20 +162,10 @@ impl Daemon {
                 return Err(e);
             }
         };
-        self.register_pane(id, pane);
         let ws_project = ws.project.clone();
         let ws_path = ws.path.clone();
         let ws_branch = ws.branch.clone();
         let ws_kind = ws.kind;
-        self.workspaces.lock().insert(id, ws);
-        let project_name = project
-            .file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| project.to_string_lossy().to_string());
-        self.agents.lock().insert(
-            id,
-            AgentMeta { project: project_name, task: task.to_string() },
-        );
         self.registry.upsert(crate::registry::AgentRecord {
             agent_id: id.0,
             project: ws_project,
@@ -187,6 +177,34 @@ impl Daemon {
             cols: self.default_cols,
             rows: self.default_rows,
         });
+        self.finalize_agent(id, pane, ws, task, adapter);
+
+        Ok(id)
+    }
+
+    /// Register a freshly-spawned (or re-spawned, via `reconcile`) agent pane: pane map,
+    /// workspace, in-memory agent metadata, attention, the hookless VT-scanner fallback,
+    /// its split tree, and its exit watcher. Does NOT touch the registry — callers own that
+    /// (so `reconcile`, which is reading the registry, never re-writes the record it just read).
+    fn finalize_agent(
+        self: &Arc<Self>,
+        id: PaneId,
+        pane: Pane,
+        ws: Workspace,
+        task: &str,
+        adapter: &dyn AgentAdapter,
+    ) {
+        let project_name = ws
+            .project
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| ws.project.to_string_lossy().to_string());
+        self.register_pane(id, pane);
+        self.workspaces.lock().insert(id, ws);
+        self.agents.lock().insert(
+            id,
+            AgentMeta { project: project_name, task: task.to_string() },
+        );
         self.set_attention(id, AttentionState::Working);
 
         if !adapter.provides_hooks() {
@@ -231,8 +249,6 @@ impl Daemon {
             });
             self.watchers.lock().insert(id, handle);
         }
-
-        Ok(id)
     }
 
     pub(crate) fn workspace_of(&self, pane: PaneId) -> Option<Workspace> {
