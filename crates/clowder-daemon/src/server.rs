@@ -848,6 +848,7 @@ impl Daemon {
 mod tests {
     use super::*;
     use std::time::Duration;
+    use serial_test::serial;
 
     fn sh(script: &str) -> PaneCommand {
         PaneCommand {
@@ -1206,6 +1207,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn reconcile_respawns_recorded_agents_and_prunes_missing() {
         use crate::{FakeNotifier, SyntheticAdapter};
         use std::process::Command as PCommand;
@@ -2126,6 +2128,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn reconcile_restored_companion_ids_never_collide_with_agents() {
         use crate::{FakeNotifier, SyntheticAdapter};
         use std::process::Command as PCommand;
