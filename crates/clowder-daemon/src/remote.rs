@@ -277,28 +277,37 @@ pub(crate) mod test_support {
     use tokio_rustls::rustls::{DigitallySignedStruct, SignatureScheme, Error};
 
     #[derive(Debug)]
-    struct PinnedFp(String);
+    struct PinnedFp {
+        fp: String,
+        provider: Arc<tokio_rustls::rustls::crypto::CryptoProvider>,
+    }
     impl ServerCertVerifier for PinnedFp {
         fn verify_server_cert(&self, end_entity: &CertificateDer, _i: &[CertificateDer], _n: &ServerName, _o: &[u8], _t: UnixTime) -> Result<ServerCertVerified, Error> {
-            if clowder_proto::cert_fingerprint_hex(end_entity) == self.0 {
+            if clowder_proto::cert_fingerprint_hex(end_entity) == self.fp {
                 Ok(ServerCertVerified::assertion())
             } else {
                 Err(Error::General("fingerprint mismatch".into()))
             }
         }
-        fn verify_tls12_signature(&self, _m: &[u8], _c: &CertificateDer, _d: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, Error> { Ok(HandshakeSignatureValid::assertion()) }
-        fn verify_tls13_signature(&self, _m: &[u8], _c: &CertificateDer, _d: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, Error> { Ok(HandshakeSignatureValid::assertion()) }
+        // Real signature verification (not just the fingerprint pin) so these tests exercise the
+        // same identity + key-possession check as the real client's TofuVerifier.
+        fn verify_tls12_signature(&self, message: &[u8], cert: &CertificateDer, dss: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, Error> {
+            tokio_rustls::rustls::crypto::verify_tls12_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+        }
+        fn verify_tls13_signature(&self, message: &[u8], cert: &CertificateDer, dss: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, Error> {
+            tokio_rustls::rustls::crypto::verify_tls13_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+        }
         fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-            vec![SignatureScheme::ECDSA_NISTP256_SHA256, SignatureScheme::ED25519, SignatureScheme::RSA_PSS_SHA256, SignatureScheme::RSA_PKCS1_SHA256]
+            self.provider.signature_verification_algorithms.supported_schemes()
         }
     }
 
     pub(crate) fn connector_pinned(fp: String) -> TlsConnector {
         let provider = Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
-        let config = ClientConfig::builder_with_provider(provider)
+        let config = ClientConfig::builder_with_provider(provider.clone())
             .with_safe_default_protocol_versions().unwrap()
             .dangerous()
-            .with_custom_certificate_verifier(Arc::new(PinnedFp(fp)))
+            .with_custom_certificate_verifier(Arc::new(PinnedFp { fp, provider }))
             .with_no_client_auth();
         TlsConnector::from(Arc::new(config))
     }

@@ -13,7 +13,11 @@ pub fn known_hosts_path() -> PathBuf {
 
 /// Record-or-verify `fp` for `host`. Ok = trusted (recorded on first sight); Err(msg) = refuse.
 pub fn check(path: &Path, host: &str, fp: &str) -> Result<(), String> {
-    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    let existing = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("cannot read known_hosts {}: {e}", path.display())),
+    };
     for line in existing.lines() {
         let mut it = line.split_whitespace();
         if let (Some(h), Some(f)) = (it.next(), it.next()) {
@@ -43,6 +47,7 @@ pub fn check(path: &Path, host: &str, fp: &str) -> Result<(), String> {
 pub struct TofuVerifier {
     pub host: String,
     pub known_hosts_path: PathBuf,
+    pub provider: Arc<tokio_rustls::rustls::crypto::CryptoProvider>,
 }
 
 impl ServerCertVerifier for TofuVerifier {
@@ -52,17 +57,29 @@ impl ServerCertVerifier for TofuVerifier {
             .map(|_| ServerCertVerified::assertion())
             .map_err(|msg| Error::General(msg))
     }
-    fn verify_tls12_signature(&self, _m: &[u8], _c: &CertificateDer, _d: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, Error> { Ok(HandshakeSignatureValid::assertion()) }
-    fn verify_tls13_signature(&self, _m: &[u8], _c: &CertificateDer, _d: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, Error> { Ok(HandshakeSignatureValid::assertion()) }
+    // Fingerprint pinning above proves identity (the peer presented the expected cert), but
+    // that alone isn't enough — an active MITM can also hold a copy of that (public) cert. These
+    // two checks prove key POSSESSION: the peer signed the handshake transcript with the
+    // private key matching the pinned cert, which a MITM without that key cannot forge.
+    fn verify_tls12_signature(&self, message: &[u8], cert: &CertificateDer, dss: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, Error> {
+        tokio_rustls::rustls::crypto::verify_tls12_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+    }
+    fn verify_tls13_signature(&self, message: &[u8], cert: &CertificateDer, dss: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, Error> {
+        tokio_rustls::rustls::crypto::verify_tls13_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+    }
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        vec![SignatureScheme::ECDSA_NISTP256_SHA256, SignatureScheme::ED25519, SignatureScheme::RSA_PSS_SHA256, SignatureScheme::RSA_PKCS1_SHA256]
+        self.provider.signature_verification_algorithms.supported_schemes()
     }
 }
 
 /// Build a TLS connector that verifies `host` via TOFU.
 pub fn connector(host: &str) -> Arc<tokio_rustls::rustls::ClientConfig> {
     let provider = Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
-    let verifier = TofuVerifier { host: host.to_string(), known_hosts_path: known_hosts_path() };
+    let verifier = TofuVerifier {
+        host: host.to_string(),
+        known_hosts_path: known_hosts_path(),
+        provider: provider.clone(),
+    };
     Arc::new(
         tokio_rustls::rustls::ClientConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions().unwrap()
