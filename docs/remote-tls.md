@@ -25,9 +25,12 @@ or via env: `CLOWDER_LISTEN=0.0.0.0:7777 CLOWDER_REMOTE_TLS=1`.
 
 `listen` alone (with `tls` unset/false) serves the remote listener in **plaintext** — there is no
 `allow_plaintext` key; plaintext is simply the absence of `tls = true`. Binding to anything other than
-loopback or a Tailscale tailnet address (CGNAT `100.64.0.0/10`, or IPv6 `fd7a:115c:a1e0::/48`) without
-TLS logs a startup warning (`should_warn_exposed`, in `crates/clowder-daemon/src/remote.rs`) because
-Phase A plaintext has no authentication at all.
+loopback or a Tailscale tailnet address (CGNAT `100.64.0.0/10`, or IPv6 `fd7a:115c:a1e0::/48`) logs a
+startup warning (`should_warn_exposed`, in `crates/clowder-daemon/src/remote.rs`) — this check runs
+**unconditionally**, before TLS is even considered, so it fires the same way whether `tls` is on or off.
+With `tls = false` the wording is accurate (no authentication at all); with `tls = true` the wording is
+stale/over-cautious (token auth is in fact active) — a known minor to be refined later, not a bug to rely
+on for "TLS suppresses the warning."
 
 With `tls = true`, on first start the daemon generates and persists, under
 `$XDG_STATE_HOME/clowder` (else `~/.local/state/clowder`), mode `0600`:
@@ -44,14 +47,13 @@ clowder remote-token
 # fingerprint: <sha256 hex>
 ```
 
-**Rotation:**
-- Rotate the token: delete `remote-token`; the daemon generates a new one on next start.
-- Rotate the cert: delete both `remote-cert.pem` and `remote-key.pem`; the daemon generates a new
-  keypair on next start. Every client that already trusted the old cert must re-trust the new one (see
-  TOFU below) — a stale entry in a client's known-hosts file will refuse the connection until removed.
-
-Note that generating a new cert or token does not, by itself, delete the other — deleting all three
-files together mid-lifecycle is the clean way to fully reset remote credentials.
+**Rotation:** there is no partial (token-only or cert-only) rotation — `load_or_generate()` only takes
+the "load existing" path when **all three** files (`remote-cert.pem`, `remote-key.pem`, `remote-token`)
+are present; if *any one* is missing, it regenerates and overwrites **all three** together (fresh cert
+**and** fresh token). So to rotate, delete the credential files (simplest: delete `remote-token` and the
+pem pair together, or the whole state-dir remote-cred set) and restart the daemon — it generates a fresh
+cert and token on next start. Because the cert always changes too, every client's TOFU pin breaks: they
+must remove the stale line from their `remote_known_hosts` (see below) before they can reconnect.
 
 ## Client setup
 
@@ -101,7 +103,8 @@ the new fingerprint on the next connect.
   network path being trusted) against what the client records before relying on the connection.
 - **Token leakage.** The token is a bearer credential — anyone who reads it can authenticate as the
   client. Credential files are written `0600` (owner-only); treat leakage the same as any other secret
-  and rotate (delete `remote-token`, restart the daemon) if you suspect exposure.
+  and rotate (see Rotation above — deleting `remote-token` and restarting also regenerates the cert, so
+  clients will need to re-trust) if you suspect exposure.
 
 **Deferred (not in this phase):** mutual TLS (client certs), QUIC transport, a pinned-pairing UX (e.g.
 QR/short-code exchange instead of manual fingerprint comparison), and OS Keychain storage for the token
