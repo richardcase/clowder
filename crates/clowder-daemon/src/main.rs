@@ -62,7 +62,11 @@ async fn main() -> Result<()> {
             .map_err(|e| anyhow::anyhow!("invalid [remote] listen address {addr_str:?}: {e}"))?;
         let tcp = tokio::net::TcpListener::bind(addr).await?;
         if clowder_daemon::remote::should_warn_exposed(&addr) {
-            tracing::warn!(%addr, "remote listener bound to a non-loopback/non-tailnet address — Phase A has NO authentication; expose only behind a trusted tunnel (SSH -L / Tailscale)");
+            if config_remote_tls {
+                tracing::info!(%addr, "remote listener bound to a non-loopback/non-tailnet address, protected by TLS + token auth");
+            } else {
+                tracing::warn!(%addr, "remote listener bound to a non-loopback/non-tailnet address — plaintext with NO authentication; set [remote] tls = true, or expose only behind a trusted tunnel (SSH -L / Tailscale)");
+            }
         }
         // Fail closed: if TLS is enabled but credential setup fails, refuse to start the
         // remote listener rather than silently falling back to plaintext.
