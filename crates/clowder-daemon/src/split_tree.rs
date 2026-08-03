@@ -93,6 +93,62 @@ pub(crate) fn set_ratio(tree: &mut PaneTree, id: SplitId, ratio: f32) -> bool {
     }
 }
 
+/// Rebuild a persisted tree for restore: keep the agent leaf (its id is stable across restart),
+/// spawn a fresh companion for every other leaf (substituting the new id), regenerate split ids,
+/// and preserve axis + ratio. Best-effort: if `spawn_companion` returns None, that leaf collapses
+/// into its sibling. Returns the rebuilt tree and the new companion ids in creation order; always
+/// yields at least `Leaf { pane: agent }`.
+pub(crate) fn rebuild_for_restore(
+    tree: &PaneTree,
+    agent: PaneId,
+    spawn_companion: &mut dyn FnMut() -> Option<PaneId>,
+    alloc_split: &mut dyn FnMut() -> SplitId,
+) -> (PaneTree, Vec<PaneId>) {
+    rebuild(tree, agent, spawn_companion, alloc_split)
+        .unwrap_or_else(|| (PaneTree::Leaf { pane: agent }, Vec::new()))
+}
+
+/// Recursion for `rebuild_for_restore`. `None` = this subtree produced no panes (fully collapsed);
+/// the agent leaf can never collapse, so the top-level call always yields `Some`.
+fn rebuild(
+    node: &PaneTree,
+    agent: PaneId,
+    spawn_companion: &mut dyn FnMut() -> Option<PaneId>,
+    alloc_split: &mut dyn FnMut() -> SplitId,
+) -> Option<(PaneTree, Vec<PaneId>)> {
+    match node {
+        PaneTree::Leaf { pane } if *pane == agent => {
+            Some((PaneTree::Leaf { pane: agent }, Vec::new()))
+        }
+        PaneTree::Leaf { .. } => {
+            let id = spawn_companion()?; // None → collapse
+            Some((PaneTree::Leaf { pane: id }, vec![id]))
+        }
+        PaneTree::Split { axis, ratio, first, second, .. } => {
+            let f = rebuild(first, agent, spawn_companion, alloc_split);
+            let s = rebuild(second, agent, spawn_companion, alloc_split);
+            match (f, s) {
+                (Some((ft, mut fc)), Some((st, sc))) => {
+                    fc.extend(sc);
+                    Some((
+                        PaneTree::Split {
+                            id: alloc_split(),
+                            axis: *axis,
+                            ratio: *ratio,
+                            first: Box::new(ft),
+                            second: Box::new(st),
+                        },
+                        fc,
+                    ))
+                }
+                // one side collapsed → promote the surviving side (drop the divider)
+                (Some(x), None) | (None, Some(x)) => Some(x),
+                (None, None) => None,
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,5 +222,88 @@ mod tests {
         assert!(set_ratio(&mut t, SplitId(1), 2.0)); // clamps
         if let PaneTree::Split { ratio, .. } = &t { assert_eq!(*ratio, 0.95); } else { panic!() }
         assert!(!set_ratio(&mut t, SplitId(9), 0.5)); // unknown id
+    }
+
+    // A scripted spawner: returns the next id from `ids`, or None once exhausted / where scripted.
+    fn spawner(ids: Vec<Option<u64>>) -> impl FnMut() -> Option<PaneId> {
+        let mut it = ids.into_iter();
+        move || it.next().flatten().map(PaneId)
+    }
+    fn splitter() -> impl FnMut() -> SplitId {
+        let mut n = 1000u64;
+        move || { n += 1; SplitId(n) }
+    }
+
+    #[test]
+    fn rebuild_agent_only_leaf_is_single_leaf() {
+        let t = leaf(1);
+        let mut sp = spawner(vec![]);
+        let mut al = splitter();
+        let (out, comps) = rebuild_for_restore(&t, PaneId(1), &mut sp, &mut al);
+        assert_eq!(out, leaf(1));
+        assert!(comps.is_empty());
+    }
+
+    #[test]
+    fn rebuild_substitutes_companion_and_preserves_axis_ratio() {
+        // agent=1, one companion leaf (old id 77) under a horizontal split at ratio 0.3.
+        let t = PaneTree::Split {
+            id: SplitId(5), axis: Axis::Horizontal, ratio: 0.3,
+            first: Box::new(leaf(1)), second: Box::new(leaf(77)),
+        };
+        let mut sp = spawner(vec![Some(500)]);
+        let mut al = splitter();
+        let (out, comps) = rebuild_for_restore(&t, PaneId(1), &mut sp, &mut al);
+        assert_eq!(comps, vec![PaneId(500)]);
+        match out {
+            PaneTree::Split { id, axis, ratio, first, second } => {
+                assert_eq!(id, SplitId(1001));            // regenerated, not the old 5
+                assert_eq!(axis, Axis::Horizontal);
+                assert_eq!(ratio, 0.3);
+                assert_eq!(*first, leaf(1));              // agent leaf preserved
+                assert_eq!(*second, leaf(500));           // companion substituted
+            }
+            _ => panic!("expected split"),
+        }
+    }
+
+    #[test]
+    fn rebuild_failed_companion_collapses_to_agent() {
+        let t = PaneTree::Split {
+            id: SplitId(5), axis: Axis::Vertical, ratio: 0.5,
+            first: Box::new(leaf(1)), second: Box::new(leaf(77)),
+        };
+        let mut sp = spawner(vec![None]);   // the companion spawn fails
+        let mut al = splitter();
+        let (out, comps) = rebuild_for_restore(&t, PaneId(1), &mut sp, &mut al);
+        assert_eq!(out, leaf(1));            // collapsed to the surviving agent leaf
+        assert!(comps.is_empty());
+    }
+
+    #[test]
+    fn rebuild_nested_recurses_and_one_failure_collapses_inner() {
+        // agent=1 ; right side is a split of two companions (88, 99); 88 fails, 99 succeeds.
+        let t = PaneTree::Split {
+            id: SplitId(5), axis: Axis::Horizontal, ratio: 0.6,
+            first: Box::new(leaf(1)),
+            second: Box::new(PaneTree::Split {
+                id: SplitId(6), axis: Axis::Vertical, ratio: 0.2,
+                first: Box::new(leaf(88)), second: Box::new(leaf(99)),
+            }),
+        };
+        let mut sp = spawner(vec![None, Some(501)]);  // 88 → None, 99 → 501
+        let mut al = splitter();
+        let (out, comps) = rebuild_for_restore(&t, PaneId(1), &mut sp, &mut al);
+        assert_eq!(comps, vec![PaneId(501)]);
+        // inner split collapsed to leaf(501); outer split keeps agent + that leaf.
+        match out {
+            PaneTree::Split { axis, ratio, first, second, .. } => {
+                assert_eq!(axis, Axis::Horizontal);
+                assert_eq!(ratio, 0.6);
+                assert_eq!(*first, leaf(1));
+                assert_eq!(*second, leaf(501));
+            }
+            _ => panic!("expected split"),
+        }
     }
 }

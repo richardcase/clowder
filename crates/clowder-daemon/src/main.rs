@@ -52,6 +52,9 @@ async fn main() -> Result<()> {
     tracing::info!("reconciling agent registry");
     daemon.reconcile();
 
+    // Coalesced layout persistence: ratio drags mark the agent dirty; this task flushes them.
+    let _layout_flusher = daemon.spawn_layout_flusher();
+
     if let Some(addr_str) = remote_listen {
         let addr: std::net::SocketAddr = addr_str
             .parse()

@@ -21,6 +21,9 @@ struct AgentMeta {
     task: String,
 }
 
+/// How often the coalesced layout flusher persists agents whose divider ratios changed.
+const LAYOUT_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(750);
+
 /// The command for a companion pane: the login shell, rooted in the worktree, with no hook env.
 pub(crate) fn companion_command(shell: String, cwd: std::path::PathBuf) -> PaneCommand {
     PaneCommand { program: shell, args: vec![], cwd: Some(cwd), env: vec![] }
@@ -49,6 +52,8 @@ pub struct Daemon {
     pub(crate) default_rows: u16,
     pub(crate) shell: String,
     registry: Arc<crate::registry::Registry>,
+    /// Agents whose ratios changed since the last flush; drained by the periodic layout flusher.
+    layout_dirty: Arc<Mutex<std::collections::HashSet<PaneId>>>,
 }
 
 impl Daemon {
@@ -83,6 +88,7 @@ impl Daemon {
             default_rows: 24,
             shell: std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()),
             registry: Arc::new(crate::registry::Registry::new(crate::registry::Registry::default_path())),
+            layout_dirty: Arc::new(Mutex::new(std::collections::HashSet::new())),
         }
     }
 
@@ -133,9 +139,11 @@ impl Daemon {
     /// records whose worktree is gone or whose adapter/resume fails; never panics.
     pub fn reconcile(self: &Arc<Self>) {
         let records = self.registry.load();
-        let mut max_id = 0u64;
+        // Bump BEFORE restoring: companion `alloc_id()`s during layout restore must not collide with
+        // a not-yet-restored agent's fixed id. (Agents re-spawn under `PaneId(rec.agent_id)`.)
+        let max_id = records.iter().map(|r| r.agent_id).max().unwrap_or(0);
+        self.bump_next_id_above(max_id);
         for rec in records {
-            max_id = max_id.max(rec.agent_id);
             let id = PaneId(rec.agent_id);
             if !rec.worktree_path.exists() {
                 tracing::warn!(
@@ -171,15 +179,19 @@ impl Daemon {
                 Pane::spawn(id, cmd, rec.cols, rec.rows, self.backlog_cap)
             })();
             match spawn {
-                Ok(pane) => self.finalize_agent(id, pane, ws, &rec.task, adapter.as_ref()),
+                Ok(pane) => {
+                    let restore_cwd = ws.path.clone();
+                    self.finalize_agent(id, pane, ws, &rec.task, adapter.as_ref());
+                    if let Some(tree) = rec.tree.clone() {
+                        self.restore_layout(id, tree, restore_cwd);
+                    }
+                }
                 Err(e) => {
                     tracing::warn!("resume agent {} failed: {e}; pruning", rec.agent_id);
                     self.registry.remove(rec.agent_id);
                 }
             }
         }
-        // New spawns must not collide with restored ids.
-        self.bump_next_id_above(max_id);
     }
 
     fn register_pane(&self, id: PaneId, pane: Pane) {
@@ -234,6 +246,7 @@ impl Daemon {
             workspace_kind: ws_kind.as_str().to_string(),
             cols: self.default_cols,
             rows: self.default_rows,
+            tree: None,
         });
         self.finalize_agent(id, pane, ws, task, adapter);
 
@@ -420,8 +433,89 @@ impl Daemon {
         }
     }
 
+    /// Persist the agent's current split tree to its registry record. A bare agent leaf is stored as
+    /// `None` (keeps records small); anything with companions is stored literally. Called on every
+    /// structural tree change (split/close/reap); ratio drags persist via the coalesced flush instead.
+    fn persist_tree(&self, agent: PaneId) {
+        let opt = match self.trees.lock().get(&agent) {
+            Some(PaneTree::Leaf { pane }) if *pane == agent => None,
+            Some(tree) => Some(tree.clone()),
+            None => None,
+        };
+        self.registry.set_tree(agent.0, opt);
+    }
+
+    /// Mark an agent's layout dirty (a ratio drag). Coalesced: the periodic flusher persists it.
+    fn mark_layout_dirty(&self, agent: PaneId) {
+        self.layout_dirty.lock().insert(agent);
+    }
+
+    /// Persist every dirty agent's current tree, then clear the dirty set. Skips agents no longer
+    /// live (landed/discarded since being marked). Safe to call directly (used by tests + the flusher).
+    pub fn flush_dirty_layouts(&self) {
+        let dirty: Vec<PaneId> = self.layout_dirty.lock().drain().collect();
+        for agent in dirty {
+            if self.trees.lock().contains_key(&agent) {
+                self.persist_tree(agent);
+            }
+        }
+    }
+
+    /// Spawn the background task that flushes coalesced ratio changes every `LAYOUT_FLUSH_INTERVAL`.
+    /// Runs for the daemon's lifetime.
+    pub fn spawn_layout_flusher(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let me = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(LAYOUT_FLUSH_INTERVAL);
+            loop {
+                ticker.tick().await;
+                me.flush_dirty_layouts();
+            }
+        })
+    }
+
     fn alloc_split_id(&self) -> SplitId {
         SplitId(self.next_split_id.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Rebuild an agent's companion layout on reconcile: spawn a fresh shell per companion leaf,
+    /// wire owner + reap watchers, install the rebuilt tree, and broadcast. Best-effort — a companion
+    /// that fails to spawn collapses only its leaf; a bare agent leaf is a no-op (finalize already set
+    /// the single-leaf tree).
+    fn restore_layout(self: &Arc<Self>, agent: PaneId, tree: PaneTree, cwd: std::path::PathBuf) {
+        if matches!(&tree, PaneTree::Leaf { pane } if *pane == agent) {
+            return;
+        }
+        let shell = self.shell.clone();
+        let (cols, rows) = (self.default_cols, self.default_rows);
+        let mut spawn_companion = || -> Option<PaneId> {
+            self.spawn_pane(companion_command(shell.clone(), cwd.clone()), cols, rows).ok()
+        };
+        let mut alloc_split = || self.alloc_split_id();
+        let (rebuilt, companions) =
+            crate::split_tree::rebuild_for_restore(&tree, agent, &mut spawn_companion, &mut alloc_split);
+
+        // Install owner + tree + broadcast BEFORE spawning any reap watcher (mirrors `split_pane`):
+        // `wait_exit()` returns immediately if the child already exited, so no exit is missed even
+        // when the watcher registers late — but registering it early risks `reap_companion` firing
+        // against the still-bare pre-restore tree and dropping a companion the rebuilt tree still
+        // references, leaving a phantom leaf.
+        for c in &companions {
+            self.owner.lock().insert(*c, agent);
+        }
+        self.trees.lock().insert(agent, rebuilt);
+        self.broadcast_tree(agent);
+
+        for c in companions {
+            if let Some(pane_arc) = self.get(c) {
+                let me = Arc::clone(self);
+                let handle = tokio::spawn(async move {
+                    pane_arc.wait_exit().await;
+                    me.reap_companion(c);
+                });
+                self.companion_watchers.lock().insert(c, handle);
+            }
+        }
     }
 
     /// Split `target` (a leaf) by spawning a companion shell in its agent's worktree.
@@ -455,6 +549,7 @@ impl Daemon {
         }
         self.owner.lock().insert(companion, agent);
         self.broadcast_tree(agent);
+        self.persist_tree(agent);
 
         // Reap the companion if its process exits/crashes (mirrors the per-agent watcher). Registered
         // after owner+tree are set so `reap_companion` always finds the owner. `wait_exit()` returns
@@ -492,6 +587,7 @@ impl Daemon {
         self.owner.lock().remove(&pane);
         self.companion_watchers.lock().remove(&pane);
         self.broadcast_tree(agent);
+        self.persist_tree(agent);
     }
 
     /// Close a companion pane (collapsing the tree), or teardown the agent if `pane` is one.
@@ -521,6 +617,7 @@ impl Daemon {
         }
         self.owner.lock().remove(&pane);
         self.broadcast_tree(agent);
+        self.persist_tree(agent);
         Ok(Some(agent))
     }
 
@@ -538,6 +635,7 @@ impl Daemon {
         }
         let agent = found.ok_or_else(|| anyhow::anyhow!("unknown split {split:?}"))?;
         self.broadcast_tree(agent);
+        self.mark_layout_dirty(agent);
         Ok(agent)
     }
 
@@ -1020,6 +1118,7 @@ mod tests {
         run(&["commit", "-qm", "init"]);
 
         let statedir = tempfile::tempdir().unwrap();
+        let _state_lock = crate::STATE_FILE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLOWDER_STATE_FILE", statedir.path().join("agents.json"));
 
         let daemon = Arc::new(Daemon::new_with(
@@ -1063,6 +1162,7 @@ mod tests {
         run(&["commit", "-qm", "init"]);
 
         let statedir = tempfile::tempdir().unwrap();
+        let _state_lock = crate::STATE_FILE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLOWDER_STATE_FILE", statedir.path().join("agents.json"));
         let state_path = statedir.path().join("agents.json");
 
@@ -1117,6 +1217,116 @@ mod tests {
         );
         d3.shutdown();
 
+        std::env::remove_var("CLOWDER_STATE_FILE");
+    }
+
+    #[tokio::test]
+    async fn reconcile_restores_split_layout() {
+        use crate::{FakeNotifier, SyntheticAdapter};
+        use std::process::Command as PCommand;
+        use clowder_proto::{PaneTree, SplitDirection};
+
+        let repo = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            assert!(PCommand::new("git").arg("-C").arg(repo.path()).args(args).status().unwrap().success());
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@t.test"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(repo.path().join("README.md"), b"hi").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-qm", "init"]);
+
+        let statedir = tempfile::tempdir().unwrap();
+        let _state_lock = crate::STATE_FILE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("CLOWDER_STATE_FILE", statedir.path().join("agents.json"));
+
+        let d1 = Arc::new(Daemon::new_with(
+            Arc::new(FakeNotifier::new()),
+            std::path::PathBuf::from("/tmp/unused-restore1.sock"),
+        ));
+        let adapter = SyntheticAdapter {
+            command: crate::PaneCommand {
+                program: "/bin/sh".into(), args: vec!["-c".into(), "sleep 30".into()],
+                cwd: None, env: vec![],
+            },
+        };
+        let id = d1.spawn_agent(repo.path(), &adapter, "demo").unwrap();
+        d1.split_pane(id, SplitDirection::Right).unwrap();
+        // set + flush a non-default ratio so we can assert it round-trips.
+        let sid = match d1.split_tree_of(id).unwrap() { PaneTree::Split { id, .. } => id, _ => panic!() };
+        d1.set_split_ratio(sid, 0.3).unwrap();
+        d1.flush_dirty_layouts();
+
+        // Fresh daemon over the same state file → reconcile rebuilds the layout.
+        let d2 = Arc::new(Daemon::new_with(
+            Arc::new(FakeNotifier::new()),
+            std::path::PathBuf::from("/tmp/unused-restore2.sock"),
+        ));
+        d2.reconcile();
+
+        let tree = d2.split_tree_of(id).expect("agent tree restored");
+        let ls = crate::split_tree::leaves(&tree);
+        assert_eq!(ls.len(), 2, "two leaves restored");
+        assert!(ls.contains(&id), "agent leaf id preserved");
+        match tree {
+            PaneTree::Split { ratio, first, .. } => {
+                assert!((ratio - 0.3).abs() < 1e-6, "ratio restored: {ratio}");
+                assert_eq!(*first, PaneTree::Leaf { pane: id }, "agent is the first leaf");
+            }
+            _ => panic!("expected split"),
+        }
+        d2.shutdown();
+        std::env::remove_var("CLOWDER_STATE_FILE");
+    }
+
+    #[tokio::test]
+    async fn split_and_close_persist_the_tree() {
+        use crate::{FakeNotifier, SyntheticAdapter};
+        use std::process::Command as PCommand;
+        use clowder_proto::SplitDirection;
+
+        let repo = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            assert!(PCommand::new("git").arg("-C").arg(repo.path()).args(args).status().unwrap().success());
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@t.test"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(repo.path().join("README.md"), b"hi").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-qm", "init"]);
+
+        let statedir = tempfile::tempdir().unwrap();
+        let state_path = statedir.path().join("agents.json");
+        let _state_lock = crate::STATE_FILE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("CLOWDER_STATE_FILE", &state_path);
+
+        let daemon = Arc::new(Daemon::new_with(
+            Arc::new(FakeNotifier::new()),
+            std::path::PathBuf::from("/tmp/unused-persist.sock"),
+        ));
+        let adapter = SyntheticAdapter {
+            command: crate::PaneCommand {
+                program: "/bin/sh".into(), args: vec!["-c".into(), "sleep 30".into()],
+                cwd: None, env: vec![],
+            },
+        };
+        let id = daemon.spawn_agent(repo.path(), &adapter, "demo").unwrap();
+
+        // After a split, the record's tree is a 2-leaf split.
+        let companion = daemon.split_pane(id, SplitDirection::Right).unwrap();
+        let recs = crate::registry::Registry::new(state_path.clone()).load();
+        let tree = recs.iter().find(|r| r.agent_id == id.0).unwrap().tree.clone();
+        assert!(matches!(tree, Some(clowder_proto::PaneTree::Split { .. })), "split persisted: {tree:?}");
+        assert_eq!(crate::split_tree::leaves(tree.as_ref().unwrap()).len(), 2);
+
+        // After closing the companion, the tree collapses back and is persisted as None (bare leaf).
+        daemon.close_pane(companion).unwrap();
+        let recs = crate::registry::Registry::new(state_path.clone()).load();
+        assert_eq!(recs.iter().find(|r| r.agent_id == id.0).unwrap().tree, None);
+
+        daemon.shutdown();
         std::env::remove_var("CLOWDER_STATE_FILE");
     }
 
@@ -1799,5 +2009,160 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(dead, "shutdown must kill the child PTY process");
+    }
+
+    #[tokio::test]
+    async fn ratio_change_is_persisted_by_flush() {
+        use crate::{FakeNotifier, SyntheticAdapter};
+        use std::process::Command as PCommand;
+        use clowder_proto::{PaneTree, SplitDirection};
+
+        let repo = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            assert!(PCommand::new("git").arg("-C").arg(repo.path()).args(args).status().unwrap().success());
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@t.test"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(repo.path().join("README.md"), b"hi").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-qm", "init"]);
+
+        let statedir = tempfile::tempdir().unwrap();
+        let state_path = statedir.path().join("agents.json");
+        let _state_lock = crate::STATE_FILE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("CLOWDER_STATE_FILE", &state_path);
+
+        let daemon = Arc::new(Daemon::new_with(
+            Arc::new(FakeNotifier::new()),
+            std::path::PathBuf::from("/tmp/unused-ratio.sock"),
+        ));
+        let adapter = SyntheticAdapter {
+            command: crate::PaneCommand {
+                program: "/bin/sh".into(), args: vec!["-c".into(), "sleep 30".into()],
+                cwd: None, env: vec![],
+            },
+        };
+        let id = daemon.spawn_agent(repo.path(), &adapter, "demo").unwrap();
+        daemon.split_pane(id, SplitDirection::Right).unwrap();
+
+        // Find the split id, move its divider, then flush explicitly (no wall-clock dependence).
+        let sid = match daemon.split_tree_of(id).unwrap() {
+            PaneTree::Split { id, .. } => id,
+            _ => panic!("expected split"),
+        };
+        daemon.set_split_ratio(sid, 0.3).unwrap();
+        daemon.flush_dirty_layouts();
+
+        let recs = crate::registry::Registry::new(state_path.clone()).load();
+        let tree = recs.iter().find(|r| r.agent_id == id.0).unwrap().tree.clone().unwrap();
+        match tree {
+            PaneTree::Split { ratio, .. } => assert!((ratio - 0.3).abs() < 1e-6, "ratio persisted: {ratio}"),
+            _ => panic!("expected split"),
+        }
+
+        daemon.shutdown();
+        std::env::remove_var("CLOWDER_STATE_FILE");
+    }
+
+    #[tokio::test]
+    async fn reconcile_restored_companion_ids_never_collide_with_agents() {
+        use crate::{FakeNotifier, SyntheticAdapter};
+        use std::process::Command as PCommand;
+        use clowder_proto::SplitDirection;
+
+        let repo = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            assert!(PCommand::new("git").arg("-C").arg(repo.path()).args(args).status().unwrap().success());
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@t.test"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(repo.path().join("README.md"), b"hi").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-qm", "init"]);
+
+        let statedir = tempfile::tempdir().unwrap();
+        let _state_lock = crate::STATE_FILE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("CLOWDER_STATE_FILE", statedir.path().join("agents.json"));
+
+        let d1 = Arc::new(Daemon::new_with(
+            Arc::new(FakeNotifier::new()),
+            std::path::PathBuf::from("/tmp/unused-collide1.sock"),
+        ));
+        let adapter = SyntheticAdapter {
+            command: crate::PaneCommand {
+                program: "/bin/sh".into(), args: vec!["-c".into(), "sleep 30".into()],
+                cwd: None, env: vec![],
+            },
+        };
+        // Agent A (low id) with a companion, then agent B (higher id).
+        let a = d1.spawn_agent(repo.path(), &adapter, "aaa").unwrap();
+        d1.split_pane(a, SplitDirection::Right).unwrap();
+        let b = d1.spawn_agent(repo.path(), &adapter, "bbb").unwrap();
+
+        // Fresh daemon reconciles A (with layout) then B. Without the early next_id bump, A's
+        // restored companion could grab B's id.
+        let d2 = Arc::new(Daemon::new_with(
+            Arc::new(FakeNotifier::new()),
+            std::path::PathBuf::from("/tmp/unused-collide2.sock"),
+        ));
+        d2.reconcile();
+
+        // Both agents came back under their original ids.
+        let ids: std::collections::HashSet<_> = d2.list_agents().iter().map(|x| x.pane).collect();
+        assert!(ids.contains(&a) && ids.contains(&b), "both agents restored: {ids:?}");
+
+        // A's companion leaf id differs from BOTH agent ids.
+        let tree = d2.split_tree_of(a).unwrap();
+        let comp = crate::split_tree::leaves(&tree).into_iter().find(|p| *p != a).unwrap();
+        assert_ne!(comp, a, "companion != agent A");
+        assert_ne!(comp, b, "companion must not collide with agent B");
+
+        d2.shutdown();
+        std::env::remove_var("CLOWDER_STATE_FILE");
+    }
+
+    #[tokio::test]
+    async fn reconcile_m9a_record_without_tree_restores_single_leaf() {
+        use crate::{FakeNotifier, SyntheticAdapter};
+        use std::process::Command as PCommand;
+
+        let repo = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            assert!(PCommand::new("git").arg("-C").arg(repo.path()).args(args).status().unwrap().success());
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@t.test"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(repo.path().join("README.md"), b"hi").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-qm", "init"]);
+
+        let statedir = tempfile::tempdir().unwrap();
+        let _state_lock = crate::STATE_FILE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("CLOWDER_STATE_FILE", statedir.path().join("agents.json"));
+
+        let d1 = Arc::new(Daemon::new_with(
+            Arc::new(FakeNotifier::new()),
+            std::path::PathBuf::from("/tmp/unused-nolt1.sock"),
+        ));
+        let adapter = SyntheticAdapter {
+            command: crate::PaneCommand {
+                program: "/bin/sh".into(), args: vec!["-c".into(), "sleep 30".into()],
+                cwd: None, env: vec![],
+            },
+        };
+        // A plain agent, never split → its record's tree is None (the M9a shape).
+        let id = d1.spawn_agent(repo.path(), &adapter, "demo").unwrap();
+
+        let d2 = Arc::new(Daemon::new_with(
+            Arc::new(FakeNotifier::new()),
+            std::path::PathBuf::from("/tmp/unused-nolt2.sock"),
+        ));
+        d2.reconcile();
+        assert_eq!(d2.split_tree_of(id), Some(clowder_proto::PaneTree::Leaf { pane: id }));
+        d2.shutdown();
+        std::env::remove_var("CLOWDER_STATE_FILE");
     }
 }

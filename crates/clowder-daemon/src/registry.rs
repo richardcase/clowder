@@ -1,4 +1,5 @@
 use anyhow::Result;
+use clowder_proto::PaneTree;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -15,6 +16,10 @@ pub struct AgentRecord {
     pub workspace_kind: String,
     pub cols: u16,
     pub rows: u16,
+    /// The agent's split layout at last change; `None` = a single agent leaf (also how M9a
+    /// records — written before this field existed — deserialize). Rebuilt on reconcile (M9b).
+    #[serde(default)]
+    pub tree: Option<PaneTree>,
 }
 
 /// Durable, restart-surviving list of live agents. All state is in one JSON file written atomically.
@@ -70,6 +75,17 @@ impl Registry {
         self.write(&all);
     }
 
+    /// Update just one agent's persisted split tree (no-op if the agent isn't in the registry —
+    /// e.g. it was landed between a tree change and this call). Atomic, under `write_lock`.
+    pub fn set_tree(&self, agent_id: u64, tree: Option<PaneTree>) {
+        let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut all = self.load();
+        if let Some(rec) = all.iter_mut().find(|r| r.agent_id == agent_id) {
+            rec.tree = tree;
+            self.write(&all);
+        }
+    }
+
     fn write(&self, all: &[AgentRecord]) {
         if let Err(e) = self.try_write(all) {
             tracing::warn!("failed to persist agent registry {}: {e}", self.path.display());
@@ -100,6 +116,7 @@ mod tests {
             agent_id: id, project: PathBuf::from("/p"), task: "t".into(),
             adapter_id: "claude".into(), worktree_path: PathBuf::from("/p/.clowder/worktrees/t"),
             branch: "clowder/t".into(), workspace_kind: "git".into(), cols: 80, rows: 24,
+            tree: None,
         }
     }
 
@@ -144,8 +161,54 @@ mod tests {
 
     #[test]
     fn default_path_honors_env() {
+        // Shared with server::tests: CLOWDER_STATE_FILE is process-global, so any test in the
+        // crate that mutates it must hold this lock for the whole env-var-dependent span.
+        let _g = crate::STATE_FILE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLOWDER_STATE_FILE", "/tmp/x/agents.json");
         assert_eq!(Registry::default_path(), Path::new("/tmp/x/agents.json"));
         std::env::remove_var("CLOWDER_STATE_FILE");
+    }
+
+    #[test]
+    fn record_with_tree_roundtrips() {
+        use clowder_proto::{Axis, PaneId, PaneTree, SplitId};
+        let dir = tempfile::tempdir().unwrap();
+        let reg = Registry::new(dir.path().join("agents.json"));
+        let tree = PaneTree::Split {
+            id: SplitId(1), axis: Axis::Horizontal, ratio: 0.4,
+            first: Box::new(PaneTree::Leaf { pane: PaneId(1) }),
+            second: Box::new(PaneTree::Leaf { pane: PaneId(2) }),
+        };
+        reg.upsert(AgentRecord { tree: Some(tree.clone()), ..rec(1) });
+        let loaded = reg.load();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].tree, Some(tree));
+    }
+
+    #[test]
+    fn record_without_tree_key_defaults_to_none() {
+        // A record written by M9a has no "tree" key; it must deserialize to None.
+        let json = r#"[{"agent_id":1,"project":"/p","task":"t","adapter_id":"claude",
+            "worktree_path":"/p/.clowder/worktrees/t","branch":"clowder/t",
+            "workspace_kind":"git","cols":80,"rows":24}]"#;
+        let recs: Vec<AgentRecord> = serde_json::from_str(json).unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].tree, None);
+    }
+
+    #[test]
+    fn set_tree_updates_one_record_and_noops_on_absent() {
+        use clowder_proto::{PaneId, PaneTree};
+        let dir = tempfile::tempdir().unwrap();
+        let reg = Registry::new(dir.path().join("agents.json"));
+        reg.upsert(rec(1));
+        reg.upsert(rec(2));
+        let t = PaneTree::Leaf { pane: PaneId(1) };
+        reg.set_tree(1, Some(t.clone()));
+        reg.set_tree(99, Some(PaneTree::Leaf { pane: PaneId(99) })); // absent → no-op, no panic
+        let loaded = reg.load();
+        assert_eq!(loaded.iter().find(|r| r.agent_id == 1).unwrap().tree, Some(t));
+        assert_eq!(loaded.iter().find(|r| r.agent_id == 2).unwrap().tree, None);
+        assert_eq!(loaded.len(), 2);
     }
 }
