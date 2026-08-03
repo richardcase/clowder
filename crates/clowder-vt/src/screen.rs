@@ -88,7 +88,9 @@ impl ScreenInner {
         if w == 0 {
             return; // drop combining / zero-width this milestone
         }
-        if self.cx.saturating_add(w) > self.cols {
+        // Widen to u32 so the wrap check is exact even when cols is near u16::MAX (a saturating
+        // u16 add there would cap at MAX and wrongly skip the wrap, leaving the advance to overflow).
+        if self.cx as u32 + w as u32 > self.cols as u32 {
             self.cx = 0;
             if self.cy + 1 >= self.rows { self.scroll_up(); } else { self.cy += 1; }
         }
@@ -97,7 +99,7 @@ impl ScreenInner {
             if x < row.len() { row[x] = c; }
             if w == 2 && x + 1 < row.len() { row[x + 1] = ' '; }
         }
-        self.cx += w;
+        self.cx = self.cx.saturating_add(w); // never panic on a pathological pane width
     }
 
     fn line_feed(&mut self) {
@@ -350,6 +352,17 @@ mod tests {
         s.feed(b"\x1b[65535C\t");
         let (cx, _) = s.cursor();
         assert!(cx <= 9);                      // tab doesn't panic or overflow
+    }
+
+    #[test]
+    fn printing_at_a_pathological_pane_width_does_not_panic() {
+        // A resize to near u16::MAX + printing at the right edge must not overflow the cursor
+        // advance (debug builds panic on overflow); the grid stays sane.
+        let mut s = Screen::new(10, 2);
+        s.resize(u16::MAX, 1);
+        s.feed(b"\x1b[65534G");                 // cursor to the last column
+        s.feed("A世B".as_bytes());              // print incl. a wide glyph at the far edge
+        assert!(s.cursor().0 <= u16::MAX);       // no panic; cursor within bounds
     }
 
     #[test]

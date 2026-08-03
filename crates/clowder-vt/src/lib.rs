@@ -1,5 +1,8 @@
-//! Headless scanner for terminal attention signals (BEL, OSC 9, OSC 777) using the `vte`
-//! escape-sequence parser. No cell grid — just signal detection.
+//! Headless terminal parsing for the daemon, over the `vte` escape-sequence parser:
+//! - [`SignalScanner`] — attention signals only (BEL, OSC 9, OSC 777), no cell grid.
+//! - [`Screen`] — a visible-screen cell grid (glyphs + cursor + alt-screen) that also emits those
+//!   signals in a single parse pass, for content-based attention.
+//! - [`is_blocking_prompt`] — recognizes an interactive prompt from a rendered line.
 
 mod screen;
 pub use screen::Screen;
