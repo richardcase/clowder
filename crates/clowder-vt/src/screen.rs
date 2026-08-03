@@ -88,7 +88,7 @@ impl ScreenInner {
         if w == 0 {
             return; // drop combining / zero-width this milestone
         }
-        if self.cx + w > self.cols {
+        if self.cx.saturating_add(w) > self.cols {
             self.cx = 0;
             if self.cy + 1 >= self.rows { self.scroll_up(); } else { self.cy += 1; }
         }
@@ -175,7 +175,7 @@ impl vte::Perform for ScreenInner {
             0x0D => self.cx = 0,                            // CR
             0x08 => self.cx = self.cx.saturating_sub(1),    // BS
             0x09 => {                                       // HT -> next multiple of 8
-                let next = (self.cx / 8 + 1) * 8;
+                let next = (self.cx / 8).saturating_add(1).saturating_mul(8);
                 self.cx = next.min(self.cols.saturating_sub(1));
             }
             _ => {}
@@ -223,8 +223,8 @@ impl vte::Perform for ScreenInner {
         let max_y = self.rows.saturating_sub(1);
         match action {
             'A' => self.cy = self.cy.saturating_sub(p(0, 1)),
-            'B' => self.cy = (self.cy + p(0, 1)).min(max_y),
-            'C' => self.cx = (self.cx + p(0, 1)).min(max_x),
+            'B' => self.cy = self.cy.saturating_add(p(0, 1)).min(max_y),
+            'C' => self.cx = self.cx.saturating_add(p(0, 1)).min(max_x),
             'D' => self.cx = self.cx.saturating_sub(p(0, 1)),
             'G' => self.cx = p(0, 1).saturating_sub(1).min(max_x),
             'd' => self.cy = p(0, 1).saturating_sub(1).min(max_y),
@@ -338,6 +338,18 @@ mod tests {
         s.feed(b"\x1bM");            // RI at top -> scroll down
         assert_eq!(s.line(0), "");
         assert_eq!(s.line(1), "aa");
+    }
+
+    #[test]
+    fn huge_cursor_moves_do_not_panic() {
+        let mut s = Screen::new(10, 5);
+        s.feed(b"\x1b[65535C\x1b[65535B\x1b[65535A\x1b[65535D");
+        let (cx, cy) = s.cursor();
+        assert!(cx <= 9 && cy <= 4);           // clamped, no overflow panic
+        // and a tab / print at the far edge is also safe:
+        s.feed(b"\x1b[65535C\t");
+        let (cx, _) = s.cursor();
+        assert!(cx <= 9);                      // tab doesn't panic or overflow
     }
 
     #[test]
