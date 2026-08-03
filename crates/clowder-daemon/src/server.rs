@@ -1005,7 +1005,7 @@ mod tests {
     async fn attached_client_gets_attention_changed() {
         use clowder_proto::AttentionState;
         let daemon = Arc::new(Daemon::new());
-        let pane = daemon.spawn_pane(sh("sleep 5"), 80, 24).unwrap();
+        let pane = daemon.spawn_pane(sh("sleep 30"), 80, 24).unwrap();
 
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let d = daemon.clone();
@@ -1037,7 +1037,7 @@ mod tests {
     async fn attach_to_already_needy_pane_delivers_current_attention() {
         use clowder_proto::AttentionState;
         let daemon = Arc::new(Daemon::new());
-        let pane = daemon.spawn_pane(sh("sleep 5"), 80, 24).unwrap();
+        let pane = daemon.spawn_pane(sh("sleep 30"), 80, 24).unwrap();
         // Attention is set BEFORE the client attaches — the client must still learn it.
         daemon.set_attention(pane, AttentionState::NeedsInput);
 
