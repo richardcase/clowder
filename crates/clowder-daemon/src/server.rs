@@ -2239,4 +2239,82 @@ mod tests {
         daemon.shutdown();
         std::env::remove_var("CLOWDER_STATE_FILE");
     }
+
+    /// Spawn a hookless agent running `script` under /bin/sh with a short content-idle. Returns the
+    /// daemon, the agent id, and guards (tempdirs + the env lock) the caller must keep alive.
+    async fn spawn_hookless(
+        script: &str,
+    ) -> (Arc<Daemon>, PaneId, tempfile::TempDir, tempfile::TempDir, std::sync::MutexGuard<'static, ()>) {
+        use crate::{FakeNotifier, SyntheticAdapter};
+        use std::process::Command as PCommand;
+        use std::time::Duration;
+
+        let repo = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            assert!(PCommand::new("git").arg("-C").arg(repo.path()).args(args).status().unwrap().success());
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@t.test"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(repo.path().join("README.md"), b"hi").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-qm", "init"]);
+
+        let statedir = tempfile::tempdir().unwrap();
+        let lock = crate::STATE_FILE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("CLOWDER_STATE_FILE", statedir.path().join("agents.json"));
+
+        let mut d = Daemon::new_with(Arc::new(FakeNotifier::new()), "/tmp/unused-vt.sock".into());
+        d.content_idle = Duration::from_millis(40);
+        let daemon = Arc::new(d);
+        let adapter = SyntheticAdapter {
+            command: crate::PaneCommand {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), script.into()],
+                cwd: None, env: vec![],
+            },
+        };
+        let id = daemon.spawn_agent(repo.path(), &adapter, "demo").unwrap();
+        (daemon, id, repo, statedir, lock)
+    }
+
+    async fn wait_for(daemon: &Daemon, id: PaneId, want: AttentionState, ticks: u32) -> bool {
+        for _ in 0..ticks {
+            if daemon.attention_of(id) == Some(want) { return true; }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        daemon.attention_of(id) == Some(want)
+    }
+
+    #[tokio::test]
+    async fn bare_shell_prompt_does_not_escalate() {
+        let (daemon, id, _r, _s, _lock) = spawn_hookless("printf '$ '; sleep 30").await;
+        // Give the idle timer several windows to (not) fire.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_ne!(daemon.attention_of(id), Some(AttentionState::NeedsInput),
+            "a bare shell prompt must not read as NeedsInput");
+        daemon.shutdown();
+        std::env::remove_var("CLOWDER_STATE_FILE");
+    }
+
+    #[tokio::test]
+    async fn alt_screen_prompt_is_suppressed() {
+        // Enter alt-screen, then draw a (y/n): content-attention must be suppressed.
+        let (daemon, id, _r, _s, _lock) =
+            spawn_hookless("printf '\\033[?1049hContinue? (y/n) '; sleep 30").await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_ne!(daemon.attention_of(id), Some(AttentionState::NeedsInput),
+            "a prompt inside the alternate screen must be suppressed");
+        daemon.shutdown();
+        std::env::remove_var("CLOWDER_STATE_FILE");
+    }
+
+    #[tokio::test]
+    async fn bell_still_escalates_immediately() {
+        let (daemon, id, _r, _s, _lock) = spawn_hookless("printf '\\007'; sleep 30").await;
+        assert!(wait_for(&daemon, id, AttentionState::NeedsInput, 150).await,
+            "BEL must still escalate to NeedsInput");
+        daemon.shutdown();
+        std::env::remove_var("CLOWDER_STATE_FILE");
+    }
 }
