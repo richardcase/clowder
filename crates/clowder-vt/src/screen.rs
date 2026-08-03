@@ -31,6 +31,28 @@ impl Screen {
             .map(|r| r.iter().collect::<String>().trim_end().to_string())
             .unwrap_or_default()
     }
+
+    pub fn resize(&mut self, cols: u16, rows: u16) {
+        self.inner.resize(cols.max(1), rows.max(1));
+    }
+
+    pub fn is_alt_screen(&self) -> bool { self.inner.alt }
+
+    pub fn last_nonempty_line(&self) -> String {
+        for row in self.inner.grid.iter().rev() {
+            let t = row.iter().collect::<String>().trim_end().to_string();
+            if !t.is_empty() { return t; }
+        }
+        String::new()
+    }
+
+    pub fn snapshot(&self) -> Vec<String> {
+        self.inner
+            .grid
+            .iter()
+            .map(|r| r.iter().collect::<String>().trim_end().to_string())
+            .collect()
+    }
 }
 
 struct ScreenInner {
@@ -121,6 +143,27 @@ impl ScreenInner {
             _ => {}
         }
     }
+
+    fn clear(&mut self) {
+        self.grid.iter_mut().for_each(|row| row.iter_mut().for_each(|c| *c = ' '));
+    }
+
+    fn set_alt(&mut self, on: bool) {
+        if on != self.alt {
+            self.alt = on;
+            self.clear();          // clear on enter AND on leave
+            self.cx = 0;
+            self.cy = 0;
+        }
+    }
+
+    fn resize(&mut self, cols: u16, rows: u16) {
+        self.cols = cols;
+        self.rows = rows;
+        self.grid = vec![vec![' '; cols as usize]; rows as usize];
+        self.cx = self.cx.min(cols.saturating_sub(1));
+        self.cy = self.cy.min(rows.saturating_sub(1));
+    }
 }
 
 impl vte::Perform for ScreenInner {
@@ -141,8 +184,17 @@ impl vte::Perform for ScreenInner {
     fn put(&mut self, _byte: u8) {}
     fn unhook(&mut self) {}
     fn osc_dispatch(&mut self, _params: &[&[u8]], _bell_terminated: bool) {}
-    fn csi_dispatch(&mut self, params: &vte::Params, _intermediates: &[u8], _ignore: bool, action: char) {
+    fn csi_dispatch(&mut self, params: &vte::Params, intermediates: &[u8], _ignore: bool, action: char) {
         let ps: Vec<u16> = params.iter().map(|s| s.first().copied().unwrap_or(0)).collect();
+        if intermediates.first() == Some(&b'?') {
+            if action == 'h' || action == 'l' {
+                let on = action == 'h';
+                if ps.iter().any(|c| matches!(c, 1049 | 1047 | 47)) {
+                    self.set_alt(on);
+                }
+            }
+            return; // private modes are not cursor/erase ops
+        }
         // param i with default d applied when the value is 0/absent
         let p = |i: usize, d: u16| {
             let v = ps.get(i).copied().unwrap_or(0);
@@ -267,5 +319,36 @@ mod tests {
         s.feed(b"\x1bM");            // RI at top -> scroll down
         assert_eq!(s.line(0), "");
         assert_eq!(s.line(1), "aa");
+    }
+
+    #[test]
+    fn alt_screen_enter_clears_and_flags() {
+        let mut s = Screen::new(10, 2);
+        s.feed(b"normal");
+        assert!(!s.is_alt_screen());
+        s.feed(b"\x1b[?1049h");
+        assert!(s.is_alt_screen());
+        assert_eq!(s.line(0), "");                 // prior content hidden
+        s.feed(b"\x1b[?1049l");
+        assert!(!s.is_alt_screen());
+        assert_eq!(s.line(0), "");                 // cleared on leave too
+    }
+
+    #[test]
+    fn resize_reallocates_and_clamps_cursor() {
+        let mut s = Screen::new(10, 4);
+        s.feed(b"\x1b[4;9H");                       // cursor near bottom-right
+        s.resize(5, 2);
+        let (cx, cy) = s.cursor();
+        assert!(cx <= 4 && cy <= 1);
+        assert_eq!(s.line(0), "");
+    }
+
+    #[test]
+    fn last_nonempty_line_and_snapshot() {
+        let mut s = Screen::new(8, 3);
+        s.feed(b"first\r\n\r\n");                    // row0="first", rows 1-2 blank
+        assert_eq!(s.last_nonempty_line(), "first");
+        assert_eq!(s.snapshot(), vec!["first".to_string(), String::new(), String::new()]);
     }
 }
