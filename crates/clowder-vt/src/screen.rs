@@ -170,6 +170,7 @@ impl vte::Perform for ScreenInner {
     fn print(&mut self, c: char) { self.put_char(c); }
     fn execute(&mut self, byte: u8) {
         match byte {
+            0x07 => self.signals.push(AttentionSignal::Bell),   // BEL
             0x0A => self.line_feed(),                       // LF
             0x0D => self.cx = 0,                            // CR
             0x08 => self.cx = self.cx.saturating_sub(1),    // BS
@@ -183,7 +184,25 @@ impl vte::Perform for ScreenInner {
     fn hook(&mut self, _params: &vte::Params, _intermediates: &[u8], _ignore: bool, _action: char) {}
     fn put(&mut self, _byte: u8) {}
     fn unhook(&mut self) {}
-    fn osc_dispatch(&mut self, _params: &[&[u8]], _bell_terminated: bool) {}
+    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+        match params.first() {
+            Some(p) if *p == b"9" => {
+                let body = params
+                    .get(1)
+                    .map(|b| String::from_utf8_lossy(b).into_owned())
+                    .unwrap_or_default();
+                self.signals.push(AttentionSignal::Notify { title: String::new(), body });
+            }
+            Some(p) if *p == b"777" => {
+                if params.get(1).map(|b| *b == b"notify").unwrap_or(false) {
+                    let title = params.get(2).map(|b| String::from_utf8_lossy(b).into_owned()).unwrap_or_default();
+                    let body = params.get(3).map(|b| String::from_utf8_lossy(b).into_owned()).unwrap_or_default();
+                    self.signals.push(AttentionSignal::Notify { title, body });
+                }
+            }
+            _ => {}
+        }
+    }
     fn csi_dispatch(&mut self, params: &vte::Params, intermediates: &[u8], _ignore: bool, action: char) {
         let ps: Vec<u16> = params.iter().map(|s| s.first().copied().unwrap_or(0)).collect();
         if intermediates.first() == Some(&b'?') {
@@ -350,5 +369,32 @@ mod tests {
         s.feed(b"first\r\n\r\n");                    // row0="first", rows 1-2 blank
         assert_eq!(s.last_nonempty_line(), "first");
         assert_eq!(s.snapshot(), vec!["first".to_string(), String::new(), String::new()]);
+    }
+
+    #[test]
+    fn bell_is_a_signal_and_not_printed() {
+        let mut s = Screen::new(10, 1);
+        assert_eq!(s.feed(b"a\x07b"), vec![AttentionSignal::Bell]);
+        assert_eq!(s.line(0), "ab");   // BEL doesn't occupy a cell
+    }
+
+    #[test]
+    fn osc9_and_osc777_notify() {
+        let mut s = Screen::new(10, 1);
+        assert_eq!(
+            s.feed(b"\x1b]9;hello\x07"),
+            vec![AttentionSignal::Notify { title: String::new(), body: "hello".into() }]
+        );
+        let mut s2 = Screen::new(10, 1);
+        assert_eq!(
+            s2.feed(b"\x1b]777;notify;Title;Body\x1b\\"),
+            vec![AttentionSignal::Notify { title: "Title".into(), body: "Body".into() }]
+        );
+    }
+
+    #[test]
+    fn title_osc_is_ignored_by_screen() {
+        let mut s = Screen::new(20, 1);
+        assert_eq!(s.feed(b"\x1b]0;my window title\x07"), vec![]);
     }
 }
