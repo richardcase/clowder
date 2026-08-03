@@ -3,6 +3,8 @@
 
 mod screen;
 pub use screen::Screen;
+mod prompt;
+pub use prompt::is_blocking_prompt;
 
 /// An attention-worthy signal found in a pane's output.
 #[derive(Debug, Clone, PartialEq, Eq)]
