@@ -7,6 +7,7 @@ pub mod notify;
 pub mod attention;
 pub mod control_json;
 pub mod remote;
+pub mod remote_tls;
 pub mod registry;
 mod split_tree;
 pub use agent::{
