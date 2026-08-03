@@ -11,6 +11,7 @@ async fn main() -> Result<()> {
     let sock_path = config.client_sock.clone();
     let control_path = config.control_sock.clone();
     let remote_listen = config.remote_listen.clone();
+    let config_remote_tls = config.remote_tls;
     let daemon = Arc::new(Daemon::new_from_config(config));
     let hook_path = daemon.hook_sock().to_path_buf();
 
@@ -63,10 +64,23 @@ async fn main() -> Result<()> {
         if clowder_daemon::remote::should_warn_exposed(&addr) {
             tracing::warn!(%addr, "remote listener bound to a non-loopback/non-tailnet address — Phase A has NO authentication; expose only behind a trusted tunnel (SSH -L / Tailscale)");
         }
+        // Fail closed: if TLS is enabled but credential setup fails, refuse to start the
+        // remote listener rather than silently falling back to plaintext.
+        let tls = if config_remote_tls {
+            let creds = clowder_daemon::remote_tls::load_or_generate()
+                .map_err(|e| anyhow::anyhow!("[remote] tls enabled but credential setup failed: {e}"))?;
+            tracing::info!(
+                "remote TLS enabled — token: {}  cert fingerprint (sha256): {}",
+                creds.token, clowder_daemon::remote_tls::fingerprint(&creds)
+            );
+            Some(clowder_daemon::remote::build_remote_tls(&creds)?)
+        } else {
+            None
+        };
         tracing::info!(%addr, "clowder-daemon remote TCP listener enabled");
         let remote = daemon.clone();
         tokio::spawn(async move {
-            if let Some(line) = clowder_daemon::logging::conn_error_line("remote server", remote.serve_remote(tcp).await) {
+            if let Some(line) = clowder_daemon::logging::conn_error_line("remote server", remote.serve_remote(tcp, tls).await) {
                 tracing::error!("{line}");
             }
         });

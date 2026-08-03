@@ -17,6 +17,8 @@ pub struct Config {
     pub default_rows: u16,
     pub remote_listen: Option<String>,
     pub remote_host: Option<String>,
+    pub remote_tls: bool,
+    pub remote_token: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -30,7 +32,7 @@ struct Sockets { client: Option<PathBuf>, control: Option<PathBuf>, hook: Option
 #[derive(Debug, Default, Deserialize)]
 struct PaneCfg { backlog_cap: Option<usize>, shell: Option<String>, cols: Option<u16>, rows: Option<u16> }
 #[derive(Debug, Default, Deserialize)]
-struct Remote { listen: Option<String>, host: Option<String> }
+struct Remote { listen: Option<String>, host: Option<String>, tls: Option<bool>, token: Option<String> }
 
 impl Config {
     /// Load `$XDG_CONFIG_HOME/clowder/config.toml` (else `$HOME/.config/clowder/config.toml`), then apply
@@ -49,6 +51,14 @@ impl Config {
         // Per-user runtime dir for sockets: $XDG_RUNTIME_DIR › $TMPDIR › /tmp (mirrors the daemon's
         // single-instance PID lock dir). Env socket vars still override below.
         let nonempty = |k: &str| get_env(k).filter(|v| !v.is_empty());
+        // parses CLOWDER_REMOTE_TLS: "1"/"true" → Some(true), "0"/"false" → Some(false), else None
+        let env_bool = |k: &str| {
+            get_env(k).and_then(|v| match v.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" => Some(true),
+                "0" | "false" => Some(false),
+                _ => None,
+            })
+        };
         let runtime_dir = nonempty("XDG_RUNTIME_DIR")
             .or_else(|| nonempty("TMPDIR"))
             .unwrap_or_else(|| "/tmp".to_string());
@@ -70,6 +80,8 @@ impl Config {
             // (rather than failing to parse `""` as a socket address at startup).
             remote_listen: nonempty("CLOWDER_LISTEN").or(r.listen.filter(|s| !s.is_empty())),
             remote_host: nonempty("CLOWDER_REMOTE_HOST").or(r.host.filter(|s| !s.is_empty())),
+            remote_tls: env_bool("CLOWDER_REMOTE_TLS").unwrap_or(r.tls.unwrap_or(false)),
+            remote_token: nonempty("CLOWDER_REMOTE_TOKEN").or(r.token.filter(|s| !s.is_empty())),
         }
     }
 }
@@ -92,6 +104,17 @@ fn read_file(path: PathBuf) -> Option<FileConfig> {
         Err(e) => { eprintln!("clowder-config: ignoring invalid {}: {e}", path.display()); None }
     }
 }
+
+/// The durable per-user dir holding remote TLS creds: `$XDG_STATE_HOME/clowder` › `$HOME/.local/state/clowder` › `/tmp/clowder`.
+pub fn remote_state_dir() -> PathBuf {
+    let base = std::env::var("XDG_STATE_HOME").ok().filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("HOME").ok().map(|h| format!("{h}/.local/state")))
+        .unwrap_or_else(|| "/tmp".to_string());
+    PathBuf::from(base).join("clowder")
+}
+pub fn remote_cert_path() -> PathBuf { remote_state_dir().join("remote-cert.pem") }
+pub fn remote_key_path() -> PathBuf { remote_state_dir().join("remote-key.pem") }
+pub fn remote_token_path() -> PathBuf { remote_state_dir().join("remote-token") }
 
 #[cfg(test)]
 mod tests {
@@ -166,35 +189,53 @@ mod tests {
     #[test]
     fn remote_listen_env_over_file_then_none() {
         // env wins over file
-        let f = FileConfig { remote: Some(Remote { listen: Some("127.0.0.1:1".into()), host: None }), ..Default::default() };
+        let f = FileConfig { remote: Some(Remote { listen: Some("127.0.0.1:1".into()), host: None, ..Default::default() }), ..Default::default() };
         let env = |k: &str| (k == "CLOWDER_LISTEN").then(|| "127.0.0.1:2".to_string());
         assert_eq!(Config::resolve(f, &env).remote_listen.as_deref(), Some("127.0.0.1:2"));
 
         // file only
-        let f2 = FileConfig { remote: Some(Remote { listen: Some("127.0.0.1:3".into()), host: None }), ..Default::default() };
+        let f2 = FileConfig { remote: Some(Remote { listen: Some("127.0.0.1:3".into()), host: None, ..Default::default() }), ..Default::default() };
         assert_eq!(Config::resolve(f2, &|_| None).remote_listen.as_deref(), Some("127.0.0.1:3"));
 
         // neither → None (TCP off)
         assert_eq!(Config::resolve(FileConfig::default(), &|_| None).remote_listen, None);
 
         // an empty file value is "off", not Some("") (which would fail to parse/bind later)
-        let f3 = FileConfig { remote: Some(Remote { listen: Some("".into()), host: None }), ..Default::default() };
+        let f3 = FileConfig { remote: Some(Remote { listen: Some("".into()), host: None, ..Default::default() }), ..Default::default() };
         assert_eq!(Config::resolve(f3, &|_| None).remote_listen, None);
     }
 
     #[test]
     fn remote_host_env_over_file_then_none() {
-        let f = FileConfig { remote: Some(Remote { listen: None, host: Some("h:1".into()) }), ..Default::default() };
+        let f = FileConfig { remote: Some(Remote { listen: None, host: Some("h:1".into()), ..Default::default() }), ..Default::default() };
         let env = |k: &str| (k == "CLOWDER_REMOTE_HOST").then(|| "h:2".to_string());
         assert_eq!(Config::resolve(f, &env).remote_host.as_deref(), Some("h:2"));
 
-        let f2 = FileConfig { remote: Some(Remote { listen: None, host: Some("h:3".into()) }), ..Default::default() };
+        let f2 = FileConfig { remote: Some(Remote { listen: None, host: Some("h:3".into()), ..Default::default() }), ..Default::default() };
         assert_eq!(Config::resolve(f2, &|_| None).remote_host.as_deref(), Some("h:3"));
 
         assert_eq!(Config::resolve(FileConfig::default(), &|_| None).remote_host, None);
 
         // empty file value is "off"
-        let f4 = FileConfig { remote: Some(Remote { listen: None, host: Some("".into()) }), ..Default::default() };
+        let f4 = FileConfig { remote: Some(Remote { listen: None, host: Some("".into()), ..Default::default() }), ..Default::default() };
         assert_eq!(Config::resolve(f4, &|_| None).remote_host, None);
+    }
+
+    #[test]
+    fn remote_tls_and_token_resolve_env_over_file() {
+        let f = FileConfig { remote: Some(Remote {
+            listen: None, host: None, tls: Some(true), token: Some("filetok".into()),
+        }), ..Default::default() };
+        let env = |k: &str| match k { "CLOWDER_REMOTE_TOKEN" => Some("envtok".to_string()), _ => None };
+        let c = Config::resolve(f, &env);
+        assert!(c.remote_tls);
+        assert_eq!(c.remote_token.as_deref(), Some("envtok"));
+    }
+
+    #[test]
+    fn remote_tls_defaults_false_and_token_none() {
+        let c = Config::resolve(FileConfig::default(), &|_| None);
+        assert!(!c.remote_tls);
+        assert_eq!(c.remote_token, None);
     }
 }

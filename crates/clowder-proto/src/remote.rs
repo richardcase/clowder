@@ -25,19 +25,36 @@ impl Channel {
     }
 }
 
-/// Write the one-byte channel hello that prefixes a remote connection.
-pub async fn write_hello<W: AsyncWrite + Unpin>(w: &mut W, channel: Channel) -> Result<()> {
+/// Write the channel hello (channel byte + length-prefixed optional token) that prefixes a
+/// remote connection. The token is present only on the TLS path; plaintext sends `None`.
+pub async fn write_hello<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    channel: Channel,
+    token: Option<&str>,
+) -> Result<()> {
     w.write_u8(channel.to_byte()).await?;
+    let bytes = token.map(str::as_bytes).unwrap_or(&[]);
+    if bytes.len() > u16::MAX as usize {
+        bail!("hello token too long");
+    }
+    w.write_u16(bytes.len() as u16).await?;
+    w.write_all(bytes).await?;
     w.flush().await?;
     Ok(())
 }
 
-/// Read the one-byte channel hello from the start of a remote connection.
-/// `read_u8` reads exactly one byte (no over-read), so the remaining stream stays
-/// correctly framed for the channel body.
-pub async fn read_hello<R: AsyncRead + Unpin>(r: &mut R) -> Result<Channel> {
-    let b = r.read_u8().await?;
-    Channel::from_byte(b)
+/// Read the channel hello + optional token. Bounds the token length so a hostile peer cannot
+/// force a large allocation.
+pub async fn read_hello<R: AsyncRead + Unpin>(r: &mut R) -> Result<(Channel, Option<String>)> {
+    let channel = Channel::from_byte(r.read_u8().await?)?;
+    let len = r.read_u16().await? as usize;
+    if len > 4096 {
+        bail!("hello token length {len} exceeds limit");
+    }
+    let mut buf = vec![0u8; len];
+    r.read_exact(&mut buf).await?;
+    let token = if len == 0 { None } else { Some(String::from_utf8(buf)?) };
+    Ok((channel, token))
 }
 
 #[cfg(test)]
@@ -45,11 +62,16 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn hello_roundtrips_both_channels() {
-        for ch in [Channel::Control, Channel::Render] {
+    async fn hello_roundtrips_channel_and_token() {
+        for (ch, tok) in [
+            (Channel::Control, None),
+            (Channel::Render, Some("s3cr3t-token".to_string())),
+        ] {
             let (mut a, mut b) = tokio::io::duplex(64);
-            write_hello(&mut a, ch).await.unwrap();
-            assert_eq!(read_hello(&mut b).await.unwrap(), ch);
+            write_hello(&mut a, ch, tok.as_deref()).await.unwrap();
+            let (rch, rtok) = read_hello(&mut b).await.unwrap();
+            assert_eq!(rch, ch);
+            assert_eq!(rtok, tok);
         }
     }
 
