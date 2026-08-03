@@ -1008,7 +1008,7 @@ mod tests {
 
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let d = daemon.clone();
-        let jh = tokio::spawn(async move { d.handle_conn(server_io).await });
+        tokio::spawn(async move { d.handle_conn(server_io).await.unwrap() });
 
         let mut client = MsgStream::<_>::new(client_io);
         client.send(&ClientToDaemon::Attach { pane }).await.unwrap();
@@ -1020,24 +1020,13 @@ mod tests {
 
         let mut got = None;
         for _ in 0..50 {
-            match tokio::time::timeout(Duration::from_millis(50), client.recv::<DaemonToClient>()).await {
-                Ok(Ok(Some(msg))) => {
-                    eprintln!("DBG client saw {msg:?}");
-                    if let DaemonToClient::AttentionChanged { state, .. } = msg {
-                        got = Some(state);
-                        break;
-                    }
+            if let Ok(Ok(Some(msg))) =
+                tokio::time::timeout(Duration::from_millis(50), client.recv::<DaemonToClient>()).await
+            {
+                if let DaemonToClient::AttentionChanged { state, .. } = msg {
+                    got = Some(state);
+                    break;
                 }
-                Ok(Ok(None)) => { eprintln!("DBG client stream ended (None)"); break; }
-                Ok(Err(e)) => { eprintln!("DBG client recv error {e:?}"); break; }
-                Err(_) => {} // timeout, keep polling
-            }
-        }
-        if got.is_none() {
-            eprintln!("DBG handle_conn finished before delivering? {:?}", jh.is_finished());
-            if jh.is_finished() {
-                let res = jh.await;
-                eprintln!("DBG handle_conn result: {res:?}");
             }
         }
         assert_eq!(got, Some(AttentionState::NeedsInput));
