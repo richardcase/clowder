@@ -268,9 +268,12 @@ dependencies = [
  "clowder-proto",
  "clowder-workspace",
  "crossterm",
+ "rustls",
+ "rustls-pemfile",
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-rustls",
 ]
 
 [[package]]

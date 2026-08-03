@@ -29,21 +29,41 @@ pub async fn dial_with_backoff(host: &str) -> Result<TcpStream> {
 }
 
 /// Forward one local connection to the remote daemon: dial, send the channel hello, then
-/// pipe bytes both ways until either side closes.
-pub async fn forward_stream<L>(mut local: L, host: &str, channel: Channel) -> Result<()>
+/// pipe bytes both ways until either side closes. Dials TLS (with TOFU cert verification) when
+/// `token` is `Some` — a token implies the operator configured `[remote] tls=true` on the daemon
+/// side — and sends the token in the hello; dials plaintext with no token otherwise.
+pub async fn forward_stream<L>(
+    mut local: L,
+    host: &str,
+    channel: Channel,
+    token: Option<&str>,
+) -> Result<()>
 where
     L: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let mut remote = dial_with_backoff(host).await?;
-    write_hello(&mut remote, channel).await?;
+    let tcp = dial_with_backoff(host).await?;
+    let mut remote: Box<dyn RemoteStream> = match token {
+        Some(_) => {
+            let connector = tokio_rustls::TlsConnector::from(crate::tofu::connector(host));
+            let name = tokio_rustls::rustls::pki_types::ServerName::try_from("clowder")
+                .map_err(|e| anyhow::anyhow!("server name: {e}"))?;
+            Box::new(connector.connect(name, tcp).await?)
+        }
+        None => Box::new(tcp),
+    };
+    write_hello(&mut remote, channel, token).await?;
     tokio::io::copy_bidirectional(&mut local, &mut remote).await?;
     Ok(())
 }
 
+/// Object-safe alias so the TLS and plaintext streams can share one path.
+trait RemoteStream: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> RemoteStream for T {}
+
 /// Bind the local render + control Unix sockets under `dir` and forward every connection to the
 /// remote daemon at `host` (render → Channel::Render, control → Channel::Control). Prints the two
 /// paths so callers can point CLOWDER_SOCK / CLOWDER_CONTROL_SOCK at them.
-pub async fn forward(host: String, dir: PathBuf) -> Result<()> {
+pub async fn forward(host: String, dir: PathBuf, token: Option<String>) -> Result<()> {
     std::fs::create_dir_all(&dir)?;
     let render_path = dir.join("clowder.sock");
     let control_path = dir.join("clowder-control.sock");
@@ -56,7 +76,7 @@ pub async fn forward(host: String, dir: PathBuf) -> Result<()> {
     println!("  export CLOWDER_SOCK={}", render_path.display());
     println!("  export CLOWDER_CONTROL_SOCK={}", control_path.display());
 
-    let accept = |listener: UnixListener, host: String, channel: Channel| async move {
+    let accept = |listener: UnixListener, host: String, channel: Channel, token: Option<String>| async move {
         loop {
             let (stream, _) = match listener.accept().await {
                 Ok(v) => v,
@@ -67,8 +87,9 @@ pub async fn forward(host: String, dir: PathBuf) -> Result<()> {
                 }
             };
             let host = host.clone();
+            let token = token.clone();
             tokio::spawn(async move {
-                if let Err(e) = forward_stream(stream, &host, channel).await {
+                if let Err(e) = forward_stream(stream, &host, channel, token.as_deref()).await {
                     eprintln!("clowder connect: {channel:?} connection ended: {e}");
                 }
             });
@@ -76,8 +97,8 @@ pub async fn forward(host: String, dir: PathBuf) -> Result<()> {
     };
 
     tokio::select! {
-        _ = accept(render, host.clone(), Channel::Render) => Ok(()),
-        _ = accept(control, host, Channel::Control) => Ok(()),
+        _ = accept(render, host.clone(), Channel::Render, token.clone()) => Ok(()),
+        _ = accept(control, host, Channel::Control, token) => Ok(()),
     }
 }
 
@@ -87,7 +108,8 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
-    // A fake remote: reads the 1-byte hello, records it, then echoes the rest back.
+    // A fake remote: reads the full channel hello (channel byte + length-prefixed optional
+    // token), records the channel byte, then echoes the rest back.
     async fn echo_remote_recording_hello(
     ) -> (std::net::SocketAddr, tokio::sync::oneshot::Receiver<u8>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -95,7 +117,11 @@ mod tests {
         let (tx, rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let (mut sock, _) = listener.accept().await.unwrap();
-            let hello = sock.read_u8().await.unwrap();
+            let (channel, _token) = clowder_proto::read_hello(&mut sock).await.unwrap();
+            let hello = match channel {
+                Channel::Control => 1u8,
+                Channel::Render => 2u8,
+            };
             let _ = tx.send(hello);
             let mut buf = [0u8; 64];
             loop {
@@ -117,7 +143,7 @@ mod tests {
         let (addr, hello_rx) = echo_remote_recording_hello().await;
         let (mut client, server) = tokio::io::duplex(4096); // client = test side, server = forwarder's local side
         let fwd = tokio::spawn(async move {
-            forward_stream(server, &addr.to_string(), Channel::Control).await
+            forward_stream(server, &addr.to_string(), Channel::Control, None).await
         });
 
         client.write_all(b"ping").await.unwrap();
@@ -146,7 +172,7 @@ mod tests {
         let dirpath = dir.path().to_path_buf();
         let host = addr.to_string();
 
-        let srv = tokio::spawn(async move { forward(host, dirpath).await });
+        let srv = tokio::spawn(async move { forward(host, dirpath, None).await });
         // wait for the control socket to exist
         let ctl = dir.path().join("clowder-control.sock");
         for _ in 0..50 { if ctl.exists() { break; } tokio::time::sleep(Duration::from_millis(20)).await; }

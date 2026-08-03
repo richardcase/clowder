@@ -27,7 +27,7 @@ async fn main() -> Result<()> {
             let dir = cfg.control_sock.parent()
                 .ok_or_else(|| anyhow!("cannot derive forwarder socket dir"))?
                 .join("remote");
-            clowder_client::forward::forward(host, dir).await
+            clowder_client::forward::forward(host, dir, cfg.remote_token).await
         }
         Some("remote-host") => {
             // Print the resolved [remote] host (or an empty line) so the macOS app can decide
@@ -35,8 +35,21 @@ async fn main() -> Result<()> {
             println!("{}", clowder_config::Config::load().remote_host.unwrap_or_default());
             Ok(())
         }
+        Some("remote-token") => {
+            let tok_p = clowder_config::remote_token_path();
+            let cert_p = clowder_config::remote_cert_path();
+            let token = std::fs::read_to_string(&tok_p)
+                .map_err(|e| anyhow!("no remote token at {} ({e}); start the daemon with [remote] tls=true first", tok_p.display()))?;
+            let cert_pem = std::fs::read_to_string(&cert_p)?;
+            let mut rd = std::io::BufReader::new(cert_pem.as_bytes());
+            let mut certs = rustls_pemfile::certs(&mut rd);
+            let der = certs.next().ok_or_else(|| anyhow!("no cert"))??.to_vec();
+            println!("token:       {}", token.trim());
+            println!("fingerprint: {}", clowder_proto::cert_fingerprint_hex(&der));
+            Ok(())
+        }
         // Legacy: `clowder <pane-id>` still attaches.
         Some(other) if other.parse::<u64>().is_ok() => attach(other.parse().unwrap()).await,
-        _ => Err(anyhow!("usage: clowder <spawn|attach|connect|remote-host> ...")),
+        _ => Err(anyhow!("usage: clowder <spawn|attach|connect|remote-host|remote-token> ...")),
     }
 }
