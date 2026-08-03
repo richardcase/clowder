@@ -67,6 +67,9 @@ jobs:
       - name: Rust tests (whole workspace)
         run: cargo test --workspace --locked
 
+      - name: Rust tests — load-sensitive (ignored, serial)
+        run: cargo test --workspace --locked -- --ignored --test-threads=1
+
       - name: Swift tests (ClowderCore)
         run: swift test
         working-directory: macos
