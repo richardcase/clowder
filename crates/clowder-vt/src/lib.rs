@@ -1,6 +1,9 @@
 //! Headless scanner for terminal attention signals (BEL, OSC 9, OSC 777) using the `vte`
 //! escape-sequence parser. No cell grid — just signal detection.
 
+mod screen;
+pub use screen::Screen;
+
 /// An attention-worthy signal found in a pane's output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AttentionSignal {
