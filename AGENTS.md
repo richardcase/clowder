@@ -66,6 +66,8 @@ Config file: `$XDG_CONFIG_HOME/clowder/config.toml` (else `~/.config/clowder/con
 `CLOWDER_BACKLOG_CAP` (default 262144), `SHELL`, default 80×24. The app runs `clowder attach <pane>` in a
 libghostty surface. **Adapters:** `claude` (Claude Code), `codex` (OpenAI Codex), `shell` (plain shell,
 no hooks). The `clowder` CLI: `clowder spawn <project> <task> [adapter]` and `clowder attach <pane-id>`.
+An optional remote TCP listener (`[remote] listen`/`host`) can be hardened with `[remote] tls`/`token`
+(bearer-token auth + TOFU-pinned TLS) — see `docs/remote-tls.md` for setup and the threat model.
 
 ## Gotchas
 
