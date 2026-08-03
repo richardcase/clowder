@@ -1075,15 +1075,11 @@ mod tests {
         // Expect a PaneExited to arrive (rather than the session hanging forever).
         let mut exited = false;
         for _ in 0..100 {
-            if let Ok(Ok(Some(msg))) =
-                tokio::time::timeout(Duration::from_millis(50), client.recv::<DaemonToClient>()).await
-            {
-                if let DaemonToClient::PaneExited { .. } = msg {
-                    exited = true;
-                    break;
-                }
-            } else {
-                break; // stream closed
+            match tokio::time::timeout(Duration::from_millis(100), client.recv::<DaemonToClient>()).await {
+                Ok(Ok(Some(DaemonToClient::PaneExited { .. }))) => { exited = true; break; }
+                Ok(Ok(Some(_))) => {}                 // Attached / Output / AttentionChanged
+                Ok(Ok(None)) | Ok(Err(_)) => break,   // stream closed / recv error
+                Err(_) => continue,                    // 100ms window elapsed; keep polling
             }
         }
         assert!(exited, "client never received PaneExited on child exit");
