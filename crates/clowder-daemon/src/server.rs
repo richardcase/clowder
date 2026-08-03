@@ -734,12 +734,19 @@ impl Daemon {
         };
 
         let (cols, rows) = pane.size();
+        // Subscribe to attention BEFORE sending Attached/backlog: a state change triggered right
+        // after the client observes the attach must be buffered by the subscription, not dropped
+        // (the old subscribe-after-backlog order lost it under load).
+        let mut att_rx = self.subscribe_attention();
         msgs.send(&DaemonToClient::Attached { pane: pane.id(), cols, rows }).await?;
+        // Deliver the current attention state so a client attaching to an already-needy agent
+        // learns it immediately (future changes still arrive via `att_rx` in the loop below).
+        if let Some(state) = self.attention_of(pane.id()) {
+            msgs.send(&DaemonToClient::AttentionChanged { pane: pane.id(), state }).await?;
+        }
 
         let (snap, mut sub) = pane.snapshot_and_subscribe();
         msgs.send(&DaemonToClient::Output { pane: pane.id(), bytes: snap }).await?;
-
-        let mut att_rx = self.subscribe_attention();
 
         loop {
             tokio::select! {
@@ -1001,7 +1008,7 @@ mod tests {
 
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let d = daemon.clone();
-        tokio::spawn(async move { d.handle_conn(server_io).await.unwrap() });
+        let jh = tokio::spawn(async move { d.handle_conn(server_io).await });
 
         let mut client = MsgStream::<_>::new(client_io);
         client.send(&ClientToDaemon::Attach { pane }).await.unwrap();
@@ -1013,16 +1020,55 @@ mod tests {
 
         let mut got = None;
         for _ in 0..50 {
-            if let Ok(Ok(Some(msg))) =
-                tokio::time::timeout(Duration::from_millis(50), client.recv::<DaemonToClient>()).await
-            {
-                if let DaemonToClient::AttentionChanged { state, .. } = msg {
-                    got = Some(state);
-                    break;
+            match tokio::time::timeout(Duration::from_millis(50), client.recv::<DaemonToClient>()).await {
+                Ok(Ok(Some(msg))) => {
+                    eprintln!("DBG client saw {msg:?}");
+                    if let DaemonToClient::AttentionChanged { state, .. } = msg {
+                        got = Some(state);
+                        break;
+                    }
                 }
+                Ok(Ok(None)) => { eprintln!("DBG client stream ended (None)"); break; }
+                Ok(Err(e)) => { eprintln!("DBG client recv error {e:?}"); break; }
+                Err(_) => {} // timeout, keep polling
+            }
+        }
+        if got.is_none() {
+            eprintln!("DBG handle_conn finished before delivering? {:?}", jh.is_finished());
+            if jh.is_finished() {
+                let res = jh.await;
+                eprintln!("DBG handle_conn result: {res:?}");
             }
         }
         assert_eq!(got, Some(AttentionState::NeedsInput));
+    }
+
+    #[tokio::test]
+    async fn attach_to_already_needy_pane_delivers_current_attention() {
+        use clowder_proto::AttentionState;
+        let daemon = Arc::new(Daemon::new());
+        let pane = daemon.spawn_pane(sh("sleep 5"), 80, 24).unwrap();
+        // Attention is set BEFORE the client attaches — the client must still learn it.
+        daemon.set_attention(pane, AttentionState::NeedsInput);
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let d = daemon.clone();
+        tokio::spawn(async move { d.handle_conn(server_io).await.unwrap() });
+
+        let mut client = MsgStream::<_>::new(client_io);
+        client.send(&ClientToDaemon::Attach { pane }).await.unwrap();
+
+        // Within the first few frames after Attach, an AttentionChanged{NeedsInput} must arrive.
+        let mut got = None;
+        for _ in 0..50 {
+            match tokio::time::timeout(Duration::from_millis(50), client.recv::<DaemonToClient>()).await {
+                Ok(Ok(Some(DaemonToClient::AttentionChanged { state, .. }))) => { got = Some(state); break; }
+                Ok(Ok(Some(_))) => {}                 // Attached / Output
+                Ok(Ok(None)) | Ok(Err(_)) => break,
+                Err(_) => continue,
+            }
+        }
+        assert_eq!(got, Some(AttentionState::NeedsInput), "attaching client must learn current attention");
     }
 
     #[tokio::test]
