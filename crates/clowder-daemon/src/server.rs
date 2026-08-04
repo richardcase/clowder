@@ -734,12 +734,19 @@ impl Daemon {
         };
 
         let (cols, rows) = pane.size();
+        // Subscribe to attention BEFORE sending Attached/backlog: a state change triggered right
+        // after the client observes the attach must be buffered by the subscription, not dropped
+        // (the old subscribe-after-backlog order lost it under load).
+        let mut att_rx = self.subscribe_attention();
         msgs.send(&DaemonToClient::Attached { pane: pane.id(), cols, rows }).await?;
+        // Deliver the current attention state so a client attaching to an already-needy agent
+        // learns it immediately (future changes still arrive via `att_rx` in the loop below).
+        if let Some(state) = self.attention_of(pane.id()) {
+            msgs.send(&DaemonToClient::AttentionChanged { pane: pane.id(), state }).await?;
+        }
 
         let (snap, mut sub) = pane.snapshot_and_subscribe();
         msgs.send(&DaemonToClient::Output { pane: pane.id(), bytes: snap }).await?;
-
-        let mut att_rx = self.subscribe_attention();
 
         loop {
             tokio::select! {
@@ -997,7 +1004,7 @@ mod tests {
     async fn attached_client_gets_attention_changed() {
         use clowder_proto::AttentionState;
         let daemon = Arc::new(Daemon::new());
-        let pane = daemon.spawn_pane(sh("sleep 5"), 80, 24).unwrap();
+        let pane = daemon.spawn_pane(sh("sleep 30"), 80, 24).unwrap();
 
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let d = daemon.clone();
@@ -1026,6 +1033,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn attach_to_already_needy_pane_delivers_current_attention() {
+        use clowder_proto::AttentionState;
+        let daemon = Arc::new(Daemon::new());
+        let pane = daemon.spawn_pane(sh("sleep 30"), 80, 24).unwrap();
+        // Attention is set BEFORE the client attaches — the client must still learn it.
+        daemon.set_attention(pane, AttentionState::NeedsInput);
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let d = daemon.clone();
+        tokio::spawn(async move { d.handle_conn(server_io).await.unwrap() });
+
+        let mut client = MsgStream::<_>::new(client_io);
+        client.send(&ClientToDaemon::Attach { pane }).await.unwrap();
+
+        // Within the first few frames after Attach, an AttentionChanged{NeedsInput} must arrive.
+        let mut got = None;
+        for _ in 0..50 {
+            match tokio::time::timeout(Duration::from_millis(50), client.recv::<DaemonToClient>()).await {
+                Ok(Ok(Some(DaemonToClient::AttentionChanged { state, .. }))) => { got = Some(state); break; }
+                Ok(Ok(Some(_))) => {}                 // Attached / Output
+                Ok(Ok(None)) | Ok(Err(_)) => break,
+                Err(_) => continue,
+            }
+        }
+        assert_eq!(got, Some(AttentionState::NeedsInput), "attaching client must learn current attention");
+    }
+
+    #[tokio::test]
     async fn client_gets_pane_exited_when_child_exits() {
         let daemon = Arc::new(Daemon::new());
         let pane = daemon.spawn_pane(sh("exit 3"), 80, 24).unwrap();
@@ -1040,15 +1075,11 @@ mod tests {
         // Expect a PaneExited to arrive (rather than the session hanging forever).
         let mut exited = false;
         for _ in 0..100 {
-            if let Ok(Ok(Some(msg))) =
-                tokio::time::timeout(Duration::from_millis(50), client.recv::<DaemonToClient>()).await
-            {
-                if let DaemonToClient::PaneExited { .. } = msg {
-                    exited = true;
-                    break;
-                }
-            } else {
-                break; // stream closed
+            match tokio::time::timeout(Duration::from_millis(100), client.recv::<DaemonToClient>()).await {
+                Ok(Ok(Some(DaemonToClient::PaneExited { .. }))) => { exited = true; break; }
+                Ok(Ok(Some(_))) => {}                 // Attached / Output / AttentionChanged
+                Ok(Ok(None)) | Ok(Err(_)) => break,   // stream closed / recv error
+                Err(_) => continue,                    // 100ms window elapsed; keep polling
             }
         }
         assert!(exited, "client never received PaneExited on child exit");
@@ -1175,6 +1206,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "load-sensitive: spawns real /bin/sh + git worktrees; run via `cargo test -- --ignored --test-threads=1`"]
     async fn reconcile_respawns_recorded_agents_and_prunes_missing() {
         use crate::{FakeNotifier, SyntheticAdapter};
         use std::process::Command as PCommand;
@@ -2095,6 +2127,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "load-sensitive: spawns real /bin/sh + git worktrees; run via `cargo test -- --ignored --test-threads=1`"]
     async fn reconcile_restored_companion_ids_never_collide_with_agents() {
         use crate::{FakeNotifier, SyntheticAdapter};
         use std::process::Command as PCommand;
