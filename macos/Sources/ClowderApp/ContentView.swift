@@ -64,7 +64,12 @@ struct ContentView: View {
     }
 
     private var sidebar: some View {
-        List(selection: $model.selectedPane) {
+        // Stopgap: this sidebar still lists worktrees only, so a worktree-only binding is
+        // exactly right until Task 6 replaces this view with a SidebarSelection-tagged list.
+        List(selection: Binding(
+            get: { model.selectedPane },
+            set: { model.selection = $0.map(SidebarSelection.worktree) }
+        )) {
             ForEach(model.store.byProject, id: \.project) { group in
                 Section(header: Text(projectLabel(group.project))) {
                     ForEach(group.worktrees) { agent in

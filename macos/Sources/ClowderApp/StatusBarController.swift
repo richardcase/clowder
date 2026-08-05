@@ -63,7 +63,7 @@ final class StatusBarController: NSObject {
     }
 
     @objc private func selectAgent(_ sender: NSMenuItem) {
-        if let pane = sender.representedObject as? UInt64 { appModel.selectedPane = pane }
+        if let pane = sender.representedObject as? UInt64 { appModel.selection = .worktree(pane) }
         showWindow()
     }
     @objc private func showWindowAction() { showWindow() }

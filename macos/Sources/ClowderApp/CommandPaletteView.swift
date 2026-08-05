@@ -80,7 +80,7 @@ struct CommandPaletteView: View {
         guard results.indices.contains(selectedIndex) else { return }
         switch results[selectedIndex].kind {
         case let .command(id): model.run(id)
-        case let .agent(pane): model.selectedPane = pane
+        case let .agent(pane): model.selection = .worktree(pane)
         }
         close()
     }
