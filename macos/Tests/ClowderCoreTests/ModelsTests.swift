@@ -2,10 +2,10 @@ import XCTest
 @testable import ClowderCore
 
 final class ModelsTests: XCTestCase {
-    func testDecodeAgentList() throws {
-        let json = #"{"type":"agentList","agents":[{"pane":2,"project":"clowder","task":"t","state":"NeedsInput"}]}"#
+    func testDecodeWorktreeList() throws {
+        let json = #"{"type":"worktreeList","worktrees":[{"pane":2,"project":"clowder","name":"t","branch":"clowder/t","state":"NeedsInput"}]}"#
         let ev = try JSONDecoder().decode(ControlEvent.self, from: Data(json.utf8))
-        XCTAssertEqual(ev, .agentList([AgentInfo(pane: 2, project: "clowder", task: "t", state: .needsInput)]))
+        XCTAssertEqual(ev, .worktreeList([WorktreeInfo(pane: 2, project: "clowder", name: "t", branch: "clowder/t", state: .needsInput)]))
     }
 
     func testDecodeAttentionChangedExited() throws {
@@ -21,11 +21,6 @@ final class ModelsTests: XCTestCase {
         XCTAssertEqual(spawned, .agentSpawned(pane: 3))
     }
 
-    func testEncodeListAgentsRequest() throws {
-        let data = try JSONEncoder().encode(ControlRequest.listAgents)
-        XCTAssertEqual(String(decoding: data, as: UTF8.self), #"{"type":"listAgents"}"#)
-    }
-
     func testEncodeSpawnAgentRequest() throws {
         let data = try JSONEncoder().encode(ControlRequest.spawnAgent(project: "/p", task: "t", adapter: "shell"))
         let s = String(decoding: data, as: UTF8.self)
@@ -36,5 +31,24 @@ final class ModelsTests: XCTestCase {
     func testUnknownEventTypeThrows() {
         XCTAssertThrowsError(
             try JSONDecoder().decode(ControlEvent.self, from: Data(#"{"type":"bogus"}"#.utf8)))
+    }
+
+    func testWorktreeListDecodesNameAndBranch() throws {
+        let json = #"{"type":"worktreeList","worktrees":[{"pane":2,"project":"/Users/x/code/clowder","name":"task-a","branch":"clowder/task-a","state":"NeedsInput"}]}"#
+        let ev = try JSONDecoder().decode(ControlEvent.self, from: Data(json.utf8))
+        guard case let .worktreeList(list) = ev else {
+            return XCTFail("expected worktreeList, got \(ev)")
+        }
+        XCTAssertEqual(list.count, 1)
+        XCTAssertEqual(list[0].pane, 2)
+        XCTAssertEqual(list[0].project, "/Users/x/code/clowder")
+        XCTAssertEqual(list[0].name, "task-a")
+        XCTAssertEqual(list[0].branch, "clowder/task-a")
+        XCTAssertEqual(list[0].state, .needsInput)
+    }
+
+    func testListWorktreesRequestEncodesTypeOnly() throws {
+        let data = try JSONEncoder().encode(ControlRequest.listWorktrees)
+        XCTAssertEqual(String(decoding: data, as: UTF8.self), #"{"type":"listWorktrees"}"#)
     }
 }

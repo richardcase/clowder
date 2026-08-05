@@ -9,18 +9,24 @@ public enum AttentionState: String, Codable, Equatable, Sendable {
     case exited = "Exited"
 }
 
-/// Mirrors the Rust `AgentInfo` (`pane` is a bare number).
-public struct AgentInfo: Codable, Identifiable, Equatable, Sendable {
+/// Mirrors the Rust `WorktreeInfo` (`pane` is a bare number). One worktree under a project;
+/// the agent is a process inside it, so `state` is that process's attention.
+public struct WorktreeInfo: Codable, Identifiable, Equatable, Sendable {
     public let pane: UInt64
+    /// Full path to the project root (NOT a basename).
     public let project: String
-    public let task: String
+    /// The worktree's name — also the suffix of its branch.
+    public let name: String
+    /// `clowder/<name>`.
+    public let branch: String
     public var state: AttentionState
     public var id: UInt64 { pane }
 
-    public init(pane: UInt64, project: String, task: String, state: AttentionState) {
+    public init(pane: UInt64, project: String, name: String, branch: String, state: AttentionState) {
         self.pane = pane
         self.project = project
-        self.task = task
+        self.name = name
+        self.branch = branch
         self.state = state
     }
 }
@@ -37,7 +43,7 @@ public struct AdapterInfo: Codable, Identifiable, Equatable, Sendable {
 
 /// GUI/CLI → daemon. Custom `Encodable` for the internally-tagged JSON shape.
 public enum ControlRequest: Encodable, Equatable, Sendable {
-    case listAgents
+    case listWorktrees
     case listAdapters
     case spawnAgent(project: String, task: String, adapter: String)
     case splitPane(pane: UInt64, direction: SplitDirection)
@@ -52,8 +58,8 @@ public enum ControlRequest: Encodable, Equatable, Sendable {
     public func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
         switch self {
-        case .listAgents:
-            try c.encode("listAgents", forKey: .type)
+        case .listWorktrees:
+            try c.encode("listWorktrees", forKey: .type)
         case .listAdapters:
             try c.encode("listAdapters", forKey: .type)
         case let .spawnAgent(project, task, adapter):
@@ -87,7 +93,7 @@ public enum ControlRequest: Encodable, Equatable, Sendable {
 
 /// daemon → GUI/CLI. Custom `Decodable` discriminating on `type`.
 public enum ControlEvent: Decodable, Equatable, Sendable {
-    case agentList([AgentInfo])
+    case worktreeList([WorktreeInfo])
     case adapterList([AdapterInfo])
     case attentionChanged(pane: UInt64, state: AttentionState)
     case agentRemoved(pane: UInt64)
@@ -95,14 +101,14 @@ public enum ControlEvent: Decodable, Equatable, Sendable {
     case error(message: String)
     case splitTreeChanged(agent: UInt64, tree: PaneTree)
 
-    private enum CodingKeys: String, CodingKey { case type, agents, adapters, pane, state, message, agent, tree }
+    private enum CodingKeys: String, CodingKey { case type, worktrees, adapters, pane, state, message, agent, tree }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         let type = try c.decode(String.self, forKey: .type)
         switch type {
-        case "agentList":
-            self = .agentList(try c.decode([AgentInfo].self, forKey: .agents))
+        case "worktreeList":
+            self = .worktreeList(try c.decode([WorktreeInfo].self, forKey: .worktrees))
         case "adapterList":
             self = .adapterList(try c.decode([AdapterInfo].self, forKey: .adapters))
         case "attentionChanged":

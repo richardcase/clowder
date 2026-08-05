@@ -92,20 +92,20 @@ extension StatusBarController: NSMenuDelegate {
         }
         menu.addItem(.separator())
 
-        let needy = appModel.store.agentsNeedingAttention
+        let needy = appModel.store.worktreesNeedingAttention
         if needy.isEmpty {
             let item = NSMenuItem(title: "No agents need attention", action: nil, keyEquivalent: "")
             item.isEnabled = false
             menu.addItem(item)
         } else {
-            for agent in needy {
-                let proj = (agent.project as NSString).lastPathComponent
-                let name = proj.isEmpty ? agent.project : proj
-                let marker = agent.state == .needsInput ? "🔴" : "🔵"   // NeedsInput vs Completed
-                let item = NSMenuItem(title: "\(marker) \(name) — \(agent.task)",
+            for worktree in needy {
+                let proj = (worktree.project as NSString).lastPathComponent
+                let projName = proj.isEmpty ? worktree.project : proj
+                let marker = worktree.state == .needsInput ? "🔴" : "🔵"   // NeedsInput vs Completed
+                let item = NSMenuItem(title: "\(marker) \(projName) — \(worktree.name)",
                                       action: #selector(selectAgent(_:)), keyEquivalent: "")
                 item.target = self
-                item.representedObject = agent.pane
+                item.representedObject = worktree.pane
                 menu.addItem(item)
             }
         }

@@ -50,8 +50,8 @@ struct ContentView: View {
             Button("Cancel", role: .cancel) { model.cancelLifecycle() }
         } message: { pending in
             Text(pending.action == .discard
-                 ? "Deletes branch clowder/\(pending.task) and its work. This can't be undone."
-                 : "Finalizes the work onto branch clowder/\(pending.task) and removes the agent.")
+                 ? "Deletes branch clowder/\(pending.name) and its work. This can't be undone."
+                 : "Finalizes the work onto branch clowder/\(pending.name) and removes the agent.")
         }
     }
 
@@ -67,12 +67,12 @@ struct ContentView: View {
         List(selection: $model.selectedPane) {
             ForEach(model.store.byProject, id: \.project) { group in
                 Section(header: Text(projectLabel(group.project))) {
-                    ForEach(group.agents) { agent in
+                    ForEach(group.worktrees) { agent in
                         HStack(spacing: 8) {
                             Circle()
                                 .fill(color(for: agent.state))
                                 .frame(width: 8, height: 8)
-                            Text(agent.task).lineLimit(1)
+                            Text(agent.name).lineLimit(1)
                             Spacer()
                         }
                         .tag(agent.pane)
@@ -81,14 +81,14 @@ struct ContentView: View {
             }
         }
         .overlay {
-            if model.store.agents.isEmpty && model.connectionState == .live {
+            if model.store.worktrees.isEmpty && model.connectionState == .live {
                 Text("No agents yet — spawn one with +").foregroundStyle(.secondary)
             }
         }
     }
 
     @ViewBuilder private var detail: some View {
-        if let pane = model.selectedPane, let agent = model.store.agents[pane] {
+        if let pane = model.selectedPane, let agent = model.store.worktrees[pane] {
             if agent.state == .exited {
                 // The agent's process is gone: its `clowder attach` has exited and libghostty
                 // would otherwise sit on "Process exited. Press any key to close." Show a
@@ -106,13 +106,13 @@ struct ContentView: View {
         }
     }
 
-    private func exitedPlaceholder(_ agent: AgentInfo) -> some View {
+    private func exitedPlaceholder(_ worktree: WorktreeInfo) -> some View {
         VStack(spacing: 8) {
             Image(systemName: "moon.zzz.fill")
                 .font(.largeTitle)
                 .foregroundStyle(.secondary)
             Text("Agent exited").font(.title3)
-            Text(agent.task).foregroundStyle(.secondary)
+            Text(worktree.name).foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }

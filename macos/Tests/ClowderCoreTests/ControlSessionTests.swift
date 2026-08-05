@@ -14,22 +14,22 @@ final class ControlSessionTests: XCTestCase {
     func testInboundAgentListUpdatesStore() {
         let t = FakeTransport()
         let s = ControlSession(transport: t)
-        t.feed(#"{"type":"agentList","agents":[{"pane":1,"project":"p","task":"t","state":"Working"}]}"#)
-        XCTAssertEqual(s.store.agents[1]?.task, "t")
+        t.feed(#"{"type":"worktreeList","worktrees":[{"pane":1,"project":"p","name":"t","branch":"clowder/t","state":"Working"}]}"#)
+        XCTAssertEqual(s.store.worktrees[1]?.name, "t")
     }
 
     func testUnknownPaneEventTriggersListAgentsSend() {
         let t = FakeTransport()
         let session = ControlSession(transport: t)
         t.feed(#"{"type":"attentionChanged","pane":42,"state":"Working"}"#)
-        XCTAssertEqual(t.sent, [#"{"type":"listAgents"}"#])
+        XCTAssertEqual(t.sent, [#"{"type":"listWorktrees"}"#])
     }
 
     func testAgentSpawnedTriggersListAgentsSend() {
         let t = FakeTransport()
         let session = ControlSession(transport: t)
         t.feed(#"{"type":"agentSpawned","pane":7}"#)
-        XCTAssertEqual(t.sent, [#"{"type":"listAgents"}"#])
+        XCTAssertEqual(t.sent, [#"{"type":"listWorktrees"}"#])
     }
 
     func testSendSpawnAgentEncodesRequest() throws {
@@ -45,7 +45,7 @@ final class ControlSessionTests: XCTestCase {
         let s = ControlSession(transport: t)
         t.feed("not json")
         t.feed("")
-        XCTAssertTrue(s.store.agents.isEmpty)
+        XCTAssertTrue(s.store.worktrees.isEmpty)
         XCTAssertTrue(t.sent.isEmpty)
     }
 }

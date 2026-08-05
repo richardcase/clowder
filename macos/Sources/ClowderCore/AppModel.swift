@@ -8,11 +8,11 @@ public enum LifecycleAction: Equatable, Sendable { case land, discard }
 public struct PendingLifecycle: Equatable, Sendable {
     public let action: LifecycleAction
     public let pane: UInt64
-    public let task: String
-    public init(action: LifecycleAction, pane: UInt64, task: String) {
+    public let name: String
+    public init(action: LifecycleAction, pane: UInt64, name: String) {
         self.action = action
         self.pane = pane
-        self.task = task
+        self.name = name
     }
 }
 
@@ -110,7 +110,7 @@ public final class AppModel: ObservableObject {
         self.connection = transport
         self.session = session
         connectionState = .live
-        try session.send(.listAgents)
+        try session.send(.listWorktrees)
         try session.send(.listAdapters)
     }
 
@@ -159,7 +159,7 @@ public final class AppModel: ObservableObject {
 
     /// Select the 1-based Nth agent in the ordered list (Cmd-N). No-op if out of range.
     public func selectAgent(atIndex index: Int) {
-        let ordered = store.orderedAgents
+        let ordered = store.orderedWorktrees
         guard index >= 1, index <= ordered.count else { return }
         selectedPane = ordered[index - 1].pane
     }
@@ -167,7 +167,7 @@ public final class AppModel: ObservableObject {
     /// Select the next agent needing input after the current selection, cycling. If the
     /// current selection isn't needy, select the first needy one; no-op if none need input.
     public func selectNextAttention() {
-        let needy = store.orderedAgents.filter { $0.state == .needsInput }
+        let needy = store.orderedWorktrees.filter { $0.state == .needsInput }
         guard !needy.isEmpty else { return }
         if let cur = selectedPane, let idx = needy.firstIndex(where: { $0.pane == cur }) {
             selectedPane = needy[(idx + 1) % needy.count].pane
@@ -236,8 +236,8 @@ public final class AppModel: ObservableObject {
 
     /// Begin a Land/Discard: capture the selected agent + task and await confirmation.
     public func requestLifecycle(_ action: LifecycleAction) {
-        guard let pane = selectedPane, let agent = store.agents[pane] else { return }
-        pendingLifecycle = PendingLifecycle(action: action, pane: pane, task: agent.task)
+        guard let pane = selectedPane, let worktree = store.worktrees[pane] else { return }
+        pendingLifecycle = PendingLifecycle(action: action, pane: pane, name: worktree.name)
     }
 
     /// Confirmed: send the request and clear.

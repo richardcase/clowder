@@ -7,7 +7,7 @@ final class LifecycleTests: XCTestCase {
         let fake = FakeControlTransport()
         let model = AppModel(makeTransport: { fake })
         model.connect()
-        fake.deliver(#"{"type":"agentList","agents":[{"pane":1,"project":"/p","task":"fix-bug","state":"Completed"}]}"#)
+        fake.deliver(#"{"type":"worktreeList","worktrees":[{"pane":1,"project":"/p","name":"fix-bug","branch":"clowder/fix-bug","state":"Completed"}]}"#)
         model.selectedPane = 1
         return (model, fake)
     }
@@ -24,7 +24,7 @@ final class LifecycleTests: XCTestCase {
     func testRunLandSetsPendingConfirmationAndDoesNotSend() {
         let (model, fake) = modelWithAgent()
         model.run(.landAgent)
-        XCTAssertEqual(model.pendingLifecycle, PendingLifecycle(action: .land, pane: 1, task: "fix-bug"))
+        XCTAssertEqual(model.pendingLifecycle, PendingLifecycle(action: .land, pane: 1, name: "fix-bug"))
         XCTAssertFalse(fake.sentLines.contains { $0.contains("\"type\":\"landAgent\"") }, "must not send before confirm")
     }
 

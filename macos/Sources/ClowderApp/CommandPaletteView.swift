@@ -11,7 +11,7 @@ struct CommandPaletteView: View {
     private var results: [PaletteItem] {
         paletteResults(query: query,
                        commands: CommandRegistry.all(keymap: keymap),
-                       agents: model.store.orderedAgents)
+                       worktrees: model.store.orderedWorktrees)
     }
 
     var body: some View {

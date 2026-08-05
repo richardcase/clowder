@@ -3,9 +3,9 @@ import Combine
 
 /// The client-side agent model. Refresh-driven: events that can't fully hydrate a
 /// row (a pane-only `agentSpawned`, or any event for an unknown pane) set `needsRefresh`,
-/// which the session/UI answers with a `ControlRequest.listAgents`.
+/// which the session/UI answers with a `ControlRequest.listWorktrees`.
 public final class AgentStore: ObservableObject {
-    @Published public private(set) var agents: [UInt64: AgentInfo] = [:]
+    @Published public private(set) var worktrees: [UInt64: WorktreeInfo] = [:]
     @Published public private(set) var needsRefresh: Bool = false
     @Published public private(set) var lastError: String?
     @Published public private(set) var trees: [UInt64: PaneTree] = [:]
@@ -18,22 +18,22 @@ public final class AgentStore: ObservableObject {
 
     public func apply(_ event: ControlEvent) {
         switch event {
-        case let .agentList(list):
-            agents = Dictionary(uniqueKeysWithValues: list.map { ($0.pane, $0) })
+        case let .worktreeList(list):
+            worktrees = Dictionary(uniqueKeysWithValues: list.map { ($0.pane, $0) })
             needsRefresh = false
         case let .adapterList(list):
             adapters = list
         case let .attentionChanged(pane, state):
-            if var a = agents[pane] {
+            if var a = worktrees[pane] {
                 a.state = state
-                agents[pane] = a
+                worktrees[pane] = a
             } else {
                 needsRefresh = true // unknown pane — re-list to learn about it
             }
         case .agentSpawned:
-            needsRefresh = true // pane-only — re-list to hydrate project/task/state
+            needsRefresh = true // pane-only — re-list to hydrate project/name/state
         case let .agentRemoved(pane):
-            agents[pane] = nil
+            worktrees[pane] = nil
             trees[pane] = nil          // no per-companion AgentRemoved; drop the agent's tree
         case let .error(message):
             lastError = message
@@ -50,29 +50,29 @@ public final class AgentStore: ObservableObject {
     /// Drop all per-backend state (used when the app swaps between the local daemon and the remote
     /// forwarder). Adapters fall back to the default until the new connection reports its own list.
     public func reset() {
-        agents = [:]
+        worktrees = [:]
         trees = [:]
         lastError = nil
         needsRefresh = false
         adapters = AgentStore.defaultAdapters
     }
 
-    /// Agents grouped by project (projects sorted; agents within a project sorted by pane).
-    public var byProject: [(project: String, agents: [AgentInfo])] {
-        Dictionary(grouping: agents.values, by: { $0.project })
-            .map { (project: $0.key, agents: $0.value.sorted { $0.pane < $1.pane }) }
+    /// Worktrees grouped by project (projects sorted; worktrees within a project sorted by pane).
+    public var byProject: [(project: String, worktrees: [WorktreeInfo])] {
+        Dictionary(grouping: worktrees.values, by: { $0.project })
+            .map { (project: $0.key, worktrees: $0.value.sorted { $0.pane < $1.pane }) }
             .sorted { $0.project < $1.project }
     }
 
-    /// The sidebar order flattened: agents grouped by project, projects sorted, agents by pane.
+    /// The sidebar order flattened: worktrees grouped by project, projects sorted, worktrees by pane.
     /// The stable index order used by Cmd-1…9 and the palette.
-    public var orderedAgents: [AgentInfo] { byProject.flatMap { $0.agents } }
+    public var orderedWorktrees: [WorktreeInfo] { byProject.flatMap { $0.worktrees } }
 
-    /// Agents that want a response — NeedsInput or Completed — in sidebar order.
-    public var agentsNeedingAttention: [AgentInfo] {
-        orderedAgents.filter { $0.state == .needsInput || $0.state == .completed }
+    /// Worktrees that want a response — NeedsInput or Completed — in sidebar order.
+    public var worktreesNeedingAttention: [WorktreeInfo] {
+        orderedWorktrees.filter { $0.state == .needsInput || $0.state == .completed }
     }
 
-    /// How many agents need attention (the menu-bar count).
-    public var attentionCount: Int { agentsNeedingAttention.count }
+    /// How many worktrees need attention (the menu-bar count).
+    public var attentionCount: Int { worktreesNeedingAttention.count }
 }

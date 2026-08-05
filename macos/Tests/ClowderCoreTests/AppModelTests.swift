@@ -34,7 +34,7 @@ final class AppModelTests: XCTestCase {
         let model = AppModel(makeTransport: { fake })
         model.connect()
         XCTAssertEqual(model.connectionState, .live)
-        XCTAssertTrue(fake.sentLines.contains { $0.contains("\"type\":\"listAgents\"") })
+        XCTAssertTrue(fake.sentLines.contains { $0.contains("\"type\":\"listWorktrees\"") })
     }
 
     func testConnectFailureBecomesClosed() {
@@ -80,16 +80,16 @@ final class AppModelTests: XCTestCase {
         let first = FakeControlTransport()
         let model = AppModel(makeTransport: { first })
         model.connect()
-        first.deliver(#"{"type":"agentList","agents":[{"pane":1,"project":"/p","task":"t","state":"Working"}]}"#)
-        XCTAssertFalse(model.store.agents.isEmpty)
+        first.deliver(#"{"type":"worktreeList","worktrees":[{"pane":1,"project":"/p","name":"t","branch":"clowder/t","state":"Working"}]}"#)
+        XCTAssertFalse(model.store.worktrees.isEmpty)
 
         let second = FakeControlTransport()
         model.reconnect(makeTransport: { second })
 
         XCTAssertTrue(first.disconnected)                                  // old backend torn down
-        XCTAssertTrue(model.store.agents.isEmpty)                          // old agents dropped
+        XCTAssertTrue(model.store.worktrees.isEmpty)                       // old worktrees dropped
         XCTAssertEqual(model.connectionState, .live)                      // connected to the new transport
-        XCTAssertTrue(second.sentLines.contains { $0.contains("\"type\":\"listAgents\"") })  // hydrated the new one
+        XCTAssertTrue(second.sentLines.contains { $0.contains("\"type\":\"listWorktrees\"") })  // hydrated the new one
         model.shutdown()
     }
 
@@ -102,7 +102,7 @@ final class AppModelTests: XCTestCase {
 
         store.reset()
 
-        XCTAssertTrue(store.agents.isEmpty)
+        XCTAssertTrue(store.worktrees.isEmpty)
         XCTAssertTrue(store.trees.isEmpty)
         XCTAssertNil(store.lastError)
         XCTAssertFalse(store.needsRefresh)                          // no stale refresh into the new session
@@ -132,8 +132,8 @@ final class AppModelTests: XCTestCase {
         let fake = FakeControlTransport()
         let model = AppModel(makeTransport: { fake })
         model.connect()
-        fake.deliver(#"{"type":"agentList","agents":[{"pane":1,"project":"/p","task":"t","state":"Working"}]}"#)
-        XCTAssertEqual(model.store.agents[1]?.task, "t")
+        fake.deliver(#"{"type":"worktreeList","worktrees":[{"pane":1,"project":"/p","name":"t","branch":"clowder/t","state":"Working"}]}"#)
+        XCTAssertEqual(model.store.worktrees[1]?.name, "t")
     }
 
     func testStoreMutationRepublishesThroughModel() {
@@ -143,7 +143,7 @@ final class AppModelTests: XCTestCase {
         let exp = expectation(description: "model republished on store mutation")
         exp.assertForOverFulfill = false
         let c = model.objectWillChange.sink { _ in exp.fulfill() }
-        fake.deliver(#"{"type":"agentList","agents":[{"pane":1,"project":"/p","task":"t","state":"Working"}]}"#)
+        fake.deliver(#"{"type":"worktreeList","worktrees":[{"pane":1,"project":"/p","name":"t","branch":"clowder/t","state":"Working"}]}"#)
         wait(for: [exp], timeout: 1.0)
         c.cancel()
     }
@@ -180,7 +180,7 @@ final class AppModelTests: XCTestCase {
         XCTAssertTrue(wentLive)
 
         XCTAssertEqual(transports.count, 2)
-        XCTAssertTrue(transports[1].sentLines.contains { $0.contains("\"type\":\"listAgents\"") })
+        XCTAssertTrue(transports[1].sentLines.contains { $0.contains("\"type\":\"listWorktrees\"") })
         XCTAssertTrue(transports[1].sentLines.contains { $0.contains("\"type\":\"listAdapters\"") })
         model.shutdown()
     }

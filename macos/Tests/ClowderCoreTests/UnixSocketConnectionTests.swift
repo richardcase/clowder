@@ -29,28 +29,28 @@ final class UnixSocketConnectionTests: XCTestCase {
         let serverFd = listenSocket(at: path)
         defer { close(serverFd); unlink(path) }
 
-        let serverGotRequest = expectation(description: "server received listAgents")
+        let serverGotRequest = expectation(description: "server received listWorktrees")
         DispatchQueue.global().async {
             let conn = accept(serverFd, nil, nil)
             precondition(conn >= 0)
             var buf = [UInt8](repeating: 0, count: 1024)
             let n = read(conn, &buf, buf.count)
-            if n > 0, String(decoding: buf[0..<n], as: UTF8.self).contains("listAgents") {
+            if n > 0, String(decoding: buf[0..<n], as: UTF8.self).contains("listWorktrees") {
                 serverGotRequest.fulfill()
             }
-            let reply = #"{"type":"agentList","agents":[{"pane":1,"project":"p","task":"t","state":"Working"}]}"# + "\n"
+            let reply = #"{"type":"worktreeList","worktrees":[{"pane":1,"project":"p","name":"t","branch":"clowder/t","state":"Working"}]}"# + "\n"
             _ = reply.withCString { write(conn, $0, strlen($0)) }
             Thread.sleep(forTimeInterval: 0.2)
             close(conn)
         }
 
         let conn = try UnixSocketConnection(path: path)
-        let deliveredOnMain = expectation(description: "agentList delivered on main")
+        let deliveredOnMain = expectation(description: "worktreeList delivered on main")
         conn.setReceiver { line in
             XCTAssertTrue(Thread.isMainThread, "receiver must run on the main thread")
-            if line.contains("agentList") { deliveredOnMain.fulfill() }
+            if line.contains("worktreeList") { deliveredOnMain.fulfill() }
         }
-        try conn.send(line: #"{"type":"listAgents"}"#)
+        try conn.send(line: #"{"type":"listWorktrees"}"#)
 
         wait(for: [serverGotRequest, deliveredOnMain], timeout: 5.0)
     }
