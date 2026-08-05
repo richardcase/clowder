@@ -87,6 +87,11 @@ pub struct Daemon {
     /// then provisions for hundreds of milliseconds before it appears in `agents`; without this,
     /// a concurrent `remove_project` counts zero worktrees and removes a project out from under a
     /// live agent. Held across the WHOLE of each operation, not just the check.
+    ///
+    /// Lock ordering: this is the OUTERMOST lock of the pair. `remove_project` takes
+    /// `project_terms` (and, via `forget_project_terminal`, other per-pane maps) while already
+    /// holding this one — so nothing reachable from inside a `project_mutation`-guarded section
+    /// may re-acquire `project_mutation` itself.
     project_mutation: Mutex<()>,
 }
 
@@ -2872,7 +2877,7 @@ mod tests {
         assert!(d.list_projects().is_empty());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn remove_project_cannot_race_a_spawn_into_it() {
         use crate::SyntheticAdapter;
         use std::sync::Arc as StdArc;
