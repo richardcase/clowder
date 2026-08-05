@@ -1340,3 +1340,54 @@ If Step 2 found a mismatch, fix it and commit with a message naming the mismatch
 - `AgentStore` is still named for agents though it now holds projects, worktrees, trees and adapters. Renaming it touches every test file; worth doing once the stack has landed.
 - `PaletteItemKind.agent(pane:)` names a palette row, not the domain type — left alone deliberately.
 - M10b's deferred items not addressed here: `ProjectTerminalOpened` is still not broadcast to other clients, and the four `*_via_control` CLI helpers still have no timeout. Both are recorded in M10b's plan.
+
+---
+
+## Carried forward from the M10c whole-branch review
+
+**Needs a human click before this is trusted.** The final review found two Critical defects that no static
+check could reach, and the environment could not drive the GUI (no Screen Recording / Accessibility
+permission). These three remain unverified by direct observation:
+
+1. **Does clicking a project row select the project**, or does the click only toggle the disclosure
+   triangle? Both `.tag()` values are `Hashable` `SidebarSelection`, so a silent type mismatch is ruled
+   out — but "clicking a project never selects it" would take out the whole project-terminal feature.
+2. **Does the per-project `+` create a worktree** end to end.
+3. **Does Restart Agent show a live agent** rather than the dead "Process exited" screen. The fix
+   (`SurfaceHost.forget(pane:)` at both entry points) is correct by inspection; the visual is unconfirmed.
+
+**Still open, deliberately:**
+
+- **`land`/`discard` on a *companion* pane** still falls through to `finish_agent`, which removes
+  `owner[companion]` without `remove_leaf`, leaving a phantom leaf that `reap_companion` cannot heal.
+  Unreachable from the app (`requestLifecycle` only ever passes the selection root); reachable from the
+  CLI. Carried from M10b's notes — do not let this evaporate now the stack has closed.
+- **The name-case fixture's residual gap:** adding a brand-new validation rule that flips none of the
+  existing cases fails neither language's test. Judged acceptable — the realistic failure mode is
+  *changing* a rule, which is caught, and the uncaught mode fails safe (Swift too permissive, daemon
+  still authoritative, user sees the daemon's message). The convention note now lives above
+  `validate_workspace_name` and in `docs/protocol/README.md`.
+- **The daemon's control loop does blocking syscalls on runtime threads** without `spawn_blocking`.
+  Pre-existing and much larger than M10; `project_mutation` makes it marginally more visible, not worse.
+- **`ProjectTerminalOpened` is not broadcast** — closed as won't-fix. Traced against the real UI: every
+  client obtains the mapping from its own direct reply, because the only trigger for needing it is that
+  client selecting the project, and open is idempotent.
+
+## How this plan failed, for the next one
+
+Its self-review caught three defects before execution, and execution caught more. But the final review
+found two Criticals it never anticipated, and the second is the instructive one:
+
+**Task 7 was an end-to-end verification task whose inputs came from the plan, not from the code.** Its
+brief said "send each request the app sends" and then listed them — from the plan's own model of the
+app. The implementer faithfully sent that list, including `listProjects`, which the app never actually
+sent. A verification task that reproduces the plan's assumptions cannot detect that the plan was wrong.
+**Derive verification inputs from the code under test** — grep what the app actually sends — or the task
+only confirms the plan agrees with itself.
+
+The controller also repeated two false environment claims for three PRs ("`swift test` builds ClowderCore
+only"; "`swift build` is impossible, libghostty is absent"). Both came from reading `AGENTS.md`, which
+describes a *fresh clone*, and never checking the actual machine — where the 189 MB archive was already
+built. Two implementers reported the truth before it was believed. **Verify environment claims against
+the environment, not the docs**, and treat a subagent contradicting a standing assumption as evidence
+rather than error.
