@@ -8,8 +8,8 @@ use std::sync::Mutex;
 
 /// A durable `Vec<T>` held in one JSON file, written atomically.
 ///
-/// All mutation goes through `mutate`, which holds `write_lock` across the whole
-/// load-modify-write. The daemon is the sole writer, but its control handlers run as
+/// All mutation goes through `mutate` or `mutate_if`, both of which hold `write_lock` across
+/// the whole load-modify-write. The daemon is the sole writer, but its control handlers run as
 /// concurrent Tokio tasks (app, CLI, remote client), so two unsynchronized load-append-write
 /// cycles would race and drop one update. One `Arc<JsonStore>` is shared per file, and a
 /// single-instance flock guarantees one daemon, so this in-process mutex is the whole story.
@@ -48,6 +48,19 @@ impl<T: Serialize + DeserializeOwned> JsonStore<T> {
             tracing::warn!("failed to persist state file {}: {e}", self.path.display());
         }
         out
+    }
+
+    /// Like `mutate`, but skips the write when `f` returns false — so a caller that
+    /// finds nothing to change costs no I/O.
+    pub fn mutate_if(&self, f: impl FnOnce(&mut Vec<T>) -> bool) {
+        let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut all = self.load();
+        if !f(&mut all) {
+            return;
+        }
+        if let Err(e) = self.try_write(&all) {
+            tracing::warn!("failed to persist state file {}: {e}", self.path.display());
+        }
     }
 
     fn try_write(&self, all: &[T]) -> Result<()> {
@@ -103,6 +116,28 @@ mod tests {
         std::fs::write(&p, b"not json").unwrap();
         let store: JsonStore<Item> = JsonStore::new(p);
         assert!(store.load().is_empty(), "must never panic on a corrupt file");
+    }
+
+    #[test]
+    fn mutate_if_false_does_not_touch_the_filesystem() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("items.json");
+        let store: JsonStore<Item> = JsonStore::new(p.clone());
+        // The closure finds nothing to change and returns false: mutate_if must not create
+        // the file at all (a fresh path is an unambiguous signal — no mtime-granularity races).
+        store.mutate_if(|_all| false);
+        assert!(!p.exists(), "mutate_if must not write when the closure reports no change");
+    }
+
+    #[test]
+    fn mutate_if_true_persists_the_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: JsonStore<Item> = JsonStore::new(dir.path().join("items.json"));
+        store.mutate_if(|all| {
+            all.push(Item { id: 1, label: "a".into() });
+            true
+        });
+        assert_eq!(store.load(), vec![Item { id: 1, label: "a".into() }]);
     }
 
     #[test]

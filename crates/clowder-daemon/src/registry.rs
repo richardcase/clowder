@@ -55,13 +55,16 @@ impl Registry {
         self.store.mutate(|all| all.retain(|r| r.agent_id != agent_id));
     }
 
-    /// Update just one agent's persisted split tree (no-op if the agent isn't in the registry —
-    /// e.g. it was landed between a tree change and this call).
+    /// Update just one agent's persisted split tree. If `agent_id` isn't in the registry — e.g.
+    /// it was landed between a tree change and this call — this is a true no-op: no write, no
+    /// mtime bump, no disk I/O.
     pub fn set_tree(&self, agent_id: u64, tree: Option<PaneTree>) {
-        self.store.mutate(|all| {
-            if let Some(rec) = all.iter_mut().find(|r| r.agent_id == agent_id) {
+        self.store.mutate_if(|all| match all.iter_mut().find(|r| r.agent_id == agent_id) {
+            Some(rec) => {
                 rec.tree = tree;
+                true
             }
+            None => false,
         });
     }
 }
