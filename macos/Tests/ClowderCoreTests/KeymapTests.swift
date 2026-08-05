@@ -77,6 +77,32 @@ final class KeymapTests: XCTestCase {
         XCTAssertTrue(m.showingNewWorktree)
     }
 
+    func testRunNewWorktreePrefillsProjectFromProjectSelection() {
+        let m = makeModel()
+        m.store.apply(.projectAdded(ProjectInfo(path: "/code/alpha", name: "alpha", kind: "git")))
+        m.selection = .project("/code/alpha")
+        m.run(.newWorktree)
+        XCTAssertEqual(m.newWorktreeProject, "/code/alpha")
+    }
+
+    func testClosePaneIsEnabledOnlyForAFocusedCompanion() {
+        let m = makeModel()
+        m.store.apply(.projectList([ProjectInfo(path: "/p", name: "p", kind: "git")]))
+        m.store.apply(.worktreeList([
+            WorktreeInfo(pane: 1, project: "/p", name: "a", branch: "clowder/a", state: .working),
+        ]))
+        m.selection = .worktree(1)
+
+        m.focusedPane = nil
+        XCTAssertFalse(m.isEnabled(.closePane), "nothing focused")
+
+        m.focusedPane = 1
+        XCTAssertFalse(m.isEnabled(.closePane), "focused pane IS the selection root — not a companion")
+
+        m.focusedPane = 2
+        XCTAssertTrue(m.isEnabled(.closePane), "a focused companion is closable")
+    }
+
     private func makeModel() -> AppModel {
         AppModel(makeTransport: { FakeControlTransport() })
     }
