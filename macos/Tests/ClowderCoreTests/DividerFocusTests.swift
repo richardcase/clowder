@@ -42,4 +42,18 @@ final class DividerFocusTests: XCTestCase {
         model.reconcileFocus()
         XCTAssertEqual(model.focusedPane, 2)   // still a leaf → unchanged
     }
+
+    /// Selecting a project with no open terminal sets `focusedPane = selectedPane`, which is nil
+    /// (see `selection`'s `didSet`). Once `projectTerminalOpened` resolves the pane, nothing else
+    /// claims focus — without the fix, `reconcileFocus`'s `currentTree` guard bails on nil and the
+    /// terminal appears with keystrokes going nowhere until the user clicks it.
+    func testReconcileFocusFocusesAFreshlyOpenedProjectTerminal() {
+        let (model, _) = liveModel()
+        model.store.apply(.projectAdded(ProjectInfo(path: "/code/alpha", name: "alpha", kind: "git")))
+        model.selection = .project("/code/alpha")
+        XCTAssertNil(model.focusedPane, "no terminal open yet")
+        model.store.apply(.projectTerminalOpened(path: "/code/alpha", pane: 9))
+        model.reconcileFocus()
+        XCTAssertEqual(model.focusedPane, 9)
+    }
 }

@@ -24,9 +24,12 @@ public struct NewWorktreeForm: Equatable, Sendable {
 
     public var isValid: Bool { !projectPath.isEmpty && nameError == nil }
 
-    /// Nil when the name is acceptable; otherwise a user-facing reason.
+    /// Nil when the name is acceptable; otherwise a user-facing reason. Validates `name` AS SENT
+    /// — no trimming — so this agrees with the daemon's `validate_workspace_name`, which also
+    /// does not trim (whitespace, including a leading/trailing space, is rejected by the charset
+    /// check below, not silently accepted).
     public var nameError: String? {
-        let n = name.trimmingCharacters(in: .whitespaces)
+        let n = name
         if n.isEmpty { return "Name must not be empty" }
         if n.count > 64 { return "Name must be 64 characters or fewer" }
         if n == "." || n == ".." { return "Name must not be \(n)" }

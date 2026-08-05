@@ -81,6 +81,14 @@ public final class AgentStore: ObservableObject {
 
     public func clearRefresh() { needsRefresh = false }
 
+    /// Drop all project → pane terminal mappings. Project terminals are not persisted daemon-side
+    /// (see `projectTerminals`'s doc comment), so a fresh connection — including a reconnect to
+    /// the SAME daemon after it restarted — must not keep believing a stale `path → pane`
+    /// mapping; the pane it names may belong to a different (or no) process now. Called from
+    /// `AppModel.attemptConnect()` on every connect, not just `reset()`, because an ordinary
+    /// reconnect reuses the `AgentStore` instance and never calls `reset()`.
+    public func clearProjectTerminals() { projectTerminals = [:] }
+
     /// Dismiss the current error (clears the error banner).
     public func clearLastError() { lastError = nil }
 

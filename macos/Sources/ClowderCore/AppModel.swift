@@ -69,6 +69,15 @@ public final class AppModel: ObservableObject {
     @Published public var newWorktreeProject: String = ""
     @Published public var pendingLifecycle: PendingLifecycle?
 
+    /// Paths whose project terminal was observed open at least once and is not currently open —
+    /// e.g. the user typed `exit`. Lets the detail view distinguish "closed, offer Reopen" from
+    /// "still opening" (the same nil-`selectedPane` state a fresh, never-opened selection is in)
+    /// so it doesn't render a permanent spinner. Deliberately does NOT auto-reopen — looping
+    /// against a shell that exits immediately would hang the UI; the user must ask via Reopen.
+    @Published public private(set) var closedProjectTerminals: Set<String> = []
+    /// Paths whose terminal has been live at least once (drives `closedProjectTerminals` above).
+    private var everOpenedProjectPaths: Set<String> = []
+
     private var makeTransport: () throws -> ControlTransport
     private var connection: ControlTransport?
     private var session: ControlSession?
@@ -90,7 +99,10 @@ public final class AppModel: ObservableObject {
         // not cascade to the parent automatically under Combine).
         self.storeSubscription = store.objectWillChange.sink { [weak self] _ in
             self?.objectWillChange.send()
-            DispatchQueue.main.async { self?.reconcileFocus() }
+            DispatchQueue.main.async {
+                self?.reconcileFocus()
+                self?.reconcileProjectSelection()
+            }
         }
     }
 
@@ -141,6 +153,8 @@ public final class AppModel: ObservableObject {
         connectionState = .live
         try session.send(.listWorktrees)
         try session.send(.listAdapters)
+        try session.send(.listProjects)
+        store.clearProjectTerminals()
     }
 
     /// The transport closed. Unless we're explicitly shutting down, start reconnecting.
@@ -241,10 +255,37 @@ public final class AppModel: ObservableObject {
     /// If the focused pane is no longer a leaf of the current tree (a companion closed, or an
     /// external tree change), move focus back to the agent pane.
     func reconcileFocus() {
+        // A project selection made before its terminal opened set `focusedPane = selectedPane`
+        // while `selectedPane` was still nil (see `selection`'s `didSet`). Once
+        // `projectTerminalOpened` resolves the pane, nothing else sets focus — without this, the
+        // guard below bails on a nil `currentTree` and the user can select the project, watch its
+        // terminal appear, and type into it with no effect until they click it.
+        if focusedPane == nil, let p = selectedPane { focusedPane = p; return }
         guard let leaves = currentTree?.leaves else { return }   // no tree → leave focus as-is
         if let f = focusedPane, !leaves.contains(f) {
             focusedPane = selectedPane
         }
+    }
+
+    /// Resolve `.project` selection state against the store: clear a selection whose project just
+    /// left `store.projects` (removing the currently-selected row must not leave the detail pane
+    /// stuck on a spinner forever — there is no "next select" to respawn it, since the row is
+    /// gone), and maintain `closedProjectTerminals` from `store.projectTerminals`'s membership so
+    /// the detail view can tell "closed" from "still opening".
+    private func reconcileProjectSelection() {
+        if case let .project(path) = selection, !store.projects.contains(where: { $0.path == path }) {
+            selection = nil
+        }
+        // Paths no longer registered can't be selected again — stop tracking them so the sets
+        // don't grow unbounded across an app session of add/remove churn.
+        let registered = Set(store.projects.map(\.path))
+        everOpenedProjectPaths.formIntersection(registered)
+        closedProjectTerminals.formIntersection(registered)
+
+        let live = Set(store.projectTerminals.keys)
+        closedProjectTerminals.formUnion(everOpenedProjectPaths.subtracting(live))
+        closedProjectTerminals.subtract(live)          // reopened (or never-closed) — not "closed"
+        everOpenedProjectPaths.formUnion(live)
     }
 
     /// Whether a command applies to the current selection. The palette dims disabled rows and

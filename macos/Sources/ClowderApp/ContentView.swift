@@ -37,6 +37,14 @@ struct ContentView: View {
             }
         }
         .safeAreaInset(edge: .bottom) { statusBar }
+        // A landed/discarded/lost worktree's SurfaceView (and its ghostty surface) would
+        // otherwise stay cached for the app's lifetime — evict it once the worktree is gone from
+        // the store, whatever removed it (land, discard, or the daemon losing track of it).
+        .onChange(of: model.store.worktrees) { oldValue, newValue in
+            for pane in Set(oldValue.keys).subtracting(newValue.keys) {
+                surfaceHost.forget(pane: pane)
+            }
+        }
         .overlay {
             if model.showingPalette {
                 ZStack(alignment: .top) {
@@ -165,6 +173,7 @@ struct ContentView: View {
         if worktree.state == .exited {
             Button("Restart Agent") {
                 model.selection = .worktree(worktree.pane)
+                surfaceHost.forget(pane: worktree.pane)   // evict the dead cached surface first
                 model.restartSelectedWorktree()
             }
             Divider()
@@ -191,9 +200,18 @@ struct ContentView: View {
                                focusedPane: $model.focusedPane)
                     .id(pane)   // rebuild when switching agents; same agent's tree changes diff in place
             }
-        } else if case .project = model.selection {
-            ProgressView("Starting terminal…")
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if case let .project(path) = model.selection {
+            if model.closedProjectTerminals.contains(path) {
+                // The terminal was open and the user exited it (or it otherwise died). Offer a
+                // way back in — but never auto-reopen, which would loop against a shell that
+                // exits immediately. Also covers removing-then-re-adding the SAME project row,
+                // which reselects nothing (the row is already selected) so no new open request
+                // would otherwise fire.
+                closedProjectTerminalPlaceholder(path)
+            } else {
+                ProgressView("Starting terminal…")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
         } else {
             Text("Select a project or worktree").foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -207,7 +225,22 @@ struct ContentView: View {
                 .foregroundStyle(.secondary)
             Text("Agent exited").font(.title3)
             Text(worktree.name).foregroundStyle(.secondary)
-            Button("Restart Agent") { model.restartSelectedWorktree() }
+            Button("Restart Agent") {
+                surfaceHost.forget(pane: worktree.pane)   // evict the dead cached surface first
+                model.restartSelectedWorktree()
+            }
+            .buttonStyle(.borderedProminent)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private func closedProjectTerminalPlaceholder(_ path: String) -> some View {
+        VStack(spacing: 10) {
+            Image(systemName: "moon.zzz.fill")
+                .font(.largeTitle)
+                .foregroundStyle(.secondary)
+            Text("Terminal closed").font(.title3)
+            Button("Reopen") { model.openTerminal(forProject: path) }
                 .buttonStyle(.borderedProminent)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)

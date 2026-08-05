@@ -23,6 +23,10 @@ final class AttentionCountTests: XCTestCase {
 
     func testZeroWhenNoneNeedy() {
         let store = AgentStore()
+        // Register /a first — otherwise these worktrees are excluded by the unregistered-project
+        // rule before the state filter even runs, and this test would pass even if that filter
+        // were inverted.
+        store.apply(.projectList([ProjectInfo(path: "/a", name: "a", kind: "git")]))
         store.apply(.worktreeList([
             WorktreeInfo(pane: 1, project: "/a", name: "t", branch: "clowder/t", state: .working),
             WorktreeInfo(pane: 2, project: "/a", name: "t", branch: "clowder/t", state: .exited),

@@ -139,6 +139,15 @@ final class AgentStoreTests: XCTestCase {
         XCTAssertNil(s.projectTerminals["/code/alpha"], "a removed project's terminal is gone")
     }
 
+    func testClearProjectTerminalsDropsMappingsWithoutTouchingProjects() {
+        let s = AgentStore()
+        s.apply(.projectAdded(ProjectInfo(path: "/code/alpha", name: "alpha", kind: "git")))
+        s.apply(.projectTerminalOpened(path: "/code/alpha", pane: 7))
+        s.clearProjectTerminals()
+        XCTAssertTrue(s.projectTerminals.isEmpty)
+        XCTAssertEqual(s.projects.map(\.path), ["/code/alpha"], "the project itself must survive — only the stale pane mapping goes")
+    }
+
     func testResetClearsProjectState() {
         let s = AgentStore()
         s.apply(.projectAdded(ProjectInfo(path: "/code/alpha", name: "alpha", kind: "git")))

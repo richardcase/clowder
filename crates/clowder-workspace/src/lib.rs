@@ -174,6 +174,11 @@ pub fn detect_kind(project: &Path) -> Option<WorkspaceKind> {
 /// Validate a worktree/workspace name. The name becomes BOTH a git ref (`clowder/<name>`)
 /// and a path component (`.clowder/worktrees/<name>`), so it must be safe as both.
 /// Messages are user-facing — they surface directly in the app's error banner.
+///
+/// If you add or change a rule here, add a case to `docs/protocol/fixtures/worktree-names.json`
+/// and mirror the rule in Swift's `NewWorktreeForm.nameError` (`macos/Sources/ClowderCore/SheetForms.swift`)
+/// — that fixture is what `agrees_with_the_shared_name_cases` (below) and its Swift counterpart
+/// both check the two implementations against.
 pub fn validate_workspace_name(name: &str) -> Result<()> {
     if name.is_empty() {
         bail!("worktree name must not be empty");

@@ -1,8 +1,9 @@
 # Protocol fixtures
 
-`fixtures/*.json` is the wire format for the JSON control protocol shared between the Rust daemon
-and the Swift app. There are two message directions, each with its own fixture check in each
-language, because the direction determines which side is authoritative:
+Most of `fixtures/*.json` is the wire format for the JSON control protocol shared between the Rust
+daemon and the Swift app — the exception is `worktree-names.json`, described separately below.
+For the wire-format fixtures, there are two message directions, each with its own fixture check in
+each language, because the direction determines which side is authoritative:
 
 - **`ControlEvent`** (daemon → app): Rust *encodes*, Swift *decodes*. The Rust test
   (`crates/clowder-proto/src/control.rs`, `encoder_matches_the_golden_fixtures`) asserts its
@@ -27,3 +28,14 @@ existing cases in `encoder_matches_the_golden_fixtures` / `request_fixtures_deco
 (Rust) and `testDecodesEveryGoldenFixture` / `testEncodesEveryGoldenRequestFixtureExactly`
 (Swift). Derive the fixture from the Rust type first — run the Rust assertion before writing the
 Swift side, and if they disagree, fix the fixture, not the encoder.
+
+## `fixtures/worktree-names.json`
+
+Not a wire message — this is a shared table of `{"name": ..., "valid": ...}` cases checked
+against BOTH independent implementations of the worktree-name validation rule: Rust's
+`validate_workspace_name` (`crates/clowder-workspace/src/lib.rs`, exercised by
+`agrees_with_the_shared_name_cases`) and Swift's `NewWorktreeForm.nameError`
+(`macos/Sources/ClowderCore/SheetForms.swift`, exercised by `testAgreesWithTheSharedNameCases`).
+A JSON array can't carry a comment explaining that convention, which is why it lives here instead:
+if you add or change a rule in either validator, add a case to this file and mirror the rule in
+the other implementation — otherwise the two can silently drift apart.

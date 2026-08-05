@@ -3,8 +3,24 @@ use clowder_proto::{
     ClientToDaemon, ControlEvent, ControlRequest, DaemonToClient, MsgStream, PaneId, ProjectInfo,
 };
 use std::path::Path;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
+
+/// How long a `*_via_control` helper waits for its reply before giving up. This stack has a
+/// history of hangs-instead-of-failures (a stuck daemon, a lock held by a concurrent request) —
+/// bounding the wait means the CLI reports a timeout instead of sitting silently forever.
+const CONTROL_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Read the next control-socket line, bounded by `CONTROL_REPLY_TIMEOUT`.
+async fn next_control_line<R: AsyncRead + Unpin>(
+    lines: &mut tokio::io::Lines<BufReader<R>>,
+) -> anyhow::Result<Option<String>> {
+    tokio::time::timeout(CONTROL_REPLY_TIMEOUT, lines.next_line())
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out waiting for a reply from the daemon"))?
+        .map_err(anyhow::Error::from)
+}
 
 pub mod forward;
 mod tofu;
@@ -91,7 +107,7 @@ pub async fn spawn_via_control(
 
     // Skip the initial WorktreeList / any streamed events until the spawn result.
     loop {
-        match lines.next_line().await? {
+        match next_control_line(&mut lines).await? {
             Some(l) => match serde_json::from_str::<ControlEvent>(&l) {
                 Ok(ControlEvent::AgentSpawned { pane }) => return Ok(pane),
                 Ok(ControlEvent::Error { message }) => return Err(anyhow::anyhow!(message)),
@@ -119,7 +135,7 @@ pub async fn add_project_via_control(
 
     // Skip the initial WorktreeList / any streamed events until our result.
     loop {
-        match lines.next_line().await? {
+        match next_control_line(&mut lines).await? {
             Some(l) => match serde_json::from_str::<ControlEvent>(&l) {
                 Ok(ControlEvent::ProjectAdded { project }) => return Ok(project),
                 Ok(ControlEvent::Error { message }) => return Err(anyhow::anyhow!(message)),
@@ -146,7 +162,7 @@ pub async fn list_projects_via_control(
 
     // Skip the initial WorktreeList / any streamed events until our result.
     loop {
-        match lines.next_line().await? {
+        match next_control_line(&mut lines).await? {
             Some(l) => match serde_json::from_str::<ControlEvent>(&l) {
                 Ok(ControlEvent::ProjectList { projects }) => return Ok(projects),
                 Ok(ControlEvent::Error { message }) => return Err(anyhow::anyhow!(message)),
@@ -174,7 +190,7 @@ pub async fn remove_project_via_control(
 
     // Skip the initial WorktreeList / any streamed events until our result.
     loop {
-        match lines.next_line().await? {
+        match next_control_line(&mut lines).await? {
             Some(l) => match serde_json::from_str::<ControlEvent>(&l) {
                 Ok(ControlEvent::ProjectRemoved { .. }) => return Ok(()),
                 Ok(ControlEvent::Error { message }) => return Err(anyhow::anyhow!(message)),
@@ -402,5 +418,26 @@ mod tests {
         let p = add_project_via_control(&sock, "/p").await.unwrap();
         assert_eq!(p.kind, "git");
         assert_eq!(p.name, "p");
+    }
+
+    /// A daemon that accepts the connection, reads the request, and then never replies (e.g.
+    /// stuck holding `project_mutation` behind a concurrent spawn) must not hang the CLI forever
+    /// — it should report a timeout instead. `start_paused` lets the 10s timeout resolve in
+    /// virtual time instead of really waiting.
+    #[tokio::test(start_paused = true)]
+    async fn add_project_via_control_times_out_without_a_reply() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("c.sock");
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (rd, wr) = tokio::io::split(stream);
+            let mut lines = tokio::io::BufReader::new(rd).lines();
+            let _req = lines.next_line().await.unwrap().unwrap();
+            let _wr = wr; // keep the write half open so the client blocks on a read, not an EOF
+            std::future::pending::<()>().await;
+        });
+        let err = add_project_via_control(&sock, "/p").await.unwrap_err();
+        assert!(err.to_string().contains("timed out"), "unexpected error: {err}");
     }
 }

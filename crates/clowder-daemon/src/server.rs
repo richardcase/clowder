@@ -229,6 +229,13 @@ impl Daemon {
     /// The shell pane rooted at a project. Lazy and idempotent: a second caller attaches to the
     /// same shell. Not persisted — a daemon restart drops it and the next select respawns.
     pub fn open_project_terminal(self: &Arc<Self>, path: &Path) -> Result<PaneId> {
+        // Serializes against `remove_project`: without this, a project can be observed as
+        // registered here, then removed (no `project_terms` entry yet, no agents) before the
+        // spawn below publishes into `project_terms` — leaving a live shell rooted in an
+        // unregistered, unreachable project. `forget_project_terminal` (called by the spawned
+        // exit watcher below) never takes `project_mutation`, so this introduces no new lock
+        // ordering.
+        let _mutation = self.project_mutation.lock();
         let root = path.canonicalize()
             .with_context(|| format!("no such project path: {}", path.display()))?;
         if !self.projects.contains(&root) {
@@ -2923,6 +2930,50 @@ mod tests {
         } else {
             // The spawn lost the race and was rejected — acceptable, but then the project must
             // genuinely be gone, not half-removed.
+            assert!(!d.is_registered_project(repo.path()));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remove_project_cannot_race_open_project_terminal() {
+        use std::sync::Arc as StdArc;
+        let state = tempfile::tempdir().unwrap();
+        let repo = crate::test_support::init_repo();
+        let d = test_daemon_in(state.path());
+        d.add_project(repo.path()).unwrap();
+
+        // Hammer open_project_terminal on a blocking thread while the main task hammers
+        // remove_project. Before the `project_mutation` fix, `open_project_terminal` could
+        // observe the project as registered, fork its shell, and only THEN publish into
+        // `project_terms` — a window in which `remove_project` sees no `project_terms` entry and
+        // no agents, so it removes the project out from under the about-to-be-published terminal,
+        // leaving a live shell rooted in an unregistered, unreachable project.
+        let rt = tokio::runtime::Handle::current();
+        let d2 = StdArc::clone(&d);
+        let path = repo.path().to_path_buf();
+        let opener = std::thread::spawn(move || {
+            let _guard = rt.enter();
+            d2.open_project_terminal(&path)
+        });
+
+        for _ in 0..200 {
+            if d.remove_project(repo.path()).is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let opened = opener.join().unwrap();
+
+        if let Ok(pane) = opened {
+            // The open won its race and completed. If the project ended up removed anyway, the
+            // pane it opened must be dead too — never a live-but-unreachable orphan.
+            if !d.is_registered_project(repo.path()) {
+                assert!(d.get(pane).is_none(),
+                        "terminal opened into a project removed out from under it — leaked shell");
+            }
+        } else {
+            // The open lost the race and was rejected — acceptable, but then the project must be
+            // genuinely gone, not half-removed.
             assert!(!d.is_registered_project(repo.path()));
         }
     }

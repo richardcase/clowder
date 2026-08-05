@@ -14,4 +14,5 @@
  {"name":"feat/x","valid":false},
  {"name":".hidden","valid":false},
  {"name":"-dash","valid":false},
- {"name":"café","valid":false}]
+ {"name":"café","valid":false},
+ {"name":" a","valid":false}]

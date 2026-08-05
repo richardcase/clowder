@@ -37,6 +37,21 @@ final class AppModelTests: XCTestCase {
         XCTAssertTrue(fake.sentLines.contains { $0.contains("\"type\":\"listWorktrees\"") })
     }
 
+    /// Regression: a launch that hydrates `listWorktrees`/`listAdapters` but forgets
+    /// `listProjects` leaves `store.projects == []` forever — the sidebar shows "No projects
+    /// yet", every project-scoped derived value (attention count, Cmd-1…9, palette, menu-bar
+    /// badge) is empty, and the New Worktree sheet's picker has nothing to offer, so Create is
+    /// permanently disabled. Covers first connect, the reconnect loop, and a backend swap all at
+    /// once since they share `attemptConnect()`.
+    func testConnectRequestsAllThreeHydrationLists() {
+        let fake = FakeControlTransport()
+        let model = AppModel(makeTransport: { fake })
+        model.connect()
+        XCTAssertTrue(fake.sentLines.contains { $0.contains("\"type\":\"listWorktrees\"") }, "\(fake.sentLines)")
+        XCTAssertTrue(fake.sentLines.contains { $0.contains("\"type\":\"listAdapters\"") }, "\(fake.sentLines)")
+        XCTAssertTrue(fake.sentLines.contains { $0.contains("\"type\":\"listProjects\"") }, "\(fake.sentLines)")
+    }
+
     func testConnectFailureBecomesClosed() {
         struct BoomError: Error {}
         let model = AppModel(makeTransport: { throw BoomError() })
@@ -182,6 +197,7 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(transports.count, 2)
         XCTAssertTrue(transports[1].sentLines.contains { $0.contains("\"type\":\"listWorktrees\"") })
         XCTAssertTrue(transports[1].sentLines.contains { $0.contains("\"type\":\"listAdapters\"") })
+        XCTAssertTrue(transports[1].sentLines.contains { $0.contains("\"type\":\"listProjects\"") })
         model.shutdown()
     }
 
@@ -348,6 +364,85 @@ final class AppModelTests: XCTestCase {
         XCTAssertTrue(model.canRestartSelection)
         model.restartSelectedWorktree()
         XCTAssertTrue(fake.sentLines.contains { $0.contains("restartWorktree") }, "\(fake.sentLines)")
+    }
+
+    /// Project terminals are deliberately not persisted daemon-side, but the same `AgentStore`
+    /// survives an ordinary reconnect (only an explicit backend swap calls `store.reset()`). If a
+    /// daemon restart silently drops a live `path -> pane` mapping, the app must not keep
+    /// believing it — the pane it names may now be dead or reused by something else, with no way
+    /// back once the app attaches to it.
+    func testReconnectClearsStaleProjectTerminals() async {
+        let controller = SleepController()
+        var transports: [FakeControlTransport] = []
+        let model = AppModel(
+            makeTransport: { let f = FakeControlTransport(); transports.append(f); return f },
+            sleep: { await controller.sleep($0) }
+        )
+
+        model.connect()
+        model.store.apply(.projectTerminalOpened(path: "/code/alpha", pane: 9))
+        XCTAssertEqual(model.store.projectTerminals["/code/alpha"], 9)
+
+        transports[0].onClose?()                              // the daemon restarted
+        let parkedAtFirstBackoff = await eventually { controller.parkedCount == 1 }
+        XCTAssertTrue(parkedAtFirstBackoff)
+        controller.advance()                                  // wake -> attemptConnect -> live
+        let wentLive = await eventually { model.connectionState == .live }
+        XCTAssertTrue(wentLive)
+
+        XCTAssertNil(model.store.projectTerminals["/code/alpha"], "stale mapping must not survive a reconnect")
+        model.shutdown()
+    }
+
+    /// Removing the currently-selected project must not leave the detail pane wedged on a
+    /// permanent "Starting terminal…" spinner — the row is gone, so there is no future "next
+    /// select" to respawn the open, unlike the ordinary case this comment used to justify.
+    func testSelectionClearsWhenItsProjectIsRemoved() {
+        let fake = FakeControlTransport()
+        let model = AppModel(makeTransport: { fake })
+        model.connect()
+        model.store.apply(.projectAdded(ProjectInfo(path: "/code/alpha", name: "alpha", kind: "git")))
+        model.selection = .project("/code/alpha")
+        XCTAssertNotNil(model.selection)
+
+        model.store.apply(.projectRemoved(path: "/code/alpha"))
+        // objectWillChange fires synchronously (Combine's `willChange` semantics), but the
+        // resolution runs on the next main-queue turn — pump it like the reconnect tests do.
+        let exp = expectation(description: "main queue pump")
+        DispatchQueue.main.async { exp.fulfill() }
+        wait(for: [exp], timeout: 1.0)
+        XCTAssertNil(model.selection, "a selection whose project vanished must clear, not spin forever")
+    }
+
+    /// A project terminal that closes (the user typed `exit`) while still selected must not look
+    /// identical to "still opening" — the fix distinguishes the two so the detail view can offer
+    /// Reopen instead of spinning forever with no way back in.
+    func testProjectTerminalIsTrackedAsClosedAfterHavingBeenOpen() {
+        let fake = FakeControlTransport()
+        let model = AppModel(makeTransport: { fake })
+        model.connect()
+        model.store.apply(.projectAdded(ProjectInfo(path: "/code/alpha", name: "alpha", kind: "git")))
+        model.selection = .project("/code/alpha")
+        XCTAssertFalse(model.closedProjectTerminals.contains("/code/alpha"), "never opened yet — not 'closed'")
+
+        model.store.apply(.projectTerminalOpened(path: "/code/alpha", pane: 9))
+        pumpMainQueue()
+        XCTAssertFalse(model.closedProjectTerminals.contains("/code/alpha"), "open — not closed")
+
+        model.store.apply(.projectTerminalClosed(path: "/code/alpha"))
+        pumpMainQueue()
+        XCTAssertTrue(model.closedProjectTerminals.contains("/code/alpha"), "was open, now isn't — closed")
+
+        // Reopening clears the closed marker again.
+        model.store.apply(.projectTerminalOpened(path: "/code/alpha", pane: 11))
+        pumpMainQueue()
+        XCTAssertFalse(model.closedProjectTerminals.contains("/code/alpha"))
+    }
+
+    private func pumpMainQueue() {
+        let exp = expectation(description: "main queue pump")
+        DispatchQueue.main.async { exp.fulfill() }
+        wait(for: [exp], timeout: 1.0)
     }
 
     func testSelectingAWorktreeRequestsItsSplitTree() {
