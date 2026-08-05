@@ -61,7 +61,12 @@ public final class AppModel: ObservableObject {
     @Published public var focusedPane: UInt64?
     @Published public private(set) var connectionState: ConnectionState = .connecting
     @Published public var showingPalette: Bool = false
-    @Published public var showingSpawn: Bool = false
+    @Published public var showingAddProject: Bool = false
+    @Published public var showingNewWorktree: Bool = false
+    /// Which project the New Worktree sheet should prefill. Set by the per-project `+` and the
+    /// context menu; `.newWorktree` from the palette or Cmd-N leaves it as-is, so the sheet falls
+    /// back to the current selection's project or the first project.
+    @Published public var newWorktreeProject: String = ""
     @Published public var pendingLifecycle: PendingLifecycle?
 
     private var makeTransport: () throws -> ControlTransport
@@ -242,11 +247,29 @@ public final class AppModel: ObservableObject {
         }
     }
 
+    /// Whether a command applies to the current selection. The palette dims disabled rows and
+    /// key handling ignores them, so the UI never offers something the daemon would refuse.
+    public func isEnabled(_ id: CommandID) -> Bool {
+        switch id {
+        case .landAgent, .discardAgent: return selectedWorktree != nil
+        case .restartWorktree:          return canRestartSelection
+        case .closePane:                return focusedPane != nil && focusedPane != selectedPane
+        default:                        return true
+        }
+    }
+
     /// Dispatch a command by id.
     public func run(_ id: CommandID) {
         switch id {
         case .openPalette: showingPalette.toggle()
-        case .spawnAgent: showingSpawn = true
+        case .newWorktree:
+            if case let .project(path) = selection {
+                newWorktreeProject = path
+            } else if let w = selectedWorktree {
+                newWorktreeProject = w.project
+            }
+            showingNewWorktree = true
+        case .addProject: showingAddProject = true
         case .nextAttention: selectNextAttention()
         case let .switchToAgent(i): selectAgent(atIndex: i)
         case .splitRight: splitFocused(.right)
@@ -255,6 +278,7 @@ public final class AppModel: ObservableObject {
         case .focusNextPane: focusNextPane()
         case .landAgent: requestLifecycle(.land)
         case .discardAgent: requestLifecycle(.discard)
+        case .restartWorktree: restartSelectedWorktree()
         }
     }
 

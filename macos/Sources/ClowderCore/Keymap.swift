@@ -2,7 +2,8 @@ import Foundation
 
 public enum CommandID: Hashable, Sendable {
     case openPalette
-    case spawnAgent
+    case newWorktree
+    case addProject
     case nextAttention
     case switchToAgent(Int)   // 1-based position in the ordered agent list
     case splitRight
@@ -11,6 +12,7 @@ public enum CommandID: Hashable, Sendable {
     case focusNextPane
     case landAgent
     case discardAgent
+    case restartWorktree
 }
 
 public struct KeyModifiers: OptionSet, Hashable, Sendable {
@@ -51,7 +53,8 @@ public struct Keymap: Sendable {
     public static let defaults: [CommandID: KeyBinding] = {
         var m: [CommandID: KeyBinding] = [
             .openPalette:   KeyBinding("k", .command),
-            .spawnAgent:    KeyBinding("n", .command),
+            .newWorktree:   KeyBinding("n", .command),
+            .addProject:    KeyBinding("n", [.command, .shift]),
             .nextAttention: KeyBinding("a", [.command, .shift]),
             .splitRight:    KeyBinding("d", .command),
             .splitDown:     KeyBinding("d", [.command, .shift]),
@@ -73,9 +76,15 @@ public enum CommandRegistry {
     /// rows — agent-switching lives in the palette's agent section.
     public static func all(keymap: Keymap) -> [Command] {
         [
-            Command(id: .spawnAgent, title: "Spawn Agent",
-                    subtitle: "Start a new agent",
-                    defaultShortcut: keymap.binding(for: .spawnAgent)),
+            Command(id: .newWorktree, title: "New Worktree",
+                    subtitle: "Create a worktree in a project and start an agent",
+                    defaultShortcut: keymap.binding(for: .newWorktree)),
+            Command(id: .addProject, title: "Add Project",
+                    subtitle: "Register a git or jj repository",
+                    defaultShortcut: keymap.binding(for: .addProject)),
+            Command(id: .restartWorktree, title: "Restart Agent",
+                    subtitle: "Re-run the agent in the selected worktree",
+                    defaultShortcut: keymap.binding(for: .restartWorktree)),
             Command(id: .nextAttention, title: "Next Attention",
                     subtitle: "Jump to the next agent needing input",
                     defaultShortcut: keymap.binding(for: .nextAttention)),

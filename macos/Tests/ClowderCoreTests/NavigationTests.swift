@@ -54,7 +54,7 @@ final class NavigationTests: XCTestCase {
         let m = modelWithAgents()
         m.run(.openPalette); XCTAssertTrue(m.showingPalette)
         m.run(.openPalette); XCTAssertFalse(m.showingPalette)   // toggles
-        m.run(.spawnAgent); XCTAssertTrue(m.showingSpawn)
+        m.run(.newWorktree); XCTAssertTrue(m.showingNewWorktree)
         m.run(.switchToAgent(1)); XCTAssertEqual(m.selectedPane, 1)
         m.run(.nextAttention); XCTAssertEqual(m.selectedPane, 2) // first needy after pane 1
     }

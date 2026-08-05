@@ -199,12 +199,12 @@ struct ClowderApp: App {
         }
         .commands {
             // clowder is a single-window app; remove the default File > New Window (frees ⌘N
-            // for Spawn Agent instead of opening a second window).
+            // for New Worktree instead of opening a second window).
             CommandGroup(replacing: .newItem) { }
 
             CommandMenu("clowder") {
                 menuItem("Command Palette", .openPalette)
-                menuItem("Spawn Agent", .spawnAgent)
+                menuItem("New Worktree", .newWorktree)
                 menuItem("Next Attention", .nextAttention)
                 Divider()
                 ForEach(1...9, id: \.self) { i in

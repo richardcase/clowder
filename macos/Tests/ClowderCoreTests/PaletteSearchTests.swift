@@ -20,8 +20,8 @@ final class PaletteSearchTests: XCTestCase {
     }
 
     func testCommandQueryRanksCommandFirst() {
-        let r = paletteResults(query: "spawn ag", commands: cmds, worktrees: worktrees())
-        XCTAssertEqual(r.first?.title, "Spawn Agent")
+        let r = paletteResults(query: "new work", commands: cmds, worktrees: worktrees())
+        XCTAssertEqual(r.first?.title, "New Worktree")
         XCTAssertTrue(isCommand(r[0]))
     }
 

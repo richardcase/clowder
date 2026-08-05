@@ -14,12 +14,12 @@ struct ContentView: View {
         }
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
-                Button { model.showingSpawn = true } label: { Image(systemName: "plus") }
+                Button { model.showingNewWorktree = true } label: { Image(systemName: "plus") }
                     .disabled(model.connectionState != .live)
                     .help("Spawn a new agent")
             }
         }
-        .sheet(isPresented: $model.showingSpawn) {
+        .sheet(isPresented: $model.showingNewWorktree) {
             SpawnSheet(adapters: model.adapters) { project, task, adapter in
                 model.spawn(project: project, name: task, adapter: adapter)
             }
