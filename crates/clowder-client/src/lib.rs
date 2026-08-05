@@ -1,5 +1,7 @@
 use anyhow::Result;
-use clowder_proto::{ClientToDaemon, ControlEvent, ControlRequest, DaemonToClient, MsgStream, PaneId};
+use clowder_proto::{
+    ClientToDaemon, ControlEvent, ControlRequest, DaemonToClient, MsgStream, PaneId, ProjectInfo,
+};
 use std::path::Path;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -97,6 +99,89 @@ pub async fn spawn_via_control(
                 Err(_) => continue, // ignore unparseable lines defensively
             },
             None => return Err(anyhow::anyhow!("control socket closed before spawn result")),
+        }
+    }
+}
+
+/// Connect the JSON control socket, register a project, and return it as the daemon sees it.
+pub async fn add_project_via_control(
+    control_sock: &std::path::Path,
+    path: &str,
+) -> anyhow::Result<ProjectInfo> {
+    let stream = UnixStream::connect(control_sock).await?;
+    let (rd, mut wr) = tokio::io::split(stream);
+    let mut lines = BufReader::new(rd).lines();
+
+    let req = ControlRequest::AddProject { path: path.to_string() };
+    let mut line = serde_json::to_string(&req)?;
+    line.push('\n');
+    wr.write_all(line.as_bytes()).await?;
+
+    // Skip the initial WorktreeList / any streamed events until our result.
+    loop {
+        match lines.next_line().await? {
+            Some(l) => match serde_json::from_str::<ControlEvent>(&l) {
+                Ok(ControlEvent::ProjectAdded { project }) => return Ok(project),
+                Ok(ControlEvent::Error { message }) => return Err(anyhow::anyhow!(message)),
+                Ok(_) => continue,
+                Err(_) => continue, // ignore unparseable lines defensively
+            },
+            None => return Err(anyhow::anyhow!("control socket closed before the result")),
+        }
+    }
+}
+
+/// Connect the JSON control socket and list all registered projects.
+pub async fn list_projects_via_control(
+    control_sock: &std::path::Path,
+) -> anyhow::Result<Vec<ProjectInfo>> {
+    let stream = UnixStream::connect(control_sock).await?;
+    let (rd, mut wr) = tokio::io::split(stream);
+    let mut lines = BufReader::new(rd).lines();
+
+    let req = ControlRequest::ListProjects;
+    let mut line = serde_json::to_string(&req)?;
+    line.push('\n');
+    wr.write_all(line.as_bytes()).await?;
+
+    // Skip the initial WorktreeList / any streamed events until our result.
+    loop {
+        match lines.next_line().await? {
+            Some(l) => match serde_json::from_str::<ControlEvent>(&l) {
+                Ok(ControlEvent::ProjectList { projects }) => return Ok(projects),
+                Ok(ControlEvent::Error { message }) => return Err(anyhow::anyhow!(message)),
+                Ok(_) => continue,
+                Err(_) => continue, // ignore unparseable lines defensively
+            },
+            None => return Err(anyhow::anyhow!("control socket closed before the result")),
+        }
+    }
+}
+
+/// Connect the JSON control socket and remove a registered project.
+pub async fn remove_project_via_control(
+    control_sock: &std::path::Path,
+    path: &str,
+) -> anyhow::Result<()> {
+    let stream = UnixStream::connect(control_sock).await?;
+    let (rd, mut wr) = tokio::io::split(stream);
+    let mut lines = BufReader::new(rd).lines();
+
+    let req = ControlRequest::RemoveProject { path: path.to_string() };
+    let mut line = serde_json::to_string(&req)?;
+    line.push('\n');
+    wr.write_all(line.as_bytes()).await?;
+
+    // Skip the initial WorktreeList / any streamed events until our result.
+    loop {
+        match lines.next_line().await? {
+            Some(l) => match serde_json::from_str::<ControlEvent>(&l) {
+                Ok(ControlEvent::ProjectRemoved { .. }) => return Ok(()),
+                Ok(ControlEvent::Error { message }) => return Err(anyhow::anyhow!(message)),
+                Ok(_) => continue,
+                Err(_) => continue, // ignore unparseable lines defensively
+            },
+            None => return Err(anyhow::anyhow!("control socket closed before the result")),
         }
     }
 }
@@ -298,5 +383,24 @@ mod tests {
         assert_eq!(agents[0].name, "demo");
 
         daemon.teardown_agent(pane).unwrap();
+    }
+
+    #[tokio::test]
+    async fn add_project_via_control_returns_the_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("c.sock");
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (rd, mut wr) = tokio::io::split(stream);
+            let mut lines = tokio::io::BufReader::new(rd).lines();
+            let _req = lines.next_line().await.unwrap().unwrap();
+            wr.write_all(
+                b"{\"type\":\"projectAdded\",\"project\":{\"path\":\"/p\",\"name\":\"p\",\"kind\":\"git\"}}\n"
+            ).await.unwrap();
+        });
+        let p = add_project_via_control(&sock, "/p").await.unwrap();
+        assert_eq!(p.kind, "git");
+        assert_eq!(p.name, "p");
     }
 }
