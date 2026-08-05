@@ -20,8 +20,15 @@ struct ContentView: View {
             }
         }
         .sheet(isPresented: $model.showingNewWorktree) {
-            SpawnSheet(adapters: model.adapters) { project, task, adapter in
-                model.spawn(project: project, name: task, adapter: adapter)
+            NewWorktreeSheet(projects: model.store.sidebar,
+                              adapters: model.adapters,
+                              initialProjectPath: model.newWorktreeProject) { project, name, adapter in
+                model.spawn(project: project, name: name, adapter: adapter)
+            }
+        }
+        .sheet(isPresented: $model.showingAddProject) {
+            AddProjectSheet(canBrowse: true) { path in
+                model.addProject(path: path)
             }
         }
         .safeAreaInset(edge: .bottom) { statusBar }

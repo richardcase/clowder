@@ -497,4 +497,19 @@ mod tests {
         let e = validate_workspace_name(&"a".repeat(65)).unwrap_err().to_string();
         assert!(e.contains("64"), "unhelpful message: {e}");
     }
+
+    #[test]
+    fn agrees_with_the_shared_name_cases() {
+        #[derive(serde::Deserialize)]
+        struct Case { name: String, valid: bool }
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/protocol/fixtures/worktree-names.json");
+        let raw = std::fs::read_to_string(&p)
+            .unwrap_or_else(|e| panic!("missing {}: {e}", p.display()));
+        for c in serde_json::from_str::<Vec<Case>>(&raw).unwrap() {
+            assert_eq!(validate_workspace_name(&c.name).is_ok(), c.valid,
+                       "disagreed on {:?} — if you changed a rule, update the shared cases and the Swift mirror",
+                       c.name);
+        }
+    }
 }
