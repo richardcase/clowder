@@ -4,6 +4,12 @@ import XCTest
 final class AttentionCountTests: XCTestCase {
     func testCountsNeedsInputAndCompletedInOrder() {
         let store = AgentStore()
+        // `attentionCount`/`worktreesNeedingAttention` derive from `orderedWorktrees`, which now
+        // requires each worktree's project to be registered (M10c) — register /a and /b first.
+        store.apply(.projectList([
+            ProjectInfo(path: "/a", name: "a", kind: "git"),
+            ProjectInfo(path: "/b", name: "b", kind: "git"),
+        ]))
         store.apply(.worktreeList([
             WorktreeInfo(pane: 1, project: "/a", name: "t1", branch: "clowder/t1", state: .idle),
             WorktreeInfo(pane: 2, project: "/a", name: "t2", branch: "clowder/t2", state: .working),

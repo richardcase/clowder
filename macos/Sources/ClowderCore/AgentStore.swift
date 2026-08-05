@@ -1,6 +1,20 @@
 import Foundation
 import Combine
 
+/// One project row plus its worktrees, prepared for rendering. Built by `AgentStore.sidebar`
+/// so the view layer — which no local compiler checks — stays a plain `ForEach` over this.
+public struct SidebarProject: Identifiable, Equatable, Sendable {
+    public let path: String
+    public let name: String
+    /// `"git"` or `"jj"`.
+    public let kind: String
+    public let worktrees: [WorktreeInfo]
+    /// How many of THIS project's worktrees want a response. Shown on the row so a collapsed
+    /// project can never hide a waiting agent.
+    public let attentionCount: Int
+    public var id: String { path }
+}
+
 /// The client-side agent model. Refresh-driven: events that can't fully hydrate a
 /// row (a pane-only `agentSpawned`, or any event for an unknown pane) set `needsRefresh`,
 /// which the session/UI answers with a `ControlRequest.listWorktrees`.
@@ -10,6 +24,10 @@ public final class AgentStore: ObservableObject {
     @Published public private(set) var lastError: String?
     @Published public private(set) var trees: [UInt64: PaneTree] = [:]
     @Published public private(set) var adapters: [AdapterInfo] = AgentStore.defaultAdapters
+    @Published public private(set) var projects: [ProjectInfo] = []
+    /// Project path → its open terminal's pane. Populated by `projectTerminalOpened`; a missing
+    /// entry means "not open yet", which is what makes selecting a project ask the daemon.
+    @Published public private(set) var projectTerminals: [String: UInt64] = [:]
 
     /// The adapter list shown before a connection reports its own via `adapterList`.
     static let defaultAdapters = [AdapterInfo(id: "claude", displayName: "Claude Code")]
@@ -39,8 +57,25 @@ public final class AgentStore: ObservableObject {
             lastError = message
         case let .splitTreeChanged(agent, tree):
             trees[agent] = tree        // idempotent replace (carry-forward #1)
-        case .projectList, .projectAdded, .projectRemoved, .projectTerminalOpened, .projectTerminalClosed:
-            break // M10c wires project state into the store; protocol types only for now
+        case let .projectList(list):
+            projects = list
+            // Drop terminal mappings for projects that no longer exist.
+            let live = Set(list.map(\.path))
+            projectTerminals = projectTerminals.filter { live.contains($0.key) }
+        case let .projectAdded(project):
+            // Arrives twice for the requesting client (direct reply + broadcast) by design.
+            if let i = projects.firstIndex(where: { $0.path == project.path }) {
+                projects[i] = project
+            } else {
+                projects.append(project)
+            }
+        case let .projectRemoved(path):
+            projects.removeAll { $0.path == path }
+            projectTerminals[path] = nil
+        case let .projectTerminalOpened(path, pane):
+            projectTerminals[path] = pane
+        case let .projectTerminalClosed(path):
+            projectTerminals[path] = nil
         }
     }
 
@@ -57,18 +92,41 @@ public final class AgentStore: ObservableObject {
         lastError = nil
         needsRefresh = false
         adapters = AgentStore.defaultAdapters
+        projects = []
+        projectTerminals = [:]
     }
 
-    /// Worktrees grouped by project (projects sorted; worktrees within a project sorted by pane).
+    /// Projects with their worktrees, ready to render. Projects sort by display name, worktrees
+    /// by pane. Worktrees whose project is not registered are omitted — the spec's "fresh start"
+    /// decision — so they are absent from the order and the attention count too.
+    public var sidebar: [SidebarProject] {
+        let byPath = Dictionary(grouping: worktrees.values, by: { $0.project })
+        return projects
+            .sorted { ($0.name, $0.path) < ($1.name, $1.path) }
+            .map { p in
+                let mine = (byPath[p.path] ?? []).sorted { $0.pane < $1.pane }
+                return SidebarProject(
+                    path: p.path, name: p.name, kind: p.kind, worktrees: mine,
+                    attentionCount: mine.filter { $0.state == .needsInput || $0.state == .completed }.count)
+            }
+    }
+
+    /// The sidebar order flattened — the stable index order for Cmd-1…9 and the palette.
+    public var orderedWorktrees: [WorktreeInfo] { sidebar.flatMap(\.worktrees) }
+
+    /// Worktrees grouped by their raw `project` string (projects sorted; worktrees within a
+    /// project sorted by pane), with no dependency on `ProjectInfo` registration.
+    ///
+    /// `sidebar` is the model new code should use — this task's brief calls it `sidebar`'s
+    /// replacement. It survives here only because `Sources/ClowderApp/ContentView.swift:68` still
+    /// renders from it, and this task (M10c Task 2, AgentStore only) is scoped away from touching
+    /// `Sources/ClowderApp/`; wiring the view onto `sidebar` is a later task's job. Once that lands,
+    /// delete this property.
     public var byProject: [(project: String, worktrees: [WorktreeInfo])] {
         Dictionary(grouping: worktrees.values, by: { $0.project })
             .map { (project: $0.key, worktrees: $0.value.sorted { $0.pane < $1.pane }) }
             .sorted { $0.project < $1.project }
     }
-
-    /// The sidebar order flattened: worktrees grouped by project, projects sorted, worktrees by pane.
-    /// The stable index order used by Cmd-1…9 and the palette.
-    public var orderedWorktrees: [WorktreeInfo] { byProject.flatMap { $0.worktrees } }
 
     /// Worktrees that want a response — NeedsInput or Completed — in sidebar order.
     public var worktreesNeedingAttention: [WorktreeInfo] {

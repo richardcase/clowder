@@ -7,6 +7,9 @@ final class NavigationTests: XCTestCase {
         let fake = FakeControlTransport()
         let model = AppModel(makeTransport: { fake })
         model.connect()
+        // `orderedWorktrees` now requires each worktree's project to be registered (M10c) —
+        // register /a and /b before feeding the worktree list.
+        fake.deliver(#"{"type":"projectList","projects":[{"path":"/a","name":"a","kind":"git"},{"path":"/b","name":"b","kind":"git"}]}"#)
         fake.deliver(#"{"type":"worktreeList","worktrees":[{"pane":1,"project":"/a","name":"t1","branch":"clowder/t1","state":"Working"},{"pane":2,"project":"/a","name":"t2","branch":"clowder/t2","state":"NeedsInput"},{"pane":3,"project":"/b","name":"t3","branch":"clowder/t3","state":"NeedsInput"}]}"#)
         return model
     }
@@ -40,6 +43,7 @@ final class NavigationTests: XCTestCase {
         let fake = FakeControlTransport()
         let m = AppModel(makeTransport: { fake })
         m.connect()
+        fake.deliver(#"{"type":"projectList","projects":[{"path":"/a","name":"a","kind":"git"}]}"#)
         fake.deliver(#"{"type":"worktreeList","worktrees":[{"pane":1,"project":"/a","name":"t","branch":"clowder/t","state":"Working"}]}"#)
         m.selectedPane = 1
         m.selectNextAttention()
