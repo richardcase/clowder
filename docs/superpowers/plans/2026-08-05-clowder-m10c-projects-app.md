@@ -737,6 +737,55 @@ Validation lives in `ClowderCore` so it is unit-tested; the sheets stay thin.
 
 The name rules must mirror the daemon's `validate_workspace_name` so the sheet can disable Create rather than round-tripping an error: non-empty, ≤64 chars, `[A-Za-z0-9._-]` only, no leading `.` or `-`, not `.`/`..`, no `..`, no `.lock` suffix, no trailing `.`. **The daemon remains the authority** — this is a convenience mirror, and a name that slips through still gets a clean daemon error.
 
+**The duplication is deliberate and must be guarded.** Two implementations of one rule set drift silently — `validate_workspace_name` gained its trailing-dot rule mid-stack in M10a, *after* the spec's rule list was written, and nothing would have caught a Swift mirror written against the older list. So this task also adds a **shared case table** that both languages' tests read, in the same spirit as the wire fixtures.
+
+Create `docs/protocol/fixtures/worktree-names.json`:
+
+```json
+[{"name":"a","valid":true},
+ {"name":"add-projects","valid":true},
+ {"name":"fix_bug","valid":true},
+ {"name":"v1.2","valid":true},
+ {"name":"M10a","valid":true},
+ {"name":"a-b_c.d","valid":true},
+ {"name":"","valid":false},
+ {"name":".","valid":false},
+ {"name":"..","valid":false},
+ {"name":"a..b","valid":false},
+ {"name":"x.lock","valid":false},
+ {"name":"v1.","valid":false},
+ {"name":"my feature","valid":false},
+ {"name":"feat/x","valid":false},
+ {"name":".hidden","valid":false},
+ {"name":"-dash","valid":false},
+ {"name":"café","valid":false}]
+```
+
+(The 65-character case is omitted deliberately — it is unreadable as a literal. Keep testing it separately on each side.)
+
+Add a Rust test in `crates/clowder-workspace/src/lib.rs`'s `mod tests` reading the same file:
+
+```rust
+    #[test]
+    fn agrees_with_the_shared_name_cases() {
+        #[derive(serde::Deserialize)]
+        struct Case { name: String, valid: bool }
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/protocol/fixtures/worktree-names.json");
+        let raw = std::fs::read_to_string(&p)
+            .unwrap_or_else(|e| panic!("missing {}: {e}", p.display()));
+        for c in serde_json::from_str::<Vec<Case>>(&raw).unwrap() {
+            assert_eq!(validate_workspace_name(&c.name).is_ok(), c.valid,
+                       "disagreed on {:?} — if you changed a rule, update the shared cases and the Swift mirror",
+                       c.name);
+        }
+    }
+```
+
+`clowder-workspace` needs `serde` and `serde_json` as dev-dependencies for this; add them to its `Cargo.toml` `[dev-dependencies]` if absent, and commit the regenerated `Cargo.lock` (CI runs `--locked`).
+
+The Swift side reads the same file in `SheetFormsTests` — see Step 1.
+
 - [ ] **Step 1: Write the failing tests**
 
 ```swift
@@ -767,6 +816,25 @@ final class SheetFormsTests: XCTestCase {
 
     func testNewWorktreeFormRequiresAProject() {
         XCTAssertFalse(NewWorktreeForm(projectPath: "", name: "ok", adapter: "claude").isValid)
+    }
+
+    /// The same case table the Rust `validate_workspace_name` test reads. Two implementations of
+    /// one rule set drift silently otherwise — the daemon's trailing-dot rule was added after the
+    /// spec's rule list was written, and nothing would have caught a mirror built from the old one.
+    func testAgreesWithTheSharedNameCases() throws {
+        struct Case: Decodable { let name: String; let valid: Bool }
+        let here = URL(fileURLWithPath: #filePath)
+        let repo = here.deletingLastPathComponent()   // ClowderCoreTests
+            .deletingLastPathComponent()              // Tests
+            .deletingLastPathComponent()              // macos
+            .deletingLastPathComponent()              // repo root
+        let data = try Data(contentsOf: repo.appendingPathComponent(
+            "docs/protocol/fixtures/worktree-names.json"))
+        for c in try JSONDecoder().decode([Case].self, from: data) {
+            let form = NewWorktreeForm(projectPath: "/p", name: c.name, adapter: "claude")
+            XCTAssertEqual(form.nameError == nil, c.valid,
+                           "disagreed on \(c.name.debugDescription) — if you changed a rule, update the shared cases and the Rust validator")
+        }
     }
 
     func testNameErrorNamesTheProblem() {
