@@ -1,7 +1,7 @@
 use crate::agent::AgentAdapter;
 use crate::notify::{Notifier, OsNotifier};
 use crate::{Pane, PaneCommand};
-use anyhow::Result;
+use anyhow::{bail, Result};
 use clowder_proto::AttentionState;
 use clowder_proto::{ClientToDaemon, DaemonToClient, MsgStream, PaneId};
 use clowder_proto::{PaneTree, SplitDirection, SplitId};
@@ -31,6 +31,14 @@ pub(crate) fn companion_command(shell: String, cwd: std::path::PathBuf) -> PaneC
     PaneCommand { program: shell, args: vec![], cwd: Some(cwd), env: vec![] }
 }
 
+/// A change to the project list, broadcast to every connected client.
+/// Task 7 adds a third variant, `TerminalClosed(PathBuf)`.
+#[derive(Clone, Debug)]
+pub enum ProjectChange {
+    Added(crate::projects::ProjectRecord),
+    Removed(PathBuf),
+}
+
 pub struct Daemon {
     panes: Arc<Mutex<HashMap<PaneId, Arc<Pane>>>>,
     next_id: AtomicU64,
@@ -54,6 +62,8 @@ pub struct Daemon {
     pub(crate) default_rows: u16,
     pub(crate) shell: String,
     registry: Arc<crate::registry::Registry>,
+    projects: Arc<crate::projects::ProjectStore>,
+    projects_tx: broadcast::Sender<ProjectChange>,
     /// Agents whose ratios changed since the last flush; drained by the periodic layout flusher.
     layout_dirty: Arc<Mutex<std::collections::HashSet<PaneId>>>,
     /// Idle debounce before content-based attention inspects the screen for a blocking prompt.
@@ -66,9 +76,26 @@ impl Daemon {
     }
 
     pub fn new_with(notifier: Arc<dyn Notifier>, hook_sock: PathBuf) -> Daemon {
+        Daemon::new_with_paths(
+            notifier,
+            hook_sock,
+            crate::registry::Registry::default_path(),
+            crate::projects::ProjectStore::default_path(),
+        )
+    }
+
+    /// Like `new_with`, but with both state files given explicitly. Tests use this to point at a
+    /// temp dir without setting process-global env vars (which would force them to serialize).
+    pub fn new_with_paths(
+        notifier: Arc<dyn Notifier>,
+        hook_sock: PathBuf,
+        registry_path: PathBuf,
+        projects_path: PathBuf,
+    ) -> Daemon {
         let (attention_tx, _) = broadcast::channel(256);
         let (removed_tx, _) = broadcast::channel(256);
         let (split_tx, _) = broadcast::channel(256);
+        let (projects_tx, _) = broadcast::channel(256);
         Daemon {
             panes: Arc::new(Mutex::new(HashMap::new())),
             next_id: AtomicU64::new(1),
@@ -91,7 +118,9 @@ impl Daemon {
             default_cols: 80,
             default_rows: 24,
             shell: std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()),
-            registry: Arc::new(crate::registry::Registry::new(crate::registry::Registry::default_path())),
+            registry: Arc::new(crate::registry::Registry::new(registry_path)),
+            projects: Arc::new(crate::projects::ProjectStore::new(projects_path)),
+            projects_tx,
             layout_dirty: Arc::new(Mutex::new(std::collections::HashSet::new())),
             content_idle: std::time::Duration::from_millis(500),
         }
@@ -106,6 +135,56 @@ impl Daemon {
         d.default_rows = config.default_rows;
         d.shell = config.shell;
         d
+    }
+
+    pub fn subscribe_projects(&self) -> broadcast::Receiver<ProjectChange> {
+        self.projects_tx.subscribe()
+    }
+
+    pub fn list_projects(&self) -> Vec<crate::projects::ProjectRecord> {
+        let mut out = self.projects.list();
+        out.sort_by(|a, b| a.path.cmp(&b.path));
+        out
+    }
+
+    /// Is `path` (canonicalized here) a registered project?
+    pub fn is_registered_project(&self, path: &Path) -> bool {
+        match path.canonicalize() {
+            Ok(c) => self.projects.contains(&c),
+            Err(_) => false,
+        }
+    }
+
+    pub fn add_project(&self, path: &Path) -> Result<crate::projects::ProjectRecord> {
+        let rec = self.projects.add(path)?;
+        let _ = self.projects_tx.send(ProjectChange::Added(rec.clone()));
+        Ok(rec)
+    }
+
+    /// Remove a project. Refused while any worktree still belongs to it — there must be no path
+    /// by which removing a sidebar row abandons live work.
+    pub fn remove_project(&self, path: &Path) -> Result<()> {
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        // Canonicalize BOTH sides. Task 5 makes spawn_agent store a canonical path, but this
+        // must be correct before that lands too — otherwise on macOS an uncanonical
+        // AgentMeta.project (/var/...) never matches a canonical project (/private/var/...),
+        // the count comes back 0, and the guard silently lets the removal through.
+        let n = self
+            .agents
+            .lock()
+            .values()
+            .filter(|m| {
+                let p = Path::new(&m.project);
+                p.canonicalize().unwrap_or_else(|_| p.to_path_buf()) == canonical
+            })
+            .count();
+        if n > 0 {
+            bail!("project {} still has {n} worktree(s) — land or discard them first", canonical.display());
+        }
+        // Task 7 adds: kill this project's terminal pane here, before dropping the record.
+        self.projects.remove(&canonical)?;
+        let _ = self.projects_tx.send(ProjectChange::Removed(canonical));
+        Ok(())
     }
 
     pub fn set_attention(&self, pane: PaneId, state: AttentionState) {
@@ -2351,5 +2430,92 @@ mod tests {
             "BEL must still escalate to NeedsInput");
         daemon.shutdown();
         std::env::remove_var("CLOWDER_STATE_FILE");
+    }
+
+    /// A temp git repo, initialized and committed — the same shape `control_json.rs`'s tests use.
+    fn init_repo() -> tempfile::TempDir {
+        use std::process::Command as PCommand;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        let run = |args: &[&str]| {
+            assert!(PCommand::new("git").arg("-C").arg(p).args(args).status().unwrap().success());
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@t.test"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(p.join("README.md"), b"hi").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-qm", "init"]);
+        dir
+    }
+
+    /// A daemon whose registry AND project store live in `dir` — no env vars, no global lock.
+    fn test_daemon_in(dir: &std::path::Path) -> Arc<Daemon> {
+        Arc::new(Daemon::new_with_paths(
+            Arc::new(crate::FakeNotifier::new()),
+            std::path::PathBuf::from("/tmp/unused-m10b.sock"),
+            dir.join("agents.json"),
+            dir.join("projects.json"),
+        ))
+    }
+
+    #[tokio::test]
+    async fn add_and_list_projects_round_trips() {
+        let state = tempfile::tempdir().unwrap();
+        let repo = init_repo();
+        let d = test_daemon_in(state.path());
+        let rec = d.add_project(repo.path()).unwrap();
+        assert_eq!(rec.path, repo.path().canonicalize().unwrap());
+        assert_eq!(rec.kind, "git");
+        assert_eq!(d.list_projects().len(), 1);
+        assert!(d.is_registered_project(repo.path()), "uncanonical path must still match");
+    }
+
+    #[tokio::test]
+    async fn remove_project_is_refused_while_a_worktree_exists() {
+        use crate::SyntheticAdapter;
+        let state = tempfile::tempdir().unwrap();
+        let repo = init_repo();
+        let d = test_daemon_in(state.path());
+        d.add_project(repo.path()).unwrap();
+        let adapter = SyntheticAdapter {
+            command: crate::PaneCommand {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), "sleep 30".into()],
+                cwd: None,
+                env: vec![],
+            },
+        };
+        let pane = d.spawn_agent(repo.path(), &adapter, "feat").unwrap();
+
+        let e = d.remove_project(repo.path()).unwrap_err().to_string();
+        assert!(e.contains("1"), "message should say how many: {e}");
+        assert_eq!(d.list_projects().len(), 1, "project must survive a refused removal");
+
+        d.discard_agent(pane).unwrap();
+        d.remove_project(repo.path()).unwrap();      // now allowed
+        assert!(d.list_projects().is_empty());
+    }
+
+    #[tokio::test]
+    async fn project_changes_broadcast_to_subscribers() {
+        let state = tempfile::tempdir().unwrap();
+        let repo = init_repo();
+        let d = test_daemon_in(state.path());
+        let mut rx = d.subscribe_projects();
+        d.add_project(repo.path()).unwrap();
+        match tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await {
+            Ok(Ok(crate::server::ProjectChange::Added(rec))) => {
+                assert_eq!(rec.path, repo.path().canonicalize().unwrap());
+            }
+            other => panic!("expected Added, got {other:?}"),
+        }
+        d.remove_project(repo.path()).unwrap();
+        match tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await {
+            Ok(Ok(crate::server::ProjectChange::Removed(p))) => {
+                assert_eq!(p, repo.path().canonicalize().unwrap());
+            }
+            other => panic!("expected Removed, got {other:?}"),
+        }
     }
 }
