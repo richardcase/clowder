@@ -951,4 +951,23 @@ Claude-Session: https://claude.ai/code/session_01QrYWovZ9oDuyDhbhRkksEC"
 
 - `validate_workspace_name` and `detect_kind`'s `None` case are both unused after M10a — M10b wires them into `add_project` and `spawn_agent`.
 - `project` is **not** canonicalized in M10a. M10b's `add_project` canonicalizes, and `spawn_agent`'s registered-project check must canonicalize its argument the same way or every `/tmp` project fails on macOS (`/tmp` → `/private/tmp`).
-- `JsonStore::mutate` always rewrites the file, even when the closure changed nothing. That is fine for `set_tree`'s no-op case and keeps the interface to one method; revisit only if profiling says otherwise.
+- ~~`JsonStore::mutate` always rewrites the file…~~ **This note was wrong and was corrected during execution.** Always-writing silently changed `set_tree`'s no-op case from zero I/O to a full atomic rewrite, which broke the PR's behaviour-neutrality contract. `JsonStore::mutate_if` was added; `set_tree` routes through it. The lesson generalises: the plan framed this as a *performance* question when it was a *behaviour* question.
+
+### Carried forward from the M10a whole-branch review
+
+**Do in M10b:**
+
+- **`JsonStore::mutate` swallows write failures** (`store.rs`) — it warns and returns the closure's value as though it persisted. Faithful to the old `Registry::write`, so correct for M10a, but `add_project` will report success for a project that never reached disk and the user only finds out after a daemon restart. Add a `try_mutate -> Result<R>` for paths answering a user request.
+- **`remove` still writes when the id is absent**, now inconsistent with `set_tree`. Pre-existing behaviour, deliberately preserved in a behaviour-neutral PR — decide in M10b whether it should match.
+- **Keep `JsonStore` policy-free.** `remove_project`'s "refuse while worktrees exist" check belongs above the store, not inside it.
+- **`task` vs `name` is split.** The same string is `task` in `ControlRequest::SpawnAgent`, `AgentRecord.task` and Swift `spawnAgent(task:)`, but `name` in `WorktreeInfo`. Intentional (the spec freezes `SpawnAgent`'s wire shape, and `AgentRecord.task` is what keeps `agents.json` readable across the upgrade) — but M10b should decide whether the spawn request follows or the split becomes permanent.
+- **Add a trailing-dot-style audit to any new validation.** M10a's `validate_workspace_name` originally accepted `v1.`, which `git check-ref-format` rejects; the rule list in the spec had the same omission. Check new rules against `git check-ref-format` directly rather than reasoning about them.
+
+**Process lessons that cost real time here:**
+
+- **Grep both spellings when renaming a serde type.** M10a's straggler check grepped Rust identifiers only (`AgentInfo|AgentList|ListAgents|list_agents`) and reported clean, while `crates/clowder-client/src/tofu.rs:152` still sent the camelCase wire literal `{"type":"listAgents"}` — caught only by the final whole-branch review. Grep the identifier **and** its camelCase JSON spelling.
+- **Enumerate both directions of a protocol.** The plan listed `DaemonToClient::AgentList` but missed `ClientToDaemon::ListAgents`, a live request handled at three sites.
+- **The Rust↔Swift JSON seam has no mechanical guard.** Both sides hand-write the shape and both suites are self-consistent, so the Swift tests would pass unchanged against a diverged Rust encoder. M10b/M10c add `ProjectInfo` plus five requests and five events. A checked-in golden fixture set (`docs/protocol/fixtures/*.json`) that the Rust test asserts its encoder *produces* and the Swift test *decodes* turns divergence into a test failure. Cheap now, expensive after M10c.
+- **`swift test` never compiles `Sources/ClowderApp/`** (it needs the vendored libghostty). Edits there are unverified by any local compiler; CI is the first real check. Budget for that, or keep app-layer edits small and re-read them.
+
+**Deferred cosmetics** (harmless, batch whenever): pre-existing `unused imports` warning at `crates/clowder-proto/src/transport.rs:1`; stale Swift test names (`testAgentListReplacesAndClearsRefresh` et al.); `ModelsTests.testDecodeWorktreeList` is nearly subsumed by `testWorktreeListDecodesNameAndBranch`; `control.rs`'s `worktree_list_event_json_shape` never asserts the `"worktrees"` array key, which is exactly the key the Swift decoder depends on.
