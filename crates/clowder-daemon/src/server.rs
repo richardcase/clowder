@@ -83,6 +83,11 @@ pub struct Daemon {
     layout_dirty: Arc<Mutex<std::collections::HashSet<PaneId>>>,
     /// Idle debounce before content-based attention inspects the screen for a blocking prompt.
     pub(crate) content_idle: std::time::Duration,
+    /// Serializes project-list mutations against agent spawns. `spawn_agent` validates the project
+    /// then provisions for hundreds of milliseconds before it appears in `agents`; without this,
+    /// a concurrent `remove_project` counts zero worktrees and removes a project out from under a
+    /// live agent. Held across the WHOLE of each operation, not just the check.
+    project_mutation: Mutex<()>,
 }
 
 impl Daemon {
@@ -140,6 +145,7 @@ impl Daemon {
             term_project: Arc::new(Mutex::new(HashMap::new())),
             layout_dirty: Arc::new(Mutex::new(std::collections::HashSet::new())),
             content_idle: std::time::Duration::from_millis(500),
+            project_mutation: Mutex::new(()),
         }
     }
 
@@ -181,6 +187,7 @@ impl Daemon {
     /// Remove a project. Refused while any worktree still belongs to it — there must be no path
     /// by which removing a sidebar row abandons live work.
     pub fn remove_project(&self, path: &Path) -> Result<()> {
+        let _mutation = self.project_mutation.lock();
         let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         // Canonicalize BOTH sides. Task 5 makes spawn_agent store a canonical path, but this
         // must be correct before that lands too — otherwise on macOS an uncanonical
@@ -473,6 +480,7 @@ impl Daemon {
 
     /// Provision an isolated worktree, inject the adapter's hooks, and spawn the agent in it.
     pub fn spawn_agent(self: &Arc<Self>, project: &Path, adapter: &dyn AgentAdapter, name: &str) -> Result<PaneId> {
+        let _mutation = self.project_mutation.lock();
         // Canonicalize first — the registered-project check compares canonical paths, and on
         // macOS /tmp resolves to /private/tmp.
         let project = project
@@ -2862,6 +2870,56 @@ mod tests {
         d.discard_agent(pane).unwrap();
         d.remove_project(repo.path()).unwrap();      // now allowed
         assert!(d.list_projects().is_empty());
+    }
+
+    #[tokio::test]
+    async fn remove_project_cannot_race_a_spawn_into_it() {
+        use crate::SyntheticAdapter;
+        use std::sync::Arc as StdArc;
+        let state = tempfile::tempdir().unwrap();
+        let repo = crate::test_support::init_repo();
+        let d = test_daemon_in(state.path());
+        d.add_project(repo.path()).unwrap();
+
+        let adapter = SyntheticAdapter { command: crate::PaneCommand {
+            program: "/bin/sh".into(), args: vec!["-c".into(), "sleep 30".into()], cwd: None, env: vec![] } };
+
+        // Spawn on a blocking thread while the main task hammers remove_project. Without the
+        // serialization, remove_project can observe an empty `agents` map during the provisioning
+        // window and drop the project out from under a live agent.
+        //
+        // spawn_agent's hookless-scanner setup (finalize_agent) does a bare `tokio::spawn`, which
+        // needs ambient runtime context. A plain `std::thread` has none, so enter the current
+        // Handle here — otherwise the thread panics with "no reactor running" before the race
+        // between remove_project and spawn_agent is ever exercised.
+        let rt = tokio::runtime::Handle::current();
+        let d2 = StdArc::clone(&d);
+        let path = repo.path().to_path_buf();
+        let spawner = std::thread::spawn(move || {
+            let _guard = rt.enter();
+            d2.spawn_agent(&path, &adapter, "racy")
+        });
+
+        let mut removed_while_spawning = false;
+        for _ in 0..200 {
+            if d.remove_project(repo.path()).is_ok() {
+                removed_while_spawning = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let pane = spawner.join().unwrap();
+
+        if let Ok(pane) = pane {
+            assert!(!removed_while_spawning,
+                    "removed the project while an agent was being spawned into it");
+            assert!(d.is_registered_project(repo.path()), "project must still be registered");
+            d.teardown_agent(pane).unwrap();
+        } else {
+            // The spawn lost the race and was rejected — acceptable, but then the project must
+            // genuinely be gone, not half-removed.
+            assert!(!d.is_registered_project(repo.path()));
+        }
     }
 
     #[tokio::test]
