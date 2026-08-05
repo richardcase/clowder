@@ -40,6 +40,7 @@ impl Daemon {
         let mut att_rx = self.subscribe_attention();
         let mut removed_rx = self.subscribe_removed();
         let mut split_rx = self.subscribe_splits();
+        let mut proj_rx = self.subscribe_projects();
 
         write_event(&mut wr, &ControlEvent::WorktreeList { worktrees: self.list_worktrees() }).await?;
 
@@ -89,13 +90,22 @@ impl Daemon {
                                     Ok(()) => ControlEvent::AgentRemoved { pane },
                                     Err(e) => ControlEvent::Error { message: e.to_string() },
                                 },
-                                // Dispatch lands in later tasks (project CRUD: Task 4; terminal:
-                                // Task 7; restart: Task 6). The wire shapes exist now so both
-                                // sides of the protocol can be built against them.
-                                Ok(ControlRequest::ListProjects)
-                                | Ok(ControlRequest::AddProject { .. })
-                                | Ok(ControlRequest::RemoveProject { .. })
-                                | Ok(ControlRequest::OpenProjectTerminal { .. })
+                                Ok(ControlRequest::ListProjects) =>
+                                    ControlEvent::ProjectList { projects: self.list_projects() },
+                                Ok(ControlRequest::AddProject { path }) =>
+                                    match self.add_project(Path::new(&path)) {
+                                        Ok(rec) => ControlEvent::ProjectAdded { project: crate::server::project_info(rec) },
+                                        Err(e) => ControlEvent::Error { message: e.to_string() },
+                                    },
+                                Ok(ControlRequest::RemoveProject { path }) =>
+                                    match self.remove_project(Path::new(&path)) {
+                                        Ok(()) => ControlEvent::ProjectRemoved { path },
+                                        Err(e) => ControlEvent::Error { message: e.to_string() },
+                                    },
+                                // Dispatch lands in later tasks (terminal: Task 7; restart: Task 6).
+                                // The wire shapes exist now so both sides of the protocol can be
+                                // built against them.
+                                Ok(ControlRequest::OpenProjectTerminal { .. })
                                 | Ok(ControlRequest::RestartWorktree { .. }) =>
                                     ControlEvent::Error { message: "not implemented".into() },
                                 Err(e) => ControlEvent::Error { message: format!("bad request: {e}") },
@@ -124,6 +134,18 @@ impl Daemon {
                     match sp {
                         Ok((agent, tree)) =>
                             write_event(&mut wr, &ControlEvent::SplitTreeChanged { agent, tree }).await?,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(_) => break,
+                    }
+                }
+                pc = proj_rx.recv() => {
+                    match pc {
+                        Ok(crate::server::ProjectChange::Added(rec)) =>
+                            write_event(&mut wr, &ControlEvent::ProjectAdded {
+                                project: crate::server::project_info(rec) }).await?,
+                        Ok(crate::server::ProjectChange::Removed(p)) =>
+                            write_event(&mut wr, &ControlEvent::ProjectRemoved {
+                                path: p.to_string_lossy().to_string() }).await?,
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                         Err(_) => break,
                     }
@@ -312,6 +334,76 @@ mod tests {
         assert!(ids.contains(&"codex".to_string()));
         assert!(ids.contains(&"shell".to_string()));
         assert!(!ids.contains(&"synthetic".to_string()), "must expose descriptor id 'shell', not 'synthetic'");
+    }
+
+    #[tokio::test]
+    async fn control_json_adds_lists_and_streams_projects() {
+        let state = tempfile::tempdir().unwrap();
+        let repo = init_repo();
+        let daemon = Arc::new(Daemon::new_with_paths(
+            Arc::new(FakeNotifier::new()),
+            std::path::PathBuf::from("/tmp/unused-projects.sock"),
+            state.path().join("agents.json"),
+            state.path().join("projects.json"),
+        ));
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let d = daemon.clone();
+        tokio::spawn(async move { let _ = d.handle_control_json(server_io).await; });
+        let (crd, mut cwr) = tokio::io::split(client_io);
+        let mut clines = BufReader::new(crd).lines();
+        let _snapshot = clines.next_line().await.unwrap().unwrap();
+
+        let req = ControlRequest::AddProject { path: repo.path().to_string_lossy().to_string() };
+        let mut line = serde_json::to_string(&req).unwrap();
+        line.push('\n');
+        cwr.write_all(line.as_bytes()).await.unwrap();
+
+        // The reply is ProjectAdded, with the kind detected and the name derived.
+        let added = loop {
+            let l = clines.next_line().await.unwrap().unwrap();
+            if let Ok(ControlEvent::ProjectAdded { project }) = serde_json::from_str::<ControlEvent>(&l) {
+                break project;
+            }
+        };
+        assert_eq!(added.kind, "git");
+        assert_eq!(added.path, repo.path().canonicalize().unwrap().to_string_lossy());
+
+        cwr.write_all(b"{\"type\":\"listProjects\"}\n").await.unwrap();
+        let listed = loop {
+            let l = clines.next_line().await.unwrap().unwrap();
+            if let Ok(ControlEvent::ProjectList { projects }) = serde_json::from_str::<ControlEvent>(&l) {
+                if !projects.is_empty() { break projects; }
+            }
+        };
+        assert_eq!(listed.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn control_json_add_project_rejects_a_non_repo() {
+        let state = tempfile::tempdir().unwrap();
+        let plain = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(Daemon::new_with_paths(
+            Arc::new(FakeNotifier::new()),
+            std::path::PathBuf::from("/tmp/unused-projects2.sock"),
+            state.path().join("agents.json"),
+            state.path().join("projects.json"),
+        ));
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let d = daemon.clone();
+        tokio::spawn(async move { let _ = d.handle_control_json(server_io).await; });
+        let (crd, mut cwr) = tokio::io::split(client_io);
+        let mut clines = BufReader::new(crd).lines();
+        let _snapshot = clines.next_line().await.unwrap().unwrap();
+
+        let req = ControlRequest::AddProject { path: plain.path().to_string_lossy().to_string() };
+        let mut line = serde_json::to_string(&req).unwrap();
+        line.push('\n');
+        cwr.write_all(line.as_bytes()).await.unwrap();
+
+        let l = clines.next_line().await.unwrap().unwrap();
+        assert!(l.contains("not a git or jj repository"), "expected a helpful error: {l}");
+        assert!(daemon.list_projects().is_empty());
     }
 
     #[tokio::test]
