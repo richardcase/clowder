@@ -153,20 +153,28 @@ impl WorkspaceDriver for JjDriver {
     }
 }
 
-/// Pick a workspace driver for `project`: jj if a `.jj` dir is found at `project` or an
-/// ancestor, else git. `.jj` wins over `.git` (colocated repos), matching jj's own behaviour.
-pub fn driver_for(project: &Path) -> Arc<dyn WorkspaceDriver> {
+/// The workspace kind for `project`, or `None` if it is not a repo at all.
+/// Walks `project` and its ancestors; `.jj` wins over `.git` (colocated repos), matching
+/// jj's own behaviour. Note `.git` is `.exists()` rather than `.is_dir()`: a linked git
+/// worktree records `.git` as a FILE.
+pub fn detect_kind(project: &Path) -> Option<WorkspaceKind> {
     let mut cur = Some(project);
     while let Some(dir) = cur {
         if dir.join(".jj").is_dir() {
-            return Arc::new(JjDriver);
+            return Some(WorkspaceKind::Jj);
         }
         if dir.join(".git").exists() {
-            return Arc::new(GitWorktreeDriver);
+            return Some(WorkspaceKind::Git);
         }
         cur = dir.parent();
     }
-    Arc::new(GitWorktreeDriver)
+    None
+}
+
+/// Pick a workspace driver for `project`. Falls back to git when `project` is not a repo,
+/// preserving the pre-M10 contract; callers that need to REJECT a non-repo use `detect_kind`.
+pub fn driver_for(project: &Path) -> Arc<dyn WorkspaceDriver> {
+    detect_kind(project).map(driver_for_kind).unwrap_or_else(|| Arc::new(GitWorktreeDriver))
 }
 
 /// The driver matching a provisioned workspace's kind — used to route land/discard.
@@ -369,5 +377,45 @@ mod tests {
             assert_eq!(WorkspaceKind::from_str(k.as_str()), Some(k));
         }
         assert_eq!(WorkspaceKind::from_str("nope"), None);
+    }
+
+    #[test]
+    fn detect_kind_none_when_not_a_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(detect_kind(dir.path()), None);
+    }
+
+    #[test]
+    fn detect_kind_git_and_jj_with_jj_winning() {
+        let git = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(git.path().join(".git")).unwrap();
+        assert_eq!(detect_kind(git.path()), Some(WorkspaceKind::Git));
+
+        let jj = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(jj.path().join(".jj")).unwrap();
+        assert_eq!(detect_kind(jj.path()), Some(WorkspaceKind::Jj));
+
+        // Colocated: .jj wins, matching jj's own behaviour.
+        let both = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(both.path().join(".git")).unwrap();
+        std::fs::create_dir_all(both.path().join(".jj")).unwrap();
+        assert_eq!(detect_kind(both.path()), Some(WorkspaceKind::Jj));
+    }
+
+    #[test]
+    fn detect_kind_finds_marker_in_ancestor() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        let nested = dir.path().join("a").join("b");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert_eq!(detect_kind(&nested), Some(WorkspaceKind::Git));
+    }
+
+    #[test]
+    fn detect_kind_treats_git_file_as_git() {
+        // A linked worktree has `.git` as a FILE, not a dir — `.exists()` must accept both.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".git"), b"gitdir: /elsewhere").unwrap();
+        assert_eq!(detect_kind(dir.path()), Some(WorkspaceKind::Git));
     }
 }
