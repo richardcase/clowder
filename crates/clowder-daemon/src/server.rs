@@ -1,7 +1,7 @@
 use crate::agent::AgentAdapter;
 use crate::notify::{Notifier, OsNotifier};
 use crate::{Pane, PaneCommand};
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clowder_proto::AttentionState;
 use clowder_proto::{ClientToDaemon, DaemonToClient, MsgStream, PaneId};
 use clowder_proto::{PaneTree, SplitDirection, SplitId};
@@ -301,10 +301,32 @@ impl Daemon {
     }
 
     /// Provision an isolated worktree, inject the adapter's hooks, and spawn the agent in it.
-    pub fn spawn_agent(self: &Arc<Self>, project: &Path, adapter: &dyn AgentAdapter, task: &str) -> Result<PaneId> {
+    pub fn spawn_agent(self: &Arc<Self>, project: &Path, adapter: &dyn AgentAdapter, name: &str) -> Result<PaneId> {
+        // Canonicalize first — the registered-project check compares canonical paths, and on
+        // macOS /tmp resolves to /private/tmp.
+        let project = project
+            .canonicalize()
+            .with_context(|| format!("no such project path: {}", project.display()))?;
+        if !self.projects.contains(&project) {
+            bail!("unknown project: {} — add it first", project.display());
+        }
+        clowder_workspace::validate_workspace_name(name)?;
+
+        // Fail on a collision with a clear message instead of a raw `git worktree add` error.
+        // reconcile prunes a registry record when resume fails but leaves the worktree on disk,
+        // so an untracked directory here is a real case, not a hypothetical.
+        let wt = project.join(".clowder").join("worktrees").join(name);
+        if wt.exists() {
+            bail!("a worktree named '{name}' already exists at {} — land/discard it or choose another name", wt.display());
+        }
+        if branch_exists(&project, &format!("clowder/{name}")) {
+            bail!("branch clowder/{name} already exists in {} — choose another name", project.display());
+        }
+
+        let task = name;
         let id = self.alloc_id();
-        let driver = driver_for(project);
-        let ws = driver.provision(project, task)?;
+        let driver = driver_for(&project);
+        let ws = driver.provision(&project, task)?;
 
         // If any post-provision step fails (e.g. the agent binary isn't on PATH), tear down
         // the freshly-provisioned worktree/branch instead of leaking it — otherwise a retry
@@ -934,6 +956,20 @@ impl Daemon {
     }
 }
 
+/// Does `branch` already exist in `project`? Best-effort: a false negative just means the
+/// underlying driver reports the collision instead, which is the pre-M10b behaviour.
+fn branch_exists(project: &Path, branch: &str) -> bool {
+    use clowder_workspace::WorkspaceKind;
+    match clowder_workspace::detect_kind(project) {
+        Some(WorkspaceKind::Jj) => std::process::Command::new("jj")
+            .arg("-R").arg(project).args(["bookmark", "list", "-r", branch])
+            .output().map(|o| o.status.success() && !o.stdout.is_empty()).unwrap_or(false),
+        _ => std::process::Command::new("git")
+            .arg("-C").arg(project).args(["branch", "--list", branch])
+            .output().map(|o| !o.stdout.is_empty()).unwrap_or(false),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1212,10 +1248,14 @@ mod tests {
         use std::sync::Arc as StdArc;
 
         let repo = init_repo();
-        let daemon = StdArc::new(Daemon::new_with(
+        let state = tempfile::tempdir().unwrap();
+        let daemon = StdArc::new(Daemon::new_with_paths(
             StdArc::new(FakeNotifier::new()),
             std::path::PathBuf::from("/tmp/unused-listagents.sock"),
+            state.path().join("agents.json"),
+            state.path().join("projects.json"),
         ));
+        daemon.add_project(repo.path()).unwrap();
         let adapter = SyntheticAdapter {
             command: crate::PaneCommand {
                 program: "/bin/sh".into(),
@@ -1233,9 +1273,9 @@ mod tests {
         assert_eq!(a.pane, pane);
         assert_eq!(a.name, "task-a");
         assert_eq!(a.branch, "clowder/task-a");
-        // project is now the FULL path, not a basename — two repos with the same dir name
-        // must not collapse into one sidebar group.
-        assert_eq!(a.project, repo.path().to_string_lossy());
+        // project is now the FULL, CANONICAL path (spawn_agent canonicalizes it) — two repos
+        // with the same dir name must not collapse into one sidebar group.
+        assert_eq!(a.project, repo.path().canonicalize().unwrap().to_string_lossy());
         assert_eq!(a.state, AttentionState::NeedsInput);
 
         daemon.teardown_agent(pane).unwrap();
@@ -1262,10 +1302,13 @@ mod tests {
         let _state_lock = crate::STATE_FILE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLOWDER_STATE_FILE", statedir.path().join("agents.json"));
 
-        let daemon = Arc::new(Daemon::new_with(
+        let daemon = Arc::new(Daemon::new_with_paths(
             Arc::new(FakeNotifier::new()),
             std::path::PathBuf::from("/tmp/unused-m9.sock"),
+            statedir.path().join("agents.json"),
+            statedir.path().join("projects.json"),
         ));
+        daemon.add_project(repo.path()).unwrap();
         let adapter = SyntheticAdapter {
             command: crate::PaneCommand {
                 program: "/bin/sh".into(),
@@ -1307,12 +1350,16 @@ mod tests {
         let _state_lock = crate::STATE_FILE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLOWDER_STATE_FILE", statedir.path().join("agents.json"));
         let state_path = statedir.path().join("agents.json");
+        let projects_path = statedir.path().join("projects.json");
 
         // First daemon: spawn an agent so a worktree + registry record exist.
-        let daemon = Arc::new(Daemon::new_with(
+        let daemon = Arc::new(Daemon::new_with_paths(
             Arc::new(FakeNotifier::new()),
             std::path::PathBuf::from("/tmp/unused-reconcile1.sock"),
+            state_path.clone(),
+            projects_path.clone(),
         ));
+        daemon.add_project(repo.path()).unwrap();
         let adapter = SyntheticAdapter {
             command: crate::PaneCommand {
                 program: "/bin/sh".into(),
@@ -1325,10 +1372,13 @@ mod tests {
         let worktree_path = daemon.workspace_of(id).unwrap().path;
 
         // Simulate a fresh daemon (e.g. after a restart): a NEW Daemon on the same state file,
-        // with no in-memory agents, reconciling from the registry alone.
-        let d2 = Arc::new(Daemon::new_with(
+        // with no in-memory agents, reconciling from the registry alone. The project store
+        // (like the registry) persists across a restart, so it points at the same file too.
+        let d2 = Arc::new(Daemon::new_with_paths(
             Arc::new(FakeNotifier::new()),
             std::path::PathBuf::from("/tmp/unused-reconcile2.sock"),
+            state_path.clone(),
+            projects_path.clone(),
         ));
         d2.reconcile();
         let list = d2.list_worktrees();
@@ -1344,9 +1394,11 @@ mod tests {
         // Now corrupt: remove the worktree dir out from under the registry, then reconcile a
         // third daemon → the stale record is pruned, both in memory and on disk.
         std::fs::remove_dir_all(&worktree_path).unwrap();
-        let d3 = Arc::new(Daemon::new_with(
+        let d3 = Arc::new(Daemon::new_with_paths(
             Arc::new(FakeNotifier::new()),
             std::path::PathBuf::from("/tmp/unused-reconcile3.sock"),
+            state_path.clone(),
+            projects_path.clone(),
         ));
         d3.reconcile();
         assert!(
@@ -1382,11 +1434,16 @@ mod tests {
         let statedir = tempfile::tempdir().unwrap();
         let _state_lock = crate::STATE_FILE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLOWDER_STATE_FILE", statedir.path().join("agents.json"));
+        let state_path = statedir.path().join("agents.json");
+        let projects_path = statedir.path().join("projects.json");
 
-        let d1 = Arc::new(Daemon::new_with(
+        let d1 = Arc::new(Daemon::new_with_paths(
             Arc::new(FakeNotifier::new()),
             std::path::PathBuf::from("/tmp/unused-restore1.sock"),
+            state_path.clone(),
+            projects_path.clone(),
         ));
+        d1.add_project(repo.path()).unwrap();
         let adapter = SyntheticAdapter {
             command: crate::PaneCommand {
                 program: "/bin/sh".into(), args: vec!["-c".into(), "sleep 30".into()],
@@ -1401,9 +1458,11 @@ mod tests {
         d1.flush_dirty_layouts();
 
         // Fresh daemon over the same state file → reconcile rebuilds the layout.
-        let d2 = Arc::new(Daemon::new_with(
+        let d2 = Arc::new(Daemon::new_with_paths(
             Arc::new(FakeNotifier::new()),
             std::path::PathBuf::from("/tmp/unused-restore2.sock"),
+            state_path,
+            projects_path,
         ));
         d2.reconcile();
 
@@ -1444,10 +1503,13 @@ mod tests {
         let _state_lock = crate::STATE_FILE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLOWDER_STATE_FILE", &state_path);
 
-        let daemon = Arc::new(Daemon::new_with(
+        let daemon = Arc::new(Daemon::new_with_paths(
             Arc::new(FakeNotifier::new()),
             std::path::PathBuf::from("/tmp/unused-persist.sock"),
+            state_path.clone(),
+            statedir.path().join("projects.json"),
         ));
+        daemon.add_project(repo.path()).unwrap();
         let adapter = SyntheticAdapter {
             command: crate::PaneCommand {
                 program: "/bin/sh".into(), args: vec!["-c".into(), "sleep 30".into()],
@@ -1490,10 +1552,14 @@ mod tests {
         run(&["add", "."]);
         run(&["commit", "-qm", "init"]);
 
-        let daemon = Arc::new(Daemon::new_with(
+        let state = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(Daemon::new_with_paths(
             Arc::new(FakeNotifier::new()),
             std::path::PathBuf::from("/tmp/unused-control.sock"),
+            state.path().join("agents.json"),
+            state.path().join("projects.json"),
         ));
+        daemon.add_project(repo.path()).unwrap();
         let adapter = SyntheticAdapter {
             command: crate::PaneCommand {
                 program: "/bin/sh".into(),
@@ -1555,10 +1621,14 @@ mod tests {
         run(&["add", "."]);
         run(&["commit", "-qm", "init"]);
 
-        let daemon = Arc::new(Daemon::new_with(
+        let state = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(Daemon::new_with_paths(
             Arc::new(FakeNotifier::new()),
             std::path::PathBuf::from("/tmp/unused-reaper.sock"),
+            state.path().join("agents.json"),
+            state.path().join("projects.json"),
         ));
+        daemon.add_project(repo.path()).unwrap();
         let adapter = SyntheticAdapter {
             command: crate::PaneCommand {
                 program: "/bin/sh".into(),
@@ -1601,10 +1671,14 @@ mod tests {
         run(&["add", "."]);
         run(&["commit", "-qm", "init"]);
 
-        let daemon = Arc::new(Daemon::new_with(
+        let state = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(Daemon::new_with_paths(
             Arc::new(FakeNotifier::new()),
             std::path::PathBuf::from("/tmp/unused-teardown-race.sock"),
+            state.path().join("agents.json"),
+            state.path().join("projects.json"),
         ));
+        daemon.add_project(repo.path()).unwrap();
         let adapter = SyntheticAdapter {
             command: crate::PaneCommand {
                 program: "/bin/sh".into(),
@@ -1642,10 +1716,14 @@ mod tests {
         run(&["add", "."]);
         run(&["commit", "-qm", "init"]);
 
-        let daemon = Arc::new(Daemon::new_with(
+        let state = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(Daemon::new_with_paths(
             Arc::new(FakeNotifier::new()),
             std::path::PathBuf::from("/tmp/unused-removed.sock"),
+            state.path().join("agents.json"),
+            state.path().join("projects.json"),
         ));
+        daemon.add_project(repo.path()).unwrap();
         let adapter = SyntheticAdapter {
             command: crate::PaneCommand {
                 program: "/bin/sh".into(),
@@ -1679,16 +1757,22 @@ mod tests {
         assert_eq!(removed, Some(pane));
     }
 
-    /// Temp git repo + a daemon wired up the same way the other integration tests build one.
-    fn daemon_with_repo() -> (Arc<Daemon>, tempfile::TempDir) {
+    /// Temp git repo + a daemon wired up the same way the other integration tests build one,
+    /// with the repo already registered as a project. Returns the state TempDir too — it must
+    /// outlive the daemon, since the project/registry stores re-read their file on every call.
+    fn daemon_with_repo() -> (Arc<Daemon>, tempfile::TempDir, tempfile::TempDir) {
         use crate::FakeNotifier;
 
         let repo = init_repo();
-        let daemon = Arc::new(Daemon::new_with(
+        let state = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(Daemon::new_with_paths(
             Arc::new(FakeNotifier::new()),
             std::path::PathBuf::from("/tmp/unused-split-tree.sock"),
+            state.path().join("agents.json"),
+            state.path().join("projects.json"),
         ));
-        (daemon, repo)
+        daemon.add_project(repo.path()).unwrap();
+        (daemon, repo, state)
     }
 
     #[test]
@@ -1705,7 +1789,7 @@ mod tests {
         use crate::split_tree;
 
         // temp git repo + daemon with the shell adapter (reuse the existing helpers/pattern)
-        let (daemon, repo) = daemon_with_repo();
+        let (daemon, repo, _state) = daemon_with_repo();
         let agent = daemon
             .spawn_agent(
                 repo.path(),
@@ -1752,7 +1836,7 @@ mod tests {
     async fn teardown_kills_multiple_live_companions() {
         use crate::split_tree;
 
-        let (daemon, repo) = daemon_with_repo();
+        let (daemon, repo, _state) = daemon_with_repo();
         let agent = daemon
             .spawn_agent(
                 repo.path(),
@@ -1798,7 +1882,7 @@ mod tests {
 
     #[tokio::test]
     async fn hookless_agent_bell_sets_needs_input() {
-        let (daemon, repo) = daemon_with_repo();
+        let (daemon, repo, _state) = daemon_with_repo();
         let agent = daemon.spawn_agent(repo.path(), &crate::agent::SyntheticAdapter { command: bell_then_sleep() }, "t").unwrap();
         let mut ok = false;
         for _ in 0..100 {
@@ -1810,7 +1894,7 @@ mod tests {
 
     #[tokio::test]
     async fn hooked_agent_bell_is_ignored() {
-        let (daemon, repo) = daemon_with_repo();
+        let (daemon, repo, _state) = daemon_with_repo();
         let agent = daemon.spawn_agent(repo.path(), &HookedTestAdapter { cmd: bell_then_sleep() }, "t").unwrap();
         // give the BEL time to be produced; attention must stay Working (no scanner).
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -1819,7 +1903,7 @@ mod tests {
 
     #[tokio::test]
     async fn input_clears_hookless_needs_input_to_working() {
-        let (daemon, repo) = daemon_with_repo();
+        let (daemon, repo, _state) = daemon_with_repo();
         let agent = daemon.spawn_agent(repo.path(), &crate::agent::SyntheticAdapter { command: bell_then_sleep() }, "t").unwrap();
         // wait for NeedsInput
         for _ in 0..100 {
@@ -1850,7 +1934,7 @@ mod tests {
 
     #[tokio::test]
     async fn input_clears_hooked_completed_to_working() {
-        let (daemon, repo) = daemon_with_repo();
+        let (daemon, repo, _state) = daemon_with_repo();
         let agent = daemon
             .spawn_agent(
                 repo.path(),
@@ -1897,7 +1981,7 @@ mod tests {
 
     #[tokio::test]
     async fn land_agent_keeps_branch_and_removes_agent() {
-        let (daemon, repo) = daemon_with_repo();
+        let (daemon, repo, _state) = daemon_with_repo();
         let agent = daemon.spawn_agent(repo.path(), &crate::agent::SyntheticAdapter {
             command: PaneCommand { program: "/bin/sh".into(), args: vec!["-c".into(), "sleep 30".into()], cwd: None, env: vec![] },
         }, "task-a").unwrap();
@@ -1913,7 +1997,7 @@ mod tests {
 
     #[tokio::test]
     async fn discard_agent_deletes_branch_and_removes_agent() {
-        let (daemon, repo) = daemon_with_repo();
+        let (daemon, repo, _state) = daemon_with_repo();
         let agent = daemon.spawn_agent(repo.path(), &crate::agent::SyntheticAdapter {
             command: PaneCommand { program: "/bin/sh".into(), args: vec!["-c".into(), "sleep 30".into()], cwd: None, env: vec![] },
         }, "task-b").unwrap();
@@ -1959,10 +2043,14 @@ mod tests {
         use crate::{FakeNotifier, SyntheticAdapter};
 
         let repo = init_jj_repo();
-        let daemon = Arc::new(Daemon::new_with(
+        let state = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(Daemon::new_with_paths(
             Arc::new(FakeNotifier::new()),
             std::path::PathBuf::from("/tmp/unused-jj.sock"),
+            state.path().join("agents.json"),
+            state.path().join("projects.json"),
         ));
+        daemon.add_project(repo.path()).unwrap();
         let adapter = SyntheticAdapter {
             command: PaneCommand {
                 program: "/bin/sh".into(),
@@ -1980,7 +2068,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_ratio_updates_and_broadcasts() {
-        let (daemon, repo) = daemon_with_repo();
+        let (daemon, repo, _state) = daemon_with_repo();
         let agent = daemon
             .spawn_agent(
                 repo.path(),
@@ -2008,7 +2096,7 @@ mod tests {
     #[tokio::test]
     async fn companion_crash_removes_leaf_and_broadcasts_tree() {
         use crate::split_tree;
-        let (daemon, repo) = daemon_with_repo();
+        let (daemon, repo, _state) = daemon_with_repo();
         let agent = daemon
             .spawn_agent(
                 repo.path(),
@@ -2064,7 +2152,7 @@ mod tests {
     #[tokio::test]
     async fn reap_companion_is_idempotent() {
         use crate::split_tree;
-        let (daemon, repo) = daemon_with_repo();
+        let (daemon, repo, _state) = daemon_with_repo();
         let agent = daemon
             .spawn_agent(
                 repo.path(),
@@ -2164,10 +2252,13 @@ mod tests {
         let _state_lock = crate::STATE_FILE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLOWDER_STATE_FILE", &state_path);
 
-        let daemon = Arc::new(Daemon::new_with(
+        let daemon = Arc::new(Daemon::new_with_paths(
             Arc::new(FakeNotifier::new()),
             std::path::PathBuf::from("/tmp/unused-ratio.sock"),
+            state_path.clone(),
+            statedir.path().join("projects.json"),
         ));
+        daemon.add_project(repo.path()).unwrap();
         let adapter = SyntheticAdapter {
             command: crate::PaneCommand {
                 program: "/bin/sh".into(), args: vec!["-c".into(), "sleep 30".into()],
@@ -2217,11 +2308,16 @@ mod tests {
         let statedir = tempfile::tempdir().unwrap();
         let _state_lock = crate::STATE_FILE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLOWDER_STATE_FILE", statedir.path().join("agents.json"));
+        let state_path = statedir.path().join("agents.json");
+        let projects_path = statedir.path().join("projects.json");
 
-        let d1 = Arc::new(Daemon::new_with(
+        let d1 = Arc::new(Daemon::new_with_paths(
             Arc::new(FakeNotifier::new()),
             std::path::PathBuf::from("/tmp/unused-collide1.sock"),
+            state_path.clone(),
+            projects_path.clone(),
         ));
+        d1.add_project(repo.path()).unwrap();
         let adapter = SyntheticAdapter {
             command: crate::PaneCommand {
                 program: "/bin/sh".into(), args: vec!["-c".into(), "sleep 30".into()],
@@ -2235,9 +2331,11 @@ mod tests {
 
         // Fresh daemon reconciles A (with layout) then B. Without the early next_id bump, A's
         // restored companion could grab B's id.
-        let d2 = Arc::new(Daemon::new_with(
+        let d2 = Arc::new(Daemon::new_with_paths(
             Arc::new(FakeNotifier::new()),
             std::path::PathBuf::from("/tmp/unused-collide2.sock"),
+            state_path,
+            projects_path,
         ));
         d2.reconcile();
 
@@ -2274,11 +2372,16 @@ mod tests {
         let statedir = tempfile::tempdir().unwrap();
         let _state_lock = crate::STATE_FILE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLOWDER_STATE_FILE", statedir.path().join("agents.json"));
+        let state_path = statedir.path().join("agents.json");
+        let projects_path = statedir.path().join("projects.json");
 
-        let d1 = Arc::new(Daemon::new_with(
+        let d1 = Arc::new(Daemon::new_with_paths(
             Arc::new(FakeNotifier::new()),
             std::path::PathBuf::from("/tmp/unused-nolt1.sock"),
+            state_path.clone(),
+            projects_path.clone(),
         ));
+        d1.add_project(repo.path()).unwrap();
         let adapter = SyntheticAdapter {
             command: crate::PaneCommand {
                 program: "/bin/sh".into(), args: vec!["-c".into(), "sleep 30".into()],
@@ -2288,9 +2391,11 @@ mod tests {
         // A plain agent, never split → its record's tree is None (the M9a shape).
         let id = d1.spawn_agent(repo.path(), &adapter, "demo").unwrap();
 
-        let d2 = Arc::new(Daemon::new_with(
+        let d2 = Arc::new(Daemon::new_with_paths(
             Arc::new(FakeNotifier::new()),
             std::path::PathBuf::from("/tmp/unused-nolt2.sock"),
+            state_path,
+            projects_path,
         ));
         d2.reconcile();
         assert_eq!(d2.split_tree_of(id), Some(clowder_proto::PaneTree::Leaf { pane: id }));
@@ -2319,9 +2424,15 @@ mod tests {
         let _lock = crate::STATE_FILE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLOWDER_STATE_FILE", statedir.path().join("agents.json"));
 
-        let mut d = Daemon::new_with(Arc::new(FakeNotifier::new()), "/tmp/unused-vt1.sock".into());
+        let mut d = Daemon::new_with_paths(
+            Arc::new(FakeNotifier::new()),
+            "/tmp/unused-vt1.sock".into(),
+            statedir.path().join("agents.json"),
+            statedir.path().join("projects.json"),
+        );
         d.content_idle = Duration::from_millis(40);
         let daemon = Arc::new(d);
+        daemon.add_project(repo.path()).unwrap();
         let adapter = SyntheticAdapter {
             command: crate::PaneCommand {
                 program: "/bin/sh".into(),
@@ -2367,9 +2478,15 @@ mod tests {
         let lock = crate::STATE_FILE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLOWDER_STATE_FILE", statedir.path().join("agents.json"));
 
-        let mut d = Daemon::new_with(Arc::new(FakeNotifier::new()), "/tmp/unused-vt.sock".into());
+        let mut d = Daemon::new_with_paths(
+            Arc::new(FakeNotifier::new()),
+            "/tmp/unused-vt.sock".into(),
+            statedir.path().join("agents.json"),
+            statedir.path().join("projects.json"),
+        );
         d.content_idle = Duration::from_millis(40);
         let daemon = Arc::new(d);
+        daemon.add_project(repo.path()).unwrap();
         let adapter = SyntheticAdapter {
             command: crate::PaneCommand {
                 program: "/bin/sh".into(),
@@ -2489,5 +2606,68 @@ mod tests {
             }
             other => panic!("expected Removed, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn spawn_rejects_an_unregistered_project_and_leaves_nothing_behind() {
+        use crate::SyntheticAdapter;
+        let state = tempfile::tempdir().unwrap();
+        let repo = init_repo();
+        let d = test_daemon_in(state.path());
+        let adapter = SyntheticAdapter { command: crate::PaneCommand {
+            program: "/bin/sh".into(), args: vec!["-c".into(), "sleep 30".into()], cwd: None, env: vec![] } };
+
+        let e = d.spawn_agent(repo.path(), &adapter, "feat").unwrap_err().to_string();
+        assert!(e.contains("unknown project"), "unhelpful message: {e}");
+        assert!(!repo.path().join(".clowder/worktrees/feat").exists(), "must not leave a worktree");
+        let branches = std::process::Command::new("git").arg("-C").arg(repo.path())
+            .args(["branch", "--list", "clowder/feat"]).output().unwrap();
+        assert!(branches.stdout.is_empty(), "must not leave a branch");
+        assert!(d.list_worktrees().is_empty());
+    }
+
+    #[tokio::test]
+    async fn spawn_rejects_an_invalid_name_before_provisioning() {
+        use crate::SyntheticAdapter;
+        let state = tempfile::tempdir().unwrap();
+        let repo = init_repo();
+        let d = test_daemon_in(state.path());
+        d.add_project(repo.path()).unwrap();
+        let adapter = SyntheticAdapter { command: crate::PaneCommand {
+            program: "/bin/sh".into(), args: vec!["-c".into(), "sleep 30".into()], cwd: None, env: vec![] } };
+        let e = d.spawn_agent(repo.path(), &adapter, "my feature").unwrap_err().to_string();
+        assert!(e.contains("letters"), "should be the name-validation message: {e}");
+        assert!(!repo.path().join(".clowder/worktrees").exists());
+    }
+
+    #[tokio::test]
+    async fn spawn_rejects_a_colliding_worktree_with_a_real_message() {
+        use crate::SyntheticAdapter;
+        let state = tempfile::tempdir().unwrap();
+        let repo = init_repo();
+        let d = test_daemon_in(state.path());
+        d.add_project(repo.path()).unwrap();
+        // Simulate reconcile's orphan: a worktree dir on disk that the daemon knows nothing about.
+        std::fs::create_dir_all(repo.path().join(".clowder/worktrees/feat")).unwrap();
+        let adapter = SyntheticAdapter { command: crate::PaneCommand {
+            program: "/bin/sh".into(), args: vec!["-c".into(), "sleep 30".into()], cwd: None, env: vec![] } };
+        let e = d.spawn_agent(repo.path(), &adapter, "feat").unwrap_err().to_string();
+        assert!(e.contains("already exists"), "should name the collision, not a raw git error: {e}");
+        assert!(!e.contains("fatal:"), "must not surface a raw git error: {e}");
+    }
+
+    #[tokio::test]
+    async fn spawn_stores_the_canonical_project_path() {
+        use crate::SyntheticAdapter;
+        let state = tempfile::tempdir().unwrap();
+        let repo = init_repo();
+        let d = test_daemon_in(state.path());
+        d.add_project(repo.path()).unwrap();
+        let adapter = SyntheticAdapter { command: crate::PaneCommand {
+            program: "/bin/sh".into(), args: vec!["-c".into(), "sleep 30".into()], cwd: None, env: vec![] } };
+        let pane = d.spawn_agent(repo.path(), &adapter, "feat").unwrap();
+        let listed = d.list_worktrees();
+        assert_eq!(listed[0].project, repo.path().canonicalize().unwrap().to_string_lossy());
+        d.teardown_agent(pane).unwrap();
     }
 }

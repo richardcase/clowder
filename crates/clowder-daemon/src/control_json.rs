@@ -173,11 +173,15 @@ mod tests {
 
     #[tokio::test]
     async fn control_json_lists_spawns_and_streams() {
+        let state = tempfile::tempdir().unwrap();
         let repo = init_repo();
-        let daemon = Arc::new(Daemon::new_with(
+        let daemon = Arc::new(Daemon::new_with_paths(
             Arc::new(FakeNotifier::new()),
             std::path::PathBuf::from("/tmp/unused-cjson.sock"),
+            state.path().join("agents.json"),
+            state.path().join("projects.json"),
         ));
+        daemon.add_project(repo.path()).unwrap();
 
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let d = daemon.clone();
@@ -200,22 +204,32 @@ mod tests {
         line.push('\n');
         cwr.write_all(line.as_bytes()).await.unwrap();
 
-        // Read events until AgentSpawned.
-        let pane = loop {
-            let l = clines.next_line().await.unwrap().unwrap();
-            if let Ok(ControlEvent::AgentSpawned { pane }) = serde_json::from_str::<ControlEvent>(&l) {
-                break pane;
+        // Read events until AgentSpawned. Bounded: a regression that makes the daemon reply
+        // with Error instead (e.g. a spawn guard rejecting the request) must fail fast, not
+        // hang the test suite forever.
+        let pane = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let l = clines.next_line().await.unwrap().unwrap();
+                if let Ok(ControlEvent::AgentSpawned { pane }) = serde_json::from_str::<ControlEvent>(&l) {
+                    break pane;
+                }
             }
-        };
+        })
+        .await
+        .expect("no AgentSpawned within 5s");
 
         // listWorktrees now includes it.
         cwr.write_all(b"{\"type\":\"listWorktrees\"}\n").await.unwrap();
-        let listed = loop {
-            let l = clines.next_line().await.unwrap().unwrap();
-            if let Ok(ControlEvent::WorktreeList { worktrees }) = serde_json::from_str::<ControlEvent>(&l) {
-                if !worktrees.is_empty() { break worktrees; }
+        let listed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let l = clines.next_line().await.unwrap().unwrap();
+                if let Ok(ControlEvent::WorktreeList { worktrees }) = serde_json::from_str::<ControlEvent>(&l) {
+                    if !worktrees.is_empty() { break worktrees; }
+                }
             }
-        };
+        })
+        .await
+        .expect("no non-empty WorktreeList within 5s");
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].pane, pane);
         assert_eq!(listed[0].name, "demo");
@@ -241,11 +255,15 @@ mod tests {
 
     #[tokio::test]
     async fn split_pane_over_control_stream_yields_split_tree_changed() {
+        let state = tempfile::tempdir().unwrap();
         let repo = init_repo();
-        let daemon = Arc::new(Daemon::new_with(
+        let daemon = Arc::new(Daemon::new_with_paths(
             Arc::new(FakeNotifier::new()),
             std::path::PathBuf::from("/tmp/unused-cjson3.sock"),
+            state.path().join("agents.json"),
+            state.path().join("projects.json"),
         ));
+        daemon.add_project(repo.path()).unwrap();
 
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let d = daemon.clone();
@@ -268,12 +286,18 @@ mod tests {
         line.push('\n');
         cwr.write_all(line.as_bytes()).await.unwrap();
 
-        let agent = loop {
-            let l = clines.next_line().await.unwrap().unwrap();
-            if let Ok(ControlEvent::AgentSpawned { pane }) = serde_json::from_str::<ControlEvent>(&l) {
-                break pane;
+        // Bounded: a spawn-guard regression that turns AgentSpawned into an Error must fail
+        // fast, not hang the test suite forever.
+        let agent = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let l = clines.next_line().await.unwrap().unwrap();
+                if let Ok(ControlEvent::AgentSpawned { pane }) = serde_json::from_str::<ControlEvent>(&l) {
+                    break pane;
+                }
             }
-        };
+        })
+        .await
+        .expect("no AgentSpawned within 5s");
 
         // Send SplitPane and read events until SplitTreeChanged arrives.
         let req = ControlRequest::SplitPane { pane: agent, direction: clowder_proto::SplitDirection::Right };
@@ -281,16 +305,20 @@ mod tests {
         line.push('\n');
         cwr.write_all(line.as_bytes()).await.unwrap();
 
-        let tree = loop {
-            let l = clines.next_line().await.unwrap().unwrap();
-            if let Ok(ControlEvent::SplitTreeChanged { agent: a, tree }) =
-                serde_json::from_str::<ControlEvent>(&l)
-            {
-                if a == agent {
-                    break tree;
+        let tree = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let l = clines.next_line().await.unwrap().unwrap();
+                if let Ok(ControlEvent::SplitTreeChanged { agent: a, tree }) =
+                    serde_json::from_str::<ControlEvent>(&l)
+                {
+                    if a == agent {
+                        break tree;
+                    }
                 }
             }
-        };
+        })
+        .await
+        .expect("no matching SplitTreeChanged within 5s");
         assert_eq!(crate::split_tree::leaves(&tree).len(), 2, "{tree:?}");
 
         daemon.teardown_agent(agent).unwrap();

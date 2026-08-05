@@ -276,10 +276,14 @@ mod tests {
         // daemon + control socket on a temp path
         let sockdir = tempfile::tempdir().unwrap();
         let sock = sockdir.path().join("control.sock");
-        let daemon = Arc::new(Daemon::new_with(
+        let state = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(Daemon::new_with_paths(
             Arc::new(FakeNotifier::new()),
             std::path::PathBuf::from("/tmp/unused-cli.sock"),
+            state.path().join("agents.json"),
+            state.path().join("projects.json"),
         ));
+        daemon.add_project(repo.path()).unwrap();
         let listener = tokio::net::UnixListener::bind(&sock).unwrap();
         let d = daemon.clone();
         tokio::spawn(async move { let _ = d.serve_control_json(listener).await; });
