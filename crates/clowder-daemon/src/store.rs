@@ -50,6 +50,17 @@ impl<T: Serialize + DeserializeOwned> JsonStore<T> {
         out
     }
 
+    /// Like `mutate`, but returns the write error instead of only logging it. Use this for
+    /// operations answering a user request, where silently failing to persist would report
+    /// success for something that never reached disk.
+    pub fn try_mutate<R>(&self, f: impl FnOnce(&mut Vec<T>) -> R) -> Result<R> {
+        let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut all = self.load();
+        let out = f(&mut all);
+        self.try_write(&all)?;
+        Ok(out)
+    }
+
     /// Like `mutate`, but skips the write when `f` returns false — so a caller that
     /// finds nothing to change costs no I/O.
     pub fn mutate_if(&self, f: impl FnOnce(&mut Vec<T>) -> bool) {
@@ -155,5 +166,26 @@ mod tests {
         let mut ids: Vec<u64> = store.load().iter().map(|i| i.id).collect();
         ids.sort();
         assert_eq!(ids, (0..16).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn try_mutate_surfaces_write_failures() {
+        // Point the store at a path whose parent cannot be created (a FILE, not a dir),
+        // so create_dir_all fails and the error must reach the caller.
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"i am a file").unwrap();
+        let store: JsonStore<Item> = JsonStore::new(blocker.join("items.json"));
+        let err = store.try_mutate(|all| all.push(Item { id: 1, label: "a".into() }));
+        assert!(err.is_err(), "try_mutate must not silently swallow a write failure");
+    }
+
+    #[test]
+    fn try_mutate_returns_value_on_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: JsonStore<Item> = JsonStore::new(dir.path().join("items.json"));
+        let n = store.try_mutate(|all| { all.push(Item { id: 3, label: "x".into() }); all.len() }).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(store.load().len(), 1);
     }
 }
