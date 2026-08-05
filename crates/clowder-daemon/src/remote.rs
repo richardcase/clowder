@@ -146,7 +146,7 @@ mod tests {
 
         let mut client = client;
         write_hello(&mut client, Channel::Control, None).await.unwrap();
-        // The control handler's first action is to emit an AgentList event as a JSON line.
+        // The control handler's first action is to emit a WorktreeList event as a JSON line.
         let (rd, _wr) = tokio::io::split(client);
         let mut lines = BufReader::new(rd).lines();
         // Bound the read so a regression that stops the handler responding fails fast, not hangs CI.
@@ -155,7 +155,7 @@ mod tests {
             .expect("control handler produced no line within 5s")
             .unwrap()
             .unwrap();
-        assert!(line.contains("agentList"), "expected agentList event, got: {line}");
+        assert!(line.contains("worktreeList"), "expected worktreeList event, got: {line}");
         h.abort();
     }
 
@@ -213,7 +213,7 @@ mod tests {
         let mut stream = connector.connect(name, tcp).await.unwrap();
         clowder_proto::write_hello(&mut stream, clowder_proto::Channel::Control, Some(&token)).await.unwrap();
         // A control client sends a JSON line request; assert we get a JSON line back (handler engaged).
-        stream.write_all(b"{\"type\":\"listAgents\"}\n").await.unwrap();
+        stream.write_all(b"{\"type\":\"listWorktrees\"}\n").await.unwrap();
         let mut buf = [0u8; 1];
         let n = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut buf)).await.unwrap().unwrap();
         assert!(n >= 1, "control handler responded over TLS");
@@ -239,7 +239,7 @@ mod tests {
         let name = tokio_rustls::rustls::pki_types::ServerName::try_from("clowder").unwrap();
         let mut stream = connector.connect(name, tcp).await.unwrap();
         clowder_proto::write_hello(&mut stream, clowder_proto::Channel::Control, Some("wrong")).await.unwrap();
-        stream.write_all(b"{\"type\":\"listAgents\"}\n").await.unwrap();
+        stream.write_all(b"{\"type\":\"listWorktrees\"}\n").await.unwrap();
         // The daemon drops the connection before dispatch → read returns 0 (EOF).
         let mut buf = [0u8; 8];
         let n = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut buf)).await.unwrap().unwrap_or(0);

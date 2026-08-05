@@ -87,13 +87,13 @@ pub async fn spawn_via_control(
     line.push('\n');
     wr.write_all(line.as_bytes()).await?;
 
-    // Skip the initial AgentList / any streamed events until the spawn result.
+    // Skip the initial WorktreeList / any streamed events until the spawn result.
     loop {
         match lines.next_line().await? {
             Some(l) => match serde_json::from_str::<ControlEvent>(&l) {
                 Ok(ControlEvent::AgentSpawned { pane }) => return Ok(pane),
                 Ok(ControlEvent::Error { message }) => return Err(anyhow::anyhow!(message)),
-                Ok(_) => continue, // AgentList / AttentionChanged / AgentRemoved
+                Ok(_) => continue, // WorktreeList / AttentionChanged / AgentRemoved
                 Err(_) => continue, // ignore unparseable lines defensively
             },
             None => return Err(anyhow::anyhow!("control socket closed before spawn result")),
@@ -138,7 +138,7 @@ where
                     Some(DaemonToClient::PaneExited { .. }) | None => break,
                     Some(DaemonToClient::Attached { .. }) => {}
                     Some(DaemonToClient::AttentionChanged { .. }) => {}
-                    Some(DaemonToClient::AgentList { .. }) => {}
+                    Some(DaemonToClient::WorktreeList { .. }) => {}
                     Some(DaemonToClient::AgentRemoved { .. }) => {}
                 }
             }
@@ -288,10 +288,10 @@ mod tests {
             .await
             .unwrap();
 
-        let agents = daemon.list_agents();
+        let agents = daemon.list_worktrees();
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].pane, pane);
-        assert_eq!(agents[0].task, "demo");
+        assert_eq!(agents[0].name, "demo");
 
         daemon.teardown_agent(pane).unwrap();
     }

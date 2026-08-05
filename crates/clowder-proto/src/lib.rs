@@ -4,8 +4,8 @@ pub mod control;
 pub mod remote;
 pub mod auth;
 pub use message::{
-    AdapterInfo, AgentInfo, AttentionState, ClientToDaemon, DaemonToClient, HookEvent, HookKind,
-    PaneId,
+    AdapterInfo, AttentionState, ClientToDaemon, DaemonToClient, HookEvent, HookKind, PaneId,
+    WorktreeInfo,
 };
 pub use transport::{MsgStream, Transport};
 pub use control::{Axis, ControlEvent, ControlRequest, PaneTree, SplitDirection, SplitId};

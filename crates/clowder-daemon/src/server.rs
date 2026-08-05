@@ -17,8 +17,10 @@ use tokio::net::UnixListener;
 use tokio::sync::broadcast;
 
 struct AgentMeta {
+    /// Full path to the project root.
     project: String,
-    task: String,
+    name: String,
+    branch: String,
 }
 
 /// How often the coalesced layout flusher persists agents whose divider ratios changed.
@@ -265,19 +267,16 @@ impl Daemon {
         id: PaneId,
         pane: Pane,
         ws: Workspace,
-        task: &str,
+        name: &str,
         adapter: &dyn AgentAdapter,
     ) {
-        let project_name = ws
-            .project
-            .file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| ws.project.to_string_lossy().to_string());
+        let project = ws.project.to_string_lossy().to_string();
+        let branch = ws.branch.clone();
         self.register_pane(id, pane);
         self.workspaces.lock().insert(id, ws);
         self.agents.lock().insert(
             id,
-            AgentMeta { project: project_name, task: task.to_string() },
+            AgentMeta { project, name: name.to_string(), branch },
         );
         self.set_attention(id, AttentionState::Working);
 
@@ -673,15 +672,16 @@ impl Daemon {
         self.owner.lock().get(&pane).copied()
     }
 
-    pub fn list_agents(&self) -> Vec<clowder_proto::AgentInfo> {
+    pub fn list_worktrees(&self) -> Vec<clowder_proto::WorktreeInfo> {
         let agents = self.agents.lock();
         let attention = self.attention.lock();
-        let mut out: Vec<clowder_proto::AgentInfo> = agents
+        let mut out: Vec<clowder_proto::WorktreeInfo> = agents
             .iter()
-            .map(|(pane, meta)| clowder_proto::AgentInfo {
+            .map(|(pane, meta)| clowder_proto::WorktreeInfo {
                 pane: *pane,
                 project: meta.project.clone(),
-                task: meta.task.clone(),
+                name: meta.name.clone(),
+                branch: meta.branch.clone(),
                 state: attention.get(pane).copied().unwrap_or(clowder_proto::AttentionState::Working),
             })
             .collect();
@@ -725,7 +725,7 @@ impl Daemon {
                     Some(p) => break p,
                     None => return Ok(()), // unknown pane: end session
                 },
-                Some(ClientToDaemon::ListAgents) => {
+                Some(ClientToDaemon::ListWorktrees) => {
                     return self.handle_control(msgs).await;
                 }
                 Some(_) => continue, // ignore until attached
@@ -775,7 +775,7 @@ impl Daemon {
                         Some(ClientToDaemon::Resize { cols, rows, .. }) => { let _ = pane.resize(cols, rows); }
                         Some(ClientToDaemon::Detach) | None => break,
                         Some(ClientToDaemon::Attach { .. }) => continue,
-                        Some(ClientToDaemon::ListAgents) => continue,
+                        Some(ClientToDaemon::ListWorktrees) => continue,
                     }
                 }
                 att = att_rx.recv() => {
@@ -809,7 +809,7 @@ impl Daemon {
         // Snapshot the agent list, then stream every attention change.
         let mut att_rx = self.subscribe_attention();
         let mut removed_rx = self.subscribe_removed();
-        msgs.send(&DaemonToClient::AgentList { agents: self.list_agents() }).await?;
+        msgs.send(&DaemonToClient::WorktreeList { worktrees: self.list_worktrees() }).await?;
         loop {
             tokio::select! {
                 att = att_rx.recv() => {
@@ -830,9 +830,9 @@ impl Daemon {
                 }
                 incoming = msgs.recv::<ClientToDaemon>() => {
                     match incoming? {
-                        Some(ClientToDaemon::ListAgents) => {
+                        Some(ClientToDaemon::ListWorktrees) => {
                             // Client asked to refresh the list.
-                            msgs.send(&DaemonToClient::AgentList { agents: self.list_agents() }).await?;
+                            msgs.send(&DaemonToClient::WorktreeList { worktrees: self.list_worktrees() }).await?;
                         }
                         Some(_) => continue,     // control conn ignores pane ops
                         None => break,           // client disconnected
@@ -1115,7 +1115,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_agents_reports_project_task_and_state() {
+    async fn list_worktrees_reports_project_name_branch_and_state() {
         use crate::{FakeNotifier, SyntheticAdapter};
         use clowder_proto::AttentionState;
         use std::process::Command as PCommand;
@@ -1148,17 +1148,19 @@ mod tests {
         let pane = daemon.spawn_agent(repo.path(), &adapter, "task-a").unwrap();
         daemon.set_attention(pane, AttentionState::NeedsInput);
 
-        let list = daemon.list_agents();
+        let list = daemon.list_worktrees();
         assert_eq!(list.len(), 1);
         let a = &list[0];
         assert_eq!(a.pane, pane);
-        assert_eq!(a.task, "task-a");
-        // project display name is the repo dir's basename
-        assert_eq!(a.project, repo.path().file_name().unwrap().to_string_lossy());
+        assert_eq!(a.name, "task-a");
+        assert_eq!(a.branch, "clowder/task-a");
+        // project is now the FULL path, not a basename — two repos with the same dir name
+        // must not collapse into one sidebar group.
+        assert_eq!(a.project, repo.path().to_string_lossy());
         assert_eq!(a.state, AttentionState::NeedsInput);
 
         daemon.teardown_agent(pane).unwrap();
-        assert!(daemon.list_agents().is_empty());
+        assert!(daemon.list_worktrees().is_empty());
     }
 
     #[tokio::test]
@@ -1250,10 +1252,10 @@ mod tests {
             std::path::PathBuf::from("/tmp/unused-reconcile2.sock"),
         ));
         d2.reconcile();
-        let list = d2.list_agents();
+        let list = d2.list_worktrees();
         assert_eq!(list.len(), 1, "reconcile must re-register the recorded agent");
         assert_eq!(list[0].pane, id, "re-registered under the original id");
-        assert_eq!(list[0].task, "demo");
+        assert_eq!(list[0].name, "demo");
 
         // New spawns on d2 must not collide with the restored id.
         let fresh = d2.spawn_agent(repo.path(), &adapter, "fresh").unwrap();
@@ -1269,7 +1271,7 @@ mod tests {
         ));
         d3.reconcile();
         assert!(
-            d3.list_agents().iter().all(|a| a.pane != id),
+            d3.list_worktrees().iter().all(|a| a.pane != id),
             "agent whose worktree is gone must be pruned"
         );
         assert!(
@@ -1428,16 +1430,16 @@ mod tests {
         tokio::spawn(async move { let _ = d.handle_conn(server_io).await; });
 
         let mut client = MsgStream::<_>::new(client_io);
-        client.send(&ClientToDaemon::ListAgents).await.unwrap();
+        client.send(&ClientToDaemon::ListWorktrees).await.unwrap();
 
-        // First reply is the agent list.
+        // First reply is the worktree list.
         match client.recv::<DaemonToClient>().await.unwrap().unwrap() {
-            DaemonToClient::AgentList { agents } => {
-                assert_eq!(agents.len(), 1);
-                assert_eq!(agents[0].pane, pane);
-                assert_eq!(agents[0].task, "task-a");
+            DaemonToClient::WorktreeList { worktrees } => {
+                assert_eq!(worktrees.len(), 1);
+                assert_eq!(worktrees[0].pane, pane);
+                assert_eq!(worktrees[0].name, "task-a");
             }
-            other => panic!("expected AgentList, got {other:?}"),
+            other => panic!("expected WorktreeList, got {other:?}"),
         }
 
         // A later attention change streams over the SAME control connection,
@@ -1496,7 +1498,7 @@ mod tests {
         }
         assert!(exited, "agent was not marked Exited after its process exited");
         // It stays in the list (mark-exited-and-keep), still reported with Exited state.
-        let list = daemon.list_agents();
+        let list = daemon.list_worktrees();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].state, AttentionState::Exited);
 
@@ -1580,8 +1582,8 @@ mod tests {
         tokio::spawn(async move { let _ = d.handle_conn(server_io).await; });
 
         let mut client = MsgStream::<_>::new(client_io);
-        client.send(&ClientToDaemon::ListAgents).await.unwrap();
-        // Drain the initial AgentList.
+        client.send(&ClientToDaemon::ListWorktrees).await.unwrap();
+        // Drain the initial WorktreeList.
         let _ = client.recv::<DaemonToClient>().await.unwrap().unwrap();
 
         daemon.teardown_agent(pane).unwrap();
@@ -1904,7 +1906,7 @@ mod tests {
         let pane = daemon.spawn_agent(repo.path(), &adapter, "task-a").unwrap();
         assert_eq!(daemon.workspace_of(pane).unwrap().kind, clowder_workspace::WorkspaceKind::Jj);
         daemon.land_agent(pane).unwrap();
-        assert!(daemon.list_agents().is_empty());
+        assert!(daemon.list_worktrees().is_empty());
         assert!(jj_bookmark_exists(repo.path(), "clowder/task-a"));
     }
 
@@ -2172,7 +2174,7 @@ mod tests {
         d2.reconcile();
 
         // Both agents came back under their original ids.
-        let ids: std::collections::HashSet<_> = d2.list_agents().iter().map(|x| x.pane).collect();
+        let ids: std::collections::HashSet<_> = d2.list_worktrees().iter().map(|x| x.pane).collect();
         assert!(ids.contains(&a) && ids.contains(&b), "both agents restored: {ids:?}");
 
         // A's companion leaf id differs from BOTH agent ids.

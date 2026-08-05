@@ -29,8 +29,8 @@ impl Daemon {
         }
     }
 
-    /// One JSON-lines control connection: snapshot AgentList, then stream events
-    /// and handle ListAgents/SpawnAgent requests (newline-delimited JSON both ways).
+    /// One JSON-lines control connection: snapshot WorktreeList, then stream events
+    /// and handle ListWorktrees/SpawnAgent requests (newline-delimited JSON both ways).
     pub async fn handle_control_json<S>(self: Arc<Self>, stream: S) -> Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -41,7 +41,7 @@ impl Daemon {
         let mut removed_rx = self.subscribe_removed();
         let mut split_rx = self.subscribe_splits();
 
-        write_event(&mut wr, &ControlEvent::AgentList { agents: self.list_agents() }).await?;
+        write_event(&mut wr, &ControlEvent::WorktreeList { worktrees: self.list_worktrees() }).await?;
 
         loop {
             tokio::select! {
@@ -50,8 +50,8 @@ impl Daemon {
                         Some(l) if l.trim().is_empty() => continue,
                         Some(l) => {
                             let ev = match serde_json::from_str::<ControlRequest>(&l) {
-                                Ok(ControlRequest::ListAgents) =>
-                                    ControlEvent::AgentList { agents: self.list_agents() },
+                                Ok(ControlRequest::ListWorktrees) =>
+                                    ControlEvent::WorktreeList { worktrees: self.list_worktrees() },
                                 Ok(ControlRequest::ListAdapters) =>
                                     ControlEvent::AdapterList { adapters: self.list_adapters() },
                                 Ok(ControlRequest::SpawnAgent { project, task, adapter }) =>
@@ -170,9 +170,9 @@ mod tests {
         let (crd, mut cwr) = tokio::io::split(client_io);
         let mut clines = BufReader::new(crd).lines();
 
-        // Initial snapshot: empty AgentList.
+        // Initial snapshot: empty WorktreeList.
         let first = clines.next_line().await.unwrap().unwrap();
-        assert!(first.contains(r#""type":"agentList""#), "{first}");
+        assert!(first.contains(r#""type":"worktreeList""#), "{first}");
 
         // Spawn a shell agent (build the request via the typed enum to escape the path safely).
         let req = ControlRequest::SpawnAgent {
@@ -192,17 +192,17 @@ mod tests {
             }
         };
 
-        // listAgents now includes it.
-        cwr.write_all(b"{\"type\":\"listAgents\"}\n").await.unwrap();
+        // listWorktrees now includes it.
+        cwr.write_all(b"{\"type\":\"listWorktrees\"}\n").await.unwrap();
         let listed = loop {
             let l = clines.next_line().await.unwrap().unwrap();
-            if let Ok(ControlEvent::AgentList { agents }) = serde_json::from_str::<ControlEvent>(&l) {
-                if !agents.is_empty() { break agents; }
+            if let Ok(ControlEvent::WorktreeList { worktrees }) = serde_json::from_str::<ControlEvent>(&l) {
+                if !worktrees.is_empty() { break worktrees; }
             }
         };
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].pane, pane);
-        assert_eq!(listed[0].task, "demo");
+        assert_eq!(listed[0].name, "demo");
 
         // An attention change streams as JSON.
         daemon.set_attention(pane, AttentionState::NeedsInput);
@@ -238,9 +238,9 @@ mod tests {
         let (crd, mut cwr) = tokio::io::split(client_io);
         let mut clines = BufReader::new(crd).lines();
 
-        // Initial snapshot: empty AgentList.
+        // Initial snapshot: empty WorktreeList.
         let first = clines.next_line().await.unwrap().unwrap();
-        assert!(first.contains(r#""type":"agentList""#), "{first}");
+        assert!(first.contains(r#""type":"worktreeList""#), "{first}");
 
         // Spawn a shell agent.
         let req = ControlRequest::SpawnAgent {
@@ -306,7 +306,7 @@ mod tests {
 
         let l = clines.next_line().await.unwrap().unwrap();
         assert!(l.contains(r#""type":"error""#), "expected error event: {l}");
-        assert!(daemon.list_agents().is_empty());
+        assert!(daemon.list_worktrees().is_empty());
     }
 
     #[test]
@@ -334,9 +334,9 @@ mod tests {
         let (crd, mut cwr) = tokio::io::split(client_io);
         let mut clines = BufReader::new(crd).lines();
 
-        // Initial snapshot: empty AgentList.
+        // Initial snapshot: empty WorktreeList.
         let first = clines.next_line().await.unwrap().unwrap();
-        assert!(first.contains(r#""type":"agentList""#), "{first}");
+        assert!(first.contains(r#""type":"worktreeList""#), "{first}");
 
         cwr.write_all(b"{\"type\":\"listAdapters\"}\n").await.unwrap();
         let l = clines.next_line().await.unwrap().unwrap();

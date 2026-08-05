@@ -1,4 +1,4 @@
-use crate::{AdapterInfo, AgentInfo, AttentionState, PaneId};
+use crate::{AdapterInfo, AttentionState, PaneId, WorktreeInfo};
 use serde::{Deserialize, Serialize};
 
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Serialize, Deserialize)]
@@ -30,7 +30,7 @@ pub enum PaneTree {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum ControlRequest {
-    ListAgents,
+    ListWorktrees,
     ListAdapters,
     SpawnAgent { project: String, task: String, adapter: String },
     SplitPane { pane: PaneId, direction: SplitDirection },
@@ -45,7 +45,7 @@ pub enum ControlRequest {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum ControlEvent {
-    AgentList { agents: Vec<AgentInfo> },
+    WorktreeList { worktrees: Vec<WorktreeInfo> },
     AdapterList { adapters: Vec<AdapterInfo> },
     AttentionChanged { pane: PaneId, state: AttentionState },
     AgentRemoved { pane: PaneId },
@@ -59,10 +59,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn list_agents_request_json_shape() {
-        let r = ControlRequest::ListAgents;
+    fn worktree_list_event_json_shape() {
+        let ev = ControlEvent::WorktreeList {
+            worktrees: vec![WorktreeInfo {
+                pane: PaneId(2),
+                project: "/Users/x/code/clowder".into(),
+                name: "task-a".into(),
+                branch: "clowder/task-a".into(),
+                state: AttentionState::Working,
+            }],
+        };
+        let s = serde_json::to_string(&ev).unwrap();
+        assert!(s.contains(r#""type":"worktreeList""#), "{s}");
+        assert!(s.contains(r#""pane":2"#), "pane must be a bare number: {s}");
+        assert!(s.contains(r#""branch":"clowder/task-a""#), "{s}");
+        assert_eq!(ev, serde_json::from_str::<ControlEvent>(&s).unwrap());
+    }
+
+    #[test]
+    fn list_worktrees_request_json_shape() {
+        let r = ControlRequest::ListWorktrees;
         let s = serde_json::to_string(&r).unwrap();
-        assert_eq!(s, r#"{"type":"listAgents"}"#);
+        assert_eq!(s, r#"{"type":"listWorktrees"}"#);
         assert_eq!(r, serde_json::from_str::<ControlRequest>(&s).unwrap());
     }
 
