@@ -185,11 +185,16 @@ pub fn validate_workspace_name(name: &str) -> Result<()> {
     if name == "." || name == ".." {
         bail!("worktree name must not be {name:?}");
     }
+    // Not redundant with the `contains("..")` check below despite `".."` matching both: this
+    // exact-match check produces a clearer, more specific message for that one case — keep it.
     if name.contains("..") {
         bail!("worktree name must not contain '..'");
     }
     if name.ends_with(".lock") {
         bail!("worktree name must not end with '.lock' (git reserves that suffix)");
+    }
+    if name.ends_with('.') {
+        bail!("worktree name must not end with '.' (git rejects it as a ref)");
     }
     if let Some(c) = name
         .chars()
@@ -464,7 +469,7 @@ mod tests {
     #[test]
     fn validate_workspace_name_rejects_unsafe_names() {
         let too_long = "a".repeat(65);
-        let cases: [&str; 11] = [
+        let cases: [&str; 12] = [
             "",              // empty
             &too_long,       // > 64 chars
             ".",             // path component
@@ -476,6 +481,7 @@ mod tests {
             ".hidden",       // leading dot
             "-dash",         // leading dash reads as a flag
             "caf\u{e9}",     // non-ASCII
+            "v1.",           // trailing dot — git rejects a ref ending in '.'
         ];
         for bad in cases {
             assert!(validate_workspace_name(bad).is_err(), "should reject {bad:?}");

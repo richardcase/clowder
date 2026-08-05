@@ -4,7 +4,7 @@ import Combine
 public enum LifecycleAction: Equatable, Sendable { case land, discard }
 
 /// A Land/Discard awaiting user confirmation (captured at request time so the confirmation
-/// UI can show which agent + task is affected, even if selection changes before confirming).
+/// UI can show which worktree name is affected, even if selection changes before confirming).
 public struct PendingLifecycle: Equatable, Sendable {
     public let action: LifecycleAction
     public let pane: UInt64
@@ -234,7 +234,7 @@ public final class AppModel: ObservableObject {
         }
     }
 
-    /// Begin a Land/Discard: capture the selected agent + task and await confirmation.
+    /// Begin a Land/Discard: capture the selected pane + worktree name and await confirmation.
     public func requestLifecycle(_ action: LifecycleAction) {
         guard let pane = selectedPane, let worktree = store.worktrees[pane] else { return }
         pendingLifecycle = PendingLifecycle(action: action, pane: pane, name: worktree.name)

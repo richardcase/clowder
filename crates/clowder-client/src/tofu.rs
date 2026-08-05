@@ -149,7 +149,7 @@ mod tests {
         let name = tokio_rustls::rustls::pki_types::ServerName::try_from("clowder").unwrap();
         let mut s = tls_connector.connect(name, tcp).await.expect("first connect (TOFU record) ok");
         clowder_proto::write_hello(&mut s, clowder_proto::Channel::Control, Some(&token)).await.unwrap();
-        s.write_all(b"{\"type\":\"listAgents\"}\n").await.unwrap();
+        s.write_all(b"{\"type\":\"listWorktrees\"}\n").await.unwrap();
 
         // Rotate the daemon cert (delete + regenerate) → a new fingerprint, served on a fresh addr.
         std::fs::remove_file(clowder_config::remote_cert_path()).unwrap();

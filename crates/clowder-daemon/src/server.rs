@@ -806,7 +806,7 @@ impl Daemon {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send,
     {
-        // Snapshot the agent list, then stream every attention change.
+        // Snapshot the worktree list, then stream every attention change.
         let mut att_rx = self.subscribe_attention();
         let mut removed_rx = self.subscribe_removed();
         msgs.send(&DaemonToClient::WorktreeList { worktrees: self.list_worktrees() }).await?;
