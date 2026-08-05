@@ -525,11 +525,18 @@ Rewrite the constructors so there is exactly one body:
     /// by which removing a sidebar row abandons live work.
     pub fn remove_project(&self, path: &Path) -> Result<()> {
         let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        // Canonicalize BOTH sides. Task 5 makes spawn_agent store a canonical path, but this
+        // must be correct before that lands too — otherwise on macOS an uncanonical
+        // AgentMeta.project (/var/...) never matches a canonical project (/private/var/...),
+        // the count comes back 0, and the guard silently lets the removal through.
         let n = self
             .agents
             .lock()
             .values()
-            .filter(|m| Path::new(&m.project) == canonical)
+            .filter(|m| {
+                let p = Path::new(&m.project);
+                p.canonicalize().unwrap_or_else(|_| p.to_path_buf()) == canonical
+            })
             .count();
         if n > 0 {
             bail!("project {} still has {n} worktree(s) — land or discard them first", canonical.display());
@@ -541,7 +548,7 @@ Rewrite the constructors so there is exactly one body:
     }
 ```
 
-`AgentMeta.project` is a `String` holding the full path (M10a). It is **not** canonical in M10a, but Task 5 makes `spawn_agent` canonicalize before storing, so this comparison is sound once Task 5 lands. Until then the `remove_project_is_refused_while_a_worktree_exists` test may fail on macOS — if so, note it and move to Task 5, which fixes it; do not paper over it by comparing basenames.
+`AgentMeta.project` is a `String` holding the full path (M10a), and it is **not** canonical until Task 5. Canonicalizing both sides of the comparison, as above, makes this task's test pass now and stay correct after Task 5 — do not rely on Task 5 landing first, and do not compare basenames.
 
 - [ ] **Step 5: Run the tests**
 
