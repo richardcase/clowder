@@ -39,6 +39,8 @@ public final class AgentStore: ObservableObject {
             lastError = message
         case let .splitTreeChanged(agent, tree):
             trees[agent] = tree        // idempotent replace (carry-forward #1)
+        case .projectList, .projectAdded, .projectRemoved, .projectTerminalOpened, .projectTerminalClosed:
+            break // M10c wires project state into the store; protocol types only for now
         }
     }
 

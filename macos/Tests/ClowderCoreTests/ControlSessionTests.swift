@@ -35,7 +35,7 @@ final class ControlSessionTests: XCTestCase {
     func testSendSpawnAgentEncodesRequest() throws {
         let t = FakeTransport()
         let s = ControlSession(transport: t)
-        try s.send(.spawnAgent(project: "/p", task: "demo", adapter: "shell"))
+        try s.send(.spawnAgent(project: "/p", name: "demo", adapter: "shell"))
         XCTAssertEqual(t.sent.count, 1)
         XCTAssertTrue(t.sent[0].contains(#""type":"spawnAgent""#), t.sent[0])
     }

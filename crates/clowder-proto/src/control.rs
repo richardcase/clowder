@@ -264,4 +264,40 @@ mod tests {
         assert!(!s.contains(r#""task""#), "the field is `name` now: {s}");
         assert_eq!(r, serde_json::from_str::<ControlRequest>(&s).unwrap());
     }
+
+    /// The fixture directory, relative to this crate's manifest.
+    fn fixture(name: &str) -> String {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/protocol/fixtures").join(name);
+        std::fs::read_to_string(&p)
+            .unwrap_or_else(|e| panic!("missing fixture {}: {e}", p.display()))
+            .trim().to_string()
+    }
+
+    #[test]
+    fn encoder_matches_the_golden_fixtures() {
+        let p = ProjectInfo {
+            path: "/Users/x/code/clowder".into(), name: "clowder".into(), kind: "git".into(),
+        };
+        let cases: Vec<(&str, ControlEvent)> = vec![
+            ("project-list.json", ControlEvent::ProjectList { projects: vec![p.clone()] }),
+            ("project-added.json", ControlEvent::ProjectAdded { project: p }),
+            ("project-removed.json", ControlEvent::ProjectRemoved { path: "/Users/x/code/clowder".into() }),
+            ("project-terminal-opened.json", ControlEvent::ProjectTerminalOpened {
+                path: "/Users/x/code/clowder".into(), pane: PaneId(9) }),
+            ("project-terminal-closed.json", ControlEvent::ProjectTerminalClosed {
+                path: "/Users/x/code/clowder".into() }),
+            ("worktree-list.json", ControlEvent::WorktreeList { worktrees: vec![WorktreeInfo {
+                pane: PaneId(2),
+                project: "/Users/x/code/clowder".into(),
+                name: "task-a".into(),
+                branch: "clowder/task-a".into(),
+                state: AttentionState::NeedsInput,
+            }] }),
+        ];
+        for (file, ev) in cases {
+            assert_eq!(serde_json::to_string(&ev).unwrap(), fixture(file),
+                       "encoder drifted from {file} — update BOTH the fixture and the Swift mirror");
+        }
+    }
 }

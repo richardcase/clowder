@@ -21,7 +21,7 @@ struct ContentView: View {
         }
         .sheet(isPresented: $model.showingSpawn) {
             SpawnSheet(adapters: model.adapters) { project, task, adapter in
-                model.spawn(project: project, task: task, adapter: adapter)
+                model.spawn(project: project, name: task, adapter: adapter)
             }
         }
         .safeAreaInset(edge: .bottom) { statusBar }

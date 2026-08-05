@@ -59,12 +59,12 @@ final class AppModelTests: XCTestCase {
         let fake = FakeControlTransport()
         let model = AppModel(makeTransport: { fake })
         model.connect()
-        model.spawn(project: "/tmp/repo", task: "demo", adapter: "claude")
+        model.spawn(project: "/tmp/repo", name: "demo", adapter: "claude")
         let spawnLine = try XCTUnwrap(fake.sentLines.last)
         let obj = try JSONSerialization.jsonObject(with: Data(spawnLine.utf8)) as? [String: Any]
         XCTAssertEqual(obj?["type"] as? String, "spawnAgent")
         XCTAssertEqual(obj?["project"] as? String, "/tmp/repo")
-        XCTAssertEqual(obj?["task"] as? String, "demo")
+        XCTAssertEqual(obj?["name"] as? String, "demo")
         XCTAssertEqual(obj?["adapter"] as? String, "claude")
     }
 

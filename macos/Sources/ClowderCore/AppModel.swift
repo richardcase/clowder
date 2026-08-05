@@ -148,10 +148,10 @@ public final class AppModel: ObservableObject {
         reconnectTask = nil
     }
 
-    public func spawn(project: String, task: String, adapter: String) {
+    public func spawn(project: String, name: String, adapter: String) {
         guard let session else { return }
         do {
-            try session.send(.spawnAgent(project: project, task: task, adapter: adapter))
+            try session.send(.spawnAgent(project: project, name: name, adapter: adapter))
         } catch {
             connectionState = .closed(reason: "Send failed: \(error)")
         }
