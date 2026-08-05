@@ -1886,3 +1886,22 @@ Claude-Session: https://claude.ai/code/session_01QrYWovZ9oDuyDhbhRkksEC"
 - Project terminals are not in the worktree list and carry no attention state; the project row shows a kind badge and an attention rollup over its children, never its own dot.
 - The `AgentStore` type name and `PaletteItemKind.agent` were left alone in M10a and M10b — M10c revisits that file wholesale.
 - Add a fixture to `docs/protocol/fixtures/` for any new message M10c introduces; the contract is described in `docs/protocol/README.md`.
+
+### Carried forward from the M10b whole-branch review
+
+**Deliberately deferred, must be addressed in M10c:**
+
+- **`remove_project` ↔ `spawn_agent` race.** `spawn_agent` checks project registration, then does hundreds of milliseconds of `git worktree add` before inserting into `agents` at the very end. A concurrent `remove_project` counts `agents`, sees zero, and removes the project — leaving a running agent whose project is unregistered. That is precisely the invariant the guard exists to hold ("no path by which removing a sidebar row abandons live work"). The honest fix is a small serialization `Mutex<()>` on `Daemon` held across the spawn guards through registry insertion, and across the whole of `remove_project`. It deserves its own change rather than being smuggled into a UI PR.
+- **`ProjectTerminalOpened` is not broadcast** — it goes only to the requesting client, while `ProjectTerminalClosed` goes to everyone. A second connected client never learns a terminal opened but will see it close. Harmless while `open` is idempotent; M10c is where a second client actually exists.
+- **The four `*_via_control` CLI helpers have no timeout.** If the daemon accepts a connection and never replies, the CLI hangs silently forever. `tokio::time::timeout` around each read loop is cheap, and given this branch's three hangs-instead-of-fails incidents it is worth more than the missing Error-path unit test.
+- **`land`/`discard` on a *companion* pane** falls through to `finish_agent`, which removes `owner[companion]` and kills the pane but never calls `remove_leaf` — leaving a phantom leaf that `reap_companion` cannot heal, because it early-returns on the missing `owner` entry. Pre-existing; project terminals just create more companions that can reach it.
+
+**Smaller, batch whenever:** `server.rs`'s `remove_project` holds the `agents` mutex across one `canonicalize()` syscall per agent; the terminal is killed and `TerminalClosed` broadcast *before* the store write that could still fail; `add_project_via_control` / `remove_project_via_control` accept *any* matching broadcast event rather than checking the path, so a concurrent operation by another client can satisfy the wrong caller (the general answer is request correlation ids, which the protocol lacks); `projects.rs`'s worktree-nesting scan runs outside `try_mutate`'s write lock; ~8 inline git-init blocks in `server.rs` tests could use `test_support::init_repo`; `branch_exists`'s jj arm has never executed in a test.
+
+**Do not "fix" this:** `JsonStore::mutate` does **not** delegate to `try_mutate`, and cannot — `try_mutate` returns `Result<R>`, so on write failure the closure's `R` would be lost. An earlier version of this plan instructed the delegation; the instruction was wrong.
+
+### How this plan failed, for the next one
+
+This plan shipped **six** defects that execution or review caught: a task-ordering bug (a guard compared against a canonical path three tasks before the code that produced one), a Rust temporary-lifetime bug in a test (`tempfile::tempdir().unwrap().path()` drops the dir), a mutex self-deadlock (an `if let` scrutinee holding a `MutexGuard` across a re-lock of the same mutex), two resource leaks in a teardown cascade, and a broken map bijection. It also mis-scoped the fixtures — specifying event fixtures for a bug that lived in a **request**.
+
+The common cause is the snippet-heavy style: pasted code reads as authoritative and gets transcribed rather than examined. Where a snippet must maintain an invariant, **write the invariant next to it** — "`project_terms` and `term_project` are inverses; every mutation must preserve that" — so the implementer has something to check the snippet against.
