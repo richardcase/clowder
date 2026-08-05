@@ -45,7 +45,7 @@ final class NavigationTests: XCTestCase {
         m.connect()
         fake.deliver(#"{"type":"projectList","projects":[{"path":"/a","name":"a","kind":"git"}]}"#)
         fake.deliver(#"{"type":"worktreeList","worktrees":[{"pane":1,"project":"/a","name":"t","branch":"clowder/t","state":"Working"}]}"#)
-        m.selectedPane = 1
+        m.selection = .worktree(1)
         m.selectNextAttention()
         XCTAssertEqual(m.selectedPane, 1)           // unchanged
     }

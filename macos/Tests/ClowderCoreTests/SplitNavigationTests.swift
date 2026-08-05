@@ -14,14 +14,14 @@ final class SplitNavigationTests: XCTestCase {
 
     func testSelectingAgentRequestsTreeAndFocusesAgent() {
         let (model, fake) = liveModel()
-        model.selectedPane = 1
+        model.selection = .worktree(1)
         XCTAssertTrue(fake.sentLines.contains { $0.contains("\"type\":\"getSplitTree\"") && $0.contains("\"agent\":1") })
         XCTAssertEqual(model.focusedPane, 1)
     }
 
     func testSplitFocusedSendsSplitPane() {
         let (model, fake) = liveModel()
-        model.selectedPane = 1
+        model.selection = .worktree(1)
         model.focusedPane = 1
         model.run(.splitRight)
         XCTAssertTrue(fake.sentLines.contains {
@@ -31,7 +31,7 @@ final class SplitNavigationTests: XCTestCase {
 
     func testFocusNextCyclesTreeLeaves() {
         let (model, fake) = liveModel()
-        model.selectedPane = 1
+        model.selection = .worktree(1)
         fake.deliver(treeJSON)              // trees[1] leaves = [1,2,3]
         model.focusedPane = 1
         model.focusNextPane(); XCTAssertEqual(model.focusedPane, 2)
@@ -41,7 +41,7 @@ final class SplitNavigationTests: XCTestCase {
 
     func testCloseFocusedOnlyClosesCompanions() {
         let (model, fake) = liveModel()
-        model.selectedPane = 1
+        model.selection = .worktree(1)
         fake.deliver(treeJSON)
         model.focusedPane = 1               // the agent pane
         model.closeFocused()

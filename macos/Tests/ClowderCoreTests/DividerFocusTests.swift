@@ -26,7 +26,7 @@ final class DividerFocusTests: XCTestCase {
 
     func testReconcileFocusResetsWhenLeafGone() {
         let (model, fake) = liveModel()
-        model.selectedPane = 1
+        model.selection = .worktree(1)
         fake.deliver(tree123)
         model.focusedPane = 2
         fake.deliver(tree13)            // pane 2 no longer a leaf
@@ -36,7 +36,7 @@ final class DividerFocusTests: XCTestCase {
 
     func testReconcileFocusKeepsValidFocus() {
         let (model, fake) = liveModel()
-        model.selectedPane = 1
+        model.selection = .worktree(1)
         fake.deliver(tree123)
         model.focusedPane = 2
         model.reconcileFocus()

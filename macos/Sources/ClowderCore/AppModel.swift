@@ -28,10 +28,34 @@ public final class AppModel: ObservableObject {
     }
 
     public let store: AgentStore
-    @Published public var selectedPane: UInt64? {
+    @Published public var selection: SidebarSelection? {
         didSet {
-            focusedPane = selectedPane            // focus the agent pane on (re)select
-            if let agent = selectedPane { try? session?.send(.getSplitTree(agent: agent)) }
+            focusedPane = selectedPane          // focus the root pane on (re)select
+            switch selection {
+            case let .worktree(pane):
+                try? session?.send(.getSplitTree(agent: pane))
+            case let .project(path):
+                if let pane = store.projectTerminals[path] {
+                    try? session?.send(.getSplitTree(agent: pane))
+                } else {
+                    // Not open yet — ask. `projectTerminalOpened` will populate the mapping,
+                    // and the daemon's open is idempotent, so a duplicate ask is harmless.
+                    try? session?.send(.openProjectTerminal(path: path))
+                }
+            case nil:
+                break
+            }
+        }
+    }
+
+    /// The root pane of the current selection. **Derived, never stored** — this is what lets
+    /// `currentTree`, `focusedPane`, `splitFocused`, `closeFocused` and `SplitContainer` keep
+    /// working unchanged, since they always meant "the selection's root pane".
+    public var selectedPane: UInt64? {
+        switch selection {
+        case let .worktree(pane): return pane
+        case let .project(path): return store.projectTerminals[path]
+        case nil: return nil
         }
     }
     @Published public var focusedPane: UInt64?
@@ -83,7 +107,7 @@ public final class AppModel: ObservableObject {
     public func reconnect(makeTransport newMakeTransport: @escaping () throws -> ControlTransport) {
         shutdown()                       // cancel reconnect, disconnect, clear session/connection
         store.reset()                    // drop the previous backend's agents/trees
-        selectedPane = nil
+        selection = nil
         self.makeTransport = newMakeTransport
         isShuttingDown = false
         connectionState = .connecting
@@ -161,7 +185,7 @@ public final class AppModel: ObservableObject {
     public func selectAgent(atIndex index: Int) {
         let ordered = store.orderedWorktrees
         guard index >= 1, index <= ordered.count else { return }
-        selectedPane = ordered[index - 1].pane
+        selection = .worktree(ordered[index - 1].pane)
     }
 
     /// Select the next agent needing input after the current selection, cycling. If the
@@ -170,9 +194,9 @@ public final class AppModel: ObservableObject {
         let needy = store.orderedWorktrees.filter { $0.state == .needsInput }
         guard !needy.isEmpty else { return }
         if let cur = selectedPane, let idx = needy.firstIndex(where: { $0.pane == cur }) {
-            selectedPane = needy[(idx + 1) % needy.count].pane
+            selection = .worktree(needy[(idx + 1) % needy.count].pane)
         } else {
-            selectedPane = needy[0].pane
+            selection = .worktree(needy[0].pane)
         }
     }
 
@@ -236,9 +260,31 @@ public final class AppModel: ObservableObject {
 
     /// Begin a Land/Discard: capture the selected pane + worktree name and await confirmation.
     public func requestLifecycle(_ action: LifecycleAction) {
-        guard let pane = selectedPane, let worktree = store.worktrees[pane] else { return }
-        pendingLifecycle = PendingLifecycle(action: action, pane: pane, name: worktree.name)
+        guard case let .worktree(pane) = selection, let w = store.worktrees[pane] else { return }
+        pendingLifecycle = PendingLifecycle(action: action, pane: pane, name: w.name)
     }
+
+    /// The selected worktree, if the selection is a worktree that exists.
+    public var selectedWorktree: WorktreeInfo? {
+        guard case let .worktree(pane) = selection else { return nil }
+        return store.worktrees[pane]
+    }
+
+    /// Restart is offered only for an exited agent — the daemon refuses it otherwise.
+    public var canRestartSelection: Bool { selectedWorktree?.state == .exited }
+
+    public func restartSelectedWorktree() {
+        guard canRestartSelection, case let .worktree(pane) = selection else { return }
+        try? session?.send(.restartWorktree(pane: pane))
+    }
+
+    /// Ask the daemon to open (or re-open) a project's terminal. Idempotent daemon-side.
+    public func openTerminal(forProject path: String) {
+        try? session?.send(.openProjectTerminal(path: path))
+    }
+
+    public func addProject(path: String) { try? session?.send(.addProject(path: path)) }
+    public func removeProject(path: String) { try? session?.send(.removeProject(path: path)) }
 
     /// Confirmed: send the request and clear.
     public func confirmLifecycle() {

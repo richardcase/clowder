@@ -282,6 +282,81 @@ final class AppModelTests: XCTestCase {
         XCTAssertTrue(wentLive)
         model.shutdown()
     }
+
+    func testSelectedPaneIsDerivedFromSelection() {
+        let fake = FakeControlTransport()
+        let model = AppModel(makeTransport: { fake })
+        model.connect()
+        model.selection = .worktree(5)
+        XCTAssertEqual(model.selectedPane, 5)
+        model.selection = .project("/code/alpha")
+        XCTAssertNil(model.selectedPane, "a project with no open terminal has no pane yet")
+        model.store.apply(.projectTerminalOpened(path: "/code/alpha", pane: 9))
+        XCTAssertEqual(model.selectedPane, 9, "once the daemon reports the terminal, it resolves")
+        model.selection = nil
+        XCTAssertNil(model.selectedPane)
+    }
+
+    func testSelectingAProjectWithNoTerminalAsksTheDaemon() throws {
+        let fake = FakeControlTransport()
+        let model = AppModel(makeTransport: { fake })
+        model.connect()
+        model.store.apply(.projectAdded(ProjectInfo(path: "/code/alpha", name: "alpha", kind: "git")))
+        model.selection = .project("/code/alpha")
+        XCTAssertTrue(fake.sentLines.contains { $0.contains("openProjectTerminal") },
+                      "must ask the daemon to open the terminal: \(fake.sentLines)")
+    }
+
+    func testSelectingAProjectWithAKnownTerminalDoesNotReask() {
+        let fake = FakeControlTransport()
+        let model = AppModel(makeTransport: { fake })
+        model.connect()
+        model.store.apply(.projectTerminalOpened(path: "/code/alpha", pane: 9))
+        model.selection = .project("/code/alpha")
+        XCTAssertFalse(fake.sentLines.contains { $0.contains("openProjectTerminal") },
+                       "already open — selecting must not respawn")
+    }
+
+    func testLifecycleCommandsAreNoOpsUnderAProjectSelection() {
+        let fake = FakeControlTransport()
+        let model = AppModel(makeTransport: { fake })
+        model.connect()
+        model.store.apply(.projectAdded(ProjectInfo(path: "/code/alpha", name: "alpha", kind: "git")))
+        model.store.apply(.projectTerminalOpened(path: "/code/alpha", pane: 9))
+        model.selection = .project("/code/alpha")
+        model.requestLifecycle(.land)
+        XCTAssertNil(model.pendingLifecycle, "land must refuse a project terminal")
+        model.requestLifecycle(.discard)
+        XCTAssertNil(model.pendingLifecycle)
+    }
+
+    func testRestartIsOnlyOfferedForAnExitedWorktree() {
+        let fake = FakeControlTransport()
+        let model = AppModel(makeTransport: { fake })
+        model.connect()
+        model.store.apply(.projectList([ProjectInfo(path: "/p", name: "p", kind: "git")]))
+        model.store.apply(.worktreeList([
+            WorktreeInfo(pane: 1, project: "/p", name: "a", branch: "clowder/a", state: .working),
+        ]))
+        model.selection = .worktree(1)
+        XCTAssertFalse(model.canRestartSelection)
+        model.restartSelectedWorktree()
+        XCTAssertFalse(fake.sentLines.contains { $0.contains("restartWorktree") },
+                       "restart must not be sent for a live agent")
+
+        model.store.apply(.attentionChanged(pane: 1, state: .exited))
+        XCTAssertTrue(model.canRestartSelection)
+        model.restartSelectedWorktree()
+        XCTAssertTrue(fake.sentLines.contains { $0.contains("restartWorktree") }, "\(fake.sentLines)")
+    }
+
+    func testSelectingAWorktreeRequestsItsSplitTree() {
+        let fake = FakeControlTransport()
+        let model = AppModel(makeTransport: { fake })
+        model.connect()
+        model.selection = .worktree(4)
+        XCTAssertTrue(fake.sentLines.contains { $0.contains("getSplitTree") }, "\(fake.sentLines)")
+    }
 }
 
 /// A test double for AppModel's injected `sleep`: records each requested delay and parks the
