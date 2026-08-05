@@ -239,54 +239,81 @@ impl Daemon {
         let max_id = records.iter().map(|r| r.agent_id).max().unwrap_or(0);
         self.bump_next_id_above(max_id);
         for rec in records {
-            let id = PaneId(rec.agent_id);
-            if !rec.worktree_path.exists() {
-                tracing::warn!(
-                    "agent {} worktree {} is gone; pruning",
-                    rec.agent_id,
-                    rec.worktree_path.display()
-                );
+            if let Err(e) = self.resume_agent(&rec) {
+                tracing::warn!("resume agent {} failed: {e}; pruning", rec.agent_id);
                 self.registry.remove(rec.agent_id);
-                continue;
-            }
-            let Some(kind) = clowder_workspace::WorkspaceKind::from_str(&rec.workspace_kind) else {
-                tracing::warn!("agent {} has unknown workspace kind {:?}; pruning", rec.agent_id, rec.workspace_kind);
-                self.registry.remove(rec.agent_id);
-                continue;
-            };
-            let Some(adapter) = crate::agent::build_adapter(&rec.adapter_id) else {
-                tracing::warn!("agent {} has unknown adapter {:?}; pruning", rec.agent_id, rec.adapter_id);
-                self.registry.remove(rec.agent_id);
-                continue;
-            };
-            let ws = Workspace {
-                path: rec.worktree_path.clone(),
-                branch: rec.branch.clone(),
-                project: rec.project.clone(),
-                kind,
-            };
-            let spawn = (|| -> Result<Pane> {
-                adapter.provision_hooks(&ws.path, id, &self.hook_sock)?;
-                let mut cmd = adapter.resume_command(&ws.path);
-                cmd.cwd = Some(ws.path.clone());
-                cmd.env.push(("CLOWDER_AGENT_ID".into(), id.0.to_string()));
-                cmd.env.push(("CLOWDER_HOOK_SOCK".into(), self.hook_sock.to_string_lossy().to_string()));
-                Pane::spawn(id, cmd, rec.cols, rec.rows, self.backlog_cap)
-            })();
-            match spawn {
-                Ok(pane) => {
-                    let restore_cwd = ws.path.clone();
-                    self.finalize_agent(id, pane, ws, &rec.task, adapter.as_ref());
-                    if let Some(tree) = rec.tree.clone() {
-                        self.restore_layout(id, tree, restore_cwd);
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("resume agent {} failed: {e}; pruning", rec.agent_id);
-                    self.registry.remove(rec.agent_id);
-                }
             }
         }
+    }
+
+    /// Re-spawn one recorded agent under its original pane id: provision hooks, run the adapter's
+    /// resume command, finalize, restore its companion layout. Shared by `reconcile` (daemon
+    /// restart) and `restart_worktree` (user request), so the two cannot drift apart.
+    fn resume_agent(self: &Arc<Self>, rec: &crate::registry::AgentRecord) -> Result<PaneId> {
+        let id = PaneId(rec.agent_id);
+        if !rec.worktree_path.exists() {
+            bail!("worktree {} is gone", rec.worktree_path.display());
+        }
+        let kind = clowder_workspace::WorkspaceKind::from_str(&rec.workspace_kind)
+            .ok_or_else(|| anyhow::anyhow!("unknown workspace kind {:?}", rec.workspace_kind))?;
+        let adapter = crate::agent::build_adapter(&rec.adapter_id)
+            .ok_or_else(|| anyhow::anyhow!("unknown adapter {:?}", rec.adapter_id))?;
+        let ws = Workspace {
+            path: rec.worktree_path.clone(),
+            branch: rec.branch.clone(),
+            project: rec.project.clone(),
+            kind,
+        };
+        adapter.provision_hooks(&ws.path, id, &self.hook_sock)?;
+        let mut cmd = adapter.resume_command(&ws.path);
+        cmd.cwd = Some(ws.path.clone());
+        cmd.env.push(("CLOWDER_AGENT_ID".into(), id.0.to_string()));
+        cmd.env.push(("CLOWDER_HOOK_SOCK".into(), self.hook_sock.to_string_lossy().to_string()));
+        let pane = Pane::spawn(id, cmd, rec.cols, rec.rows, self.backlog_cap)?;
+        let restore_cwd = ws.path.clone();
+        self.finalize_agent(id, pane, ws, &rec.task, adapter.as_ref());
+        if let Some(tree) = rec.tree.clone() {
+            self.restore_layout(id, tree, restore_cwd);
+        }
+        Ok(id)
+    }
+
+    /// Re-run an exited agent in its existing worktree, keeping its pane id (the worktree's
+    /// durable identity) and any live companion panes.
+    pub fn restart_worktree(self: &Arc<Self>, pane: PaneId) -> Result<()> {
+        if self.attention_of(pane) != Some(AttentionState::Exited) {
+            bail!("agent {} is still running — land or discard it instead", pane.0);
+        }
+        let mut rec = self
+            .registry
+            .load()
+            .into_iter()
+            .find(|r| r.agent_id == pane.0)
+            .ok_or_else(|| anyhow::anyhow!("no worktree with pane {}", pane.0))?;
+
+        // `resume_agent` unconditionally resets the tree to a bare leaf (via `finalize_agent`)
+        // and then rebuilds it from whatever tree we hand it (via `restore_layout`, if any).
+        // `rec.tree` above is the last snapshot the registry had *persisted* to disk; if a
+        // concurrent split/close on this same agent landed between that load and this point,
+        // it would be stale relative to the live `self.trees` entry, and restoring from it
+        // would silently drop (or duplicate) a companion. Re-reading the live tree right here —
+        // the instant before it gets clobbered — means restart always rebuilds the shape that
+        // was actually live, not a lagging disk copy.
+        rec.tree = self.split_tree_of(pane);
+
+        // Drop the dead pane and its stale exit watcher; `resume_agent` installs fresh ones under
+        // the same id. The split tree and any live companions are deliberately left alone.
+        if let Some(h) = self.watchers.lock().remove(&pane) {
+            h.abort();
+        }
+        if let Some(h) = self.scanners.lock().remove(&pane) {
+            h.abort();
+        }
+        self.hookless.lock().remove(&pane);
+        self.panes.lock().remove(&pane);
+
+        self.resume_agent(&rec)?;
+        Ok(())
     }
 
     fn register_pane(&self, id: PaneId, pane: Pane) {
@@ -2401,6 +2428,55 @@ mod tests {
         assert_eq!(d2.split_tree_of(id), Some(clowder_proto::PaneTree::Leaf { pane: id }));
         d2.shutdown();
         std::env::remove_var("CLOWDER_STATE_FILE");
+    }
+
+    #[tokio::test]
+    async fn restart_revives_an_exited_agent_under_the_same_pane_id() {
+        use crate::SyntheticAdapter;
+        let state = tempfile::tempdir().unwrap();
+        let repo = init_repo();
+        let d = test_daemon_in(state.path());
+        d.add_project(repo.path()).unwrap();
+        // An agent that exits immediately.
+        let adapter = SyntheticAdapter { command: crate::PaneCommand {
+            program: "/bin/sh".into(), args: vec!["-c".into(), "exit 0".into()], cwd: None, env: vec![] } };
+        let pane = d.spawn_agent(repo.path(), &adapter, "feat").unwrap();
+
+        // Wait for the exit watcher to mark it Exited.
+        for _ in 0..100 {
+            if d.attention_of(pane) == Some(AttentionState::Exited) { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(d.attention_of(pane), Some(AttentionState::Exited), "agent should have exited");
+
+        d.restart_worktree(pane).unwrap();
+        assert_eq!(d.attention_of(pane), Some(AttentionState::Working), "restart resets attention");
+        let listed = d.list_worktrees();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].pane, pane, "restart must reuse the pane id — it is the worktree identity");
+        d.teardown_agent(pane).unwrap();
+    }
+
+    #[tokio::test]
+    async fn restart_is_refused_while_the_agent_is_alive() {
+        use crate::SyntheticAdapter;
+        let state = tempfile::tempdir().unwrap();
+        let repo = init_repo();
+        let d = test_daemon_in(state.path());
+        d.add_project(repo.path()).unwrap();
+        let adapter = SyntheticAdapter { command: crate::PaneCommand {
+            program: "/bin/sh".into(), args: vec!["-c".into(), "sleep 30".into()], cwd: None, env: vec![] } };
+        let pane = d.spawn_agent(repo.path(), &adapter, "feat").unwrap();
+        let e = d.restart_worktree(pane).unwrap_err().to_string();
+        assert!(e.contains("still running"), "unhelpful message: {e}");
+        d.teardown_agent(pane).unwrap();
+    }
+
+    #[tokio::test]
+    async fn restart_of_an_unknown_pane_errors() {
+        let state = tempfile::tempdir().unwrap();
+        let d = test_daemon_in(state.path());
+        assert!(d.restart_worktree(PaneId(999)).is_err());
     }
 
     #[tokio::test]

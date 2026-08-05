@@ -102,11 +102,14 @@ impl Daemon {
                                         Ok(()) => ControlEvent::ProjectRemoved { path },
                                         Err(e) => ControlEvent::Error { message: e.to_string() },
                                     },
-                                // Dispatch lands in later tasks (terminal: Task 7; restart: Task 6).
-                                // The wire shapes exist now so both sides of the protocol can be
-                                // built against them.
-                                Ok(ControlRequest::OpenProjectTerminal { .. })
-                                | Ok(ControlRequest::RestartWorktree { .. }) =>
+                                Ok(ControlRequest::RestartWorktree { pane }) =>
+                                    match self.restart_worktree(pane) {
+                                        Ok(()) => self.tree_event(pane),
+                                        Err(e) => ControlEvent::Error { message: e.to_string() },
+                                    },
+                                // Dispatch lands in a later task (Task 7). The wire shape exists
+                                // now so both sides of the protocol can be built against it.
+                                Ok(ControlRequest::OpenProjectTerminal { .. }) =>
                                     ControlEvent::Error { message: "not implemented".into() },
                                 Err(e) => ControlEvent::Error { message: format!("bad request: {e}") },
                             };
