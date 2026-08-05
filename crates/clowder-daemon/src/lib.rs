@@ -12,6 +12,8 @@ pub mod registry;
 pub mod store;
 pub mod projects;
 mod split_tree;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub use agent::{
     adapter_descriptors, build_adapter, AdapterDescriptor, AgentAdapter, ClaudeAdapter, CodexAdapter,
     SyntheticAdapter,

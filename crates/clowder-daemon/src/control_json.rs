@@ -134,26 +134,11 @@ impl Daemon {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::init_repo;
     use crate::FakeNotifier;
     use clowder_proto::AttentionState;
-    use std::process::Command as PCommand;
     use std::time::Duration;
     use tokio::io::AsyncWriteExt;
-
-    fn init_repo() -> tempfile::TempDir {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path();
-        let run = |args: &[&str]| {
-            assert!(PCommand::new("git").arg("-C").arg(p).args(args).status().unwrap().success());
-        };
-        run(&["init", "-q"]);
-        run(&["config", "user.email", "t@t.test"]);
-        run(&["config", "user.name", "t"]);
-        std::fs::write(p.join("README.md"), b"hi").unwrap();
-        run(&["add", "."]);
-        run(&["commit", "-qm", "init"]);
-        dir
-    }
 
     #[tokio::test]
     async fn control_json_lists_spawns_and_streams() {

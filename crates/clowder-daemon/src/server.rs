@@ -926,6 +926,7 @@ impl Daemon {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::init_repo;
     use std::time::Duration;
 
     fn sh(script: &str) -> PaneCommand {
@@ -1197,21 +1198,9 @@ mod tests {
     async fn list_worktrees_reports_project_name_branch_and_state() {
         use crate::{FakeNotifier, SyntheticAdapter};
         use clowder_proto::AttentionState;
-        use std::process::Command as PCommand;
         use std::sync::Arc as StdArc;
 
-        // temp git repo
-        let repo = tempfile::tempdir().unwrap();
-        let run = |args: &[&str]| {
-            assert!(PCommand::new("git").arg("-C").arg(repo.path()).args(args).status().unwrap().success());
-        };
-        run(&["init", "-q"]);
-        run(&["config", "user.email", "t@t.test"]);
-        run(&["config", "user.name", "t"]);
-        std::fs::write(repo.path().join("README.md"), b"hi").unwrap();
-        run(&["add", "."]);
-        run(&["commit", "-qm", "init"]);
-
+        let repo = init_repo();
         let daemon = StdArc::new(Daemon::new_with(
             StdArc::new(FakeNotifier::new()),
             std::path::PathBuf::from("/tmp/unused-listagents.sock"),
@@ -1682,19 +1671,8 @@ mod tests {
     /// Temp git repo + a daemon wired up the same way the other integration tests build one.
     fn daemon_with_repo() -> (Arc<Daemon>, tempfile::TempDir) {
         use crate::FakeNotifier;
-        use std::process::Command as PCommand;
 
-        let repo = tempfile::tempdir().unwrap();
-        let run = |args: &[&str]| {
-            assert!(PCommand::new("git").arg("-C").arg(repo.path()).args(args).status().unwrap().success());
-        };
-        run(&["init", "-q"]);
-        run(&["config", "user.email", "t@t.test"]);
-        run(&["config", "user.name", "t"]);
-        std::fs::write(repo.path().join("README.md"), b"hi").unwrap();
-        run(&["add", "."]);
-        run(&["commit", "-qm", "init"]);
-
+        let repo = init_repo();
         let daemon = Arc::new(Daemon::new_with(
             Arc::new(FakeNotifier::new()),
             std::path::PathBuf::from("/tmp/unused-split-tree.sock"),
@@ -2430,23 +2408,6 @@ mod tests {
             "BEL must still escalate to NeedsInput");
         daemon.shutdown();
         std::env::remove_var("CLOWDER_STATE_FILE");
-    }
-
-    /// A temp git repo, initialized and committed — the same shape `control_json.rs`'s tests use.
-    fn init_repo() -> tempfile::TempDir {
-        use std::process::Command as PCommand;
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path();
-        let run = |args: &[&str]| {
-            assert!(PCommand::new("git").arg("-C").arg(p).args(args).status().unwrap().success());
-        };
-        run(&["init", "-q"]);
-        run(&["config", "user.email", "t@t.test"]);
-        run(&["config", "user.name", "t"]);
-        std::fs::write(p.join("README.md"), b"hi").unwrap();
-        run(&["add", "."]);
-        run(&["commit", "-qm", "init"]);
-        dir
     }
 
     /// A daemon whose registry AND project store live in `dir` — no env vars, no global lock.
