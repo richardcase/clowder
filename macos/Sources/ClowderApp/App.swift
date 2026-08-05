@@ -19,8 +19,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// The remote host the app is currently pointed at (nil = local daemon). Drives the tray label.
     private(set) var currentRemoteHost: String?
     /// The remote host from config (resolved once at startup), so a local session can still offer
-    /// "Connect to <host>". nil = no `[remote] host` configured.
-    private var configuredRemoteHost: String?
+    /// "Connect to <host>". nil = no `[remote] host` configured. Read (not just set) from
+    /// `ClowderApp.body` too, to decide whether `ContentView` runs in remote mode.
+    private(set) var configuredRemoteHost: String?
 
     /// One-time libghostty + model initialization. Idempotent and main-thread-only; runs on
     /// whichever fires first — the SwiftUI scene body or `applicationDidFinishLaunching` — so
@@ -192,7 +193,7 @@ struct ClowderApp: App {
             // Bootstrap on first body evaluation if the launch callback hasn't run yet;
             // idempotent, so a later applicationDidFinishLaunching is a no-op.
             let boot = delegate.bootstrap()
-            ContentView(surfaceHost: boot.surfaceHost)
+            ContentView(surfaceHost: boot.surfaceHost, isRemote: delegate.configuredRemoteHost != nil)
                 .environmentObject(boot.appModel)
                 .frame(minWidth: 900, minHeight: 560)
                 .background(WindowAccessor { [weak d = delegate] window in d?.adoptWindow(window) })
@@ -205,6 +206,7 @@ struct ClowderApp: App {
             CommandMenu("clowder") {
                 menuItem("Command Palette", .openPalette)
                 menuItem("New Worktree", .newWorktree)
+                menuItem("Add Project", .addProject)
                 menuItem("Next Attention", .nextAttention)
                 Divider()
                 ForEach(1...9, id: \.self) { i in
@@ -223,10 +225,13 @@ struct ClowderApp: App {
     }
 
     // A menu button that runs a command via the shared AppModel and carries its shortcut.
+    // Disabled (and so ignoring its keyboard shortcut too — SwiftUI Commands are NSMenu-backed)
+    // whenever the model says the command doesn't apply to the current selection.
     @ViewBuilder
     private func menuItem(_ title: String, _ id: CommandID) -> some View {
         Button(title) { delegate.appModel?.run(id) }
             .keyboardShortcut(shortcut(id))
+            .disabled(!(delegate.appModel?.isEnabled(id) ?? true))
     }
 
     private func shortcut(_ id: CommandID) -> KeyboardShortcut {

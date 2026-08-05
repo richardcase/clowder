@@ -114,20 +114,6 @@ public final class AgentStore: ObservableObject {
     /// The sidebar order flattened — the stable index order for Cmd-1…9 and the palette.
     public var orderedWorktrees: [WorktreeInfo] { sidebar.flatMap(\.worktrees) }
 
-    /// Worktrees grouped by their raw `project` string (projects sorted; worktrees within a
-    /// project sorted by pane), with no dependency on `ProjectInfo` registration.
-    ///
-    /// `sidebar` is the model new code should use — this task's brief calls it `sidebar`'s
-    /// replacement. It survives here only because `Sources/ClowderApp/ContentView.swift:68` still
-    /// renders from it, and this task (M10c Task 2, AgentStore only) is scoped away from touching
-    /// `Sources/ClowderApp/`; wiring the view onto `sidebar` is a later task's job. Once that lands,
-    /// delete this property.
-    public var byProject: [(project: String, worktrees: [WorktreeInfo])] {
-        Dictionary(grouping: worktrees.values, by: { $0.project })
-            .map { (project: $0.key, worktrees: $0.value.sorted { $0.pane < $1.pane }) }
-            .sorted { $0.project < $1.project }
-    }
-
     /// Worktrees that want a response — NeedsInput or Completed — in sidebar order.
     public var worktreesNeedingAttention: [WorktreeInfo] {
         orderedWorktrees.filter { $0.state == .needsInput || $0.state == .completed }
