@@ -71,7 +71,7 @@ pub async fn attach(pane_id: u64) -> Result<()> {
 pub async fn spawn_via_control(
     control_sock: &Path,
     project: &str,
-    task: &str,
+    name: &str,
     adapter: &str,
 ) -> anyhow::Result<PaneId> {
     let stream = UnixStream::connect(control_sock).await?;
@@ -80,7 +80,7 @@ pub async fn spawn_via_control(
 
     let req = ControlRequest::SpawnAgent {
         project: project.to_string(),
-        task: task.to_string(),
+        name: name.to_string(),
         adapter: adapter.to_string(),
     };
     let mut line = serde_json::to_string(&req)?;

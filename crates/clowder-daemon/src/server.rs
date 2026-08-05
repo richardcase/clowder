@@ -31,6 +31,17 @@ pub(crate) fn companion_command(shell: String, cwd: std::path::PathBuf) -> PaneC
     PaneCommand { program: shell, args: vec![], cwd: Some(cwd), env: vec![] }
 }
 
+/// Wire form of a project record: display name derived from the path's last component.
+pub(crate) fn project_info(rec: crate::projects::ProjectRecord) -> clowder_proto::ProjectInfo {
+    let name = rec.path.file_name().map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| rec.path.to_string_lossy().to_string());
+    clowder_proto::ProjectInfo {
+        path: rec.path.to_string_lossy().to_string(),
+        name,
+        kind: rec.kind,
+    }
+}
+
 /// A change to the project list, broadcast to every connected client.
 /// Task 7 adds a third variant, `TerminalClosed(PathBuf)`.
 #[derive(Clone, Debug)]
@@ -141,10 +152,10 @@ impl Daemon {
         self.projects_tx.subscribe()
     }
 
-    pub fn list_projects(&self) -> Vec<crate::projects::ProjectRecord> {
-        let mut out = self.projects.list();
-        out.sort_by(|a, b| a.path.cmp(&b.path));
-        out
+    pub fn list_projects(&self) -> Vec<clowder_proto::ProjectInfo> {
+        let mut recs = self.projects.list();
+        recs.sort_by(|a, b| a.path.cmp(&b.path));
+        recs.into_iter().map(project_info).collect()
     }
 
     /// Is `path` (canonicalized here) a registered project?

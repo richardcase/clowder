@@ -54,8 +54,8 @@ impl Daemon {
                                     ControlEvent::WorktreeList { worktrees: self.list_worktrees() },
                                 Ok(ControlRequest::ListAdapters) =>
                                     ControlEvent::AdapterList { adapters: self.list_adapters() },
-                                Ok(ControlRequest::SpawnAgent { project, task, adapter }) =>
-                                    match self.spawn_from_control(&project, &task, &adapter) {
+                                Ok(ControlRequest::SpawnAgent { project, name, adapter }) =>
+                                    match self.spawn_from_control(&project, &name, &adapter) {
                                         Ok(pane) => ControlEvent::AgentSpawned { pane },
                                         Err(e) => ControlEvent::Error { message: e.to_string() },
                                     },
@@ -89,6 +89,15 @@ impl Daemon {
                                     Ok(()) => ControlEvent::AgentRemoved { pane },
                                     Err(e) => ControlEvent::Error { message: e.to_string() },
                                 },
+                                // Dispatch lands in later tasks (project CRUD: Task 4; terminal:
+                                // Task 7; restart: Task 6). The wire shapes exist now so both
+                                // sides of the protocol can be built against them.
+                                Ok(ControlRequest::ListProjects)
+                                | Ok(ControlRequest::AddProject { .. })
+                                | Ok(ControlRequest::RemoveProject { .. })
+                                | Ok(ControlRequest::OpenProjectTerminal { .. })
+                                | Ok(ControlRequest::RestartWorktree { .. }) =>
+                                    ControlEvent::Error { message: "not implemented".into() },
                                 Err(e) => ControlEvent::Error { message: format!("bad request: {e}") },
                             };
                             write_event(&mut wr, &ev).await?;
@@ -124,10 +133,10 @@ impl Daemon {
         Ok(())
     }
 
-    fn spawn_from_control(self: &Arc<Self>, project: &str, task: &str, adapter: &str) -> Result<PaneId> {
+    fn spawn_from_control(self: &Arc<Self>, project: &str, name: &str, adapter: &str) -> Result<PaneId> {
         let project_path = Path::new(project);
         let a = build_adapter(adapter).ok_or_else(|| anyhow!("unknown adapter: {adapter}"))?;
-        self.spawn_agent(project_path, a.as_ref(), task)
+        self.spawn_agent(project_path, a.as_ref(), name)
     }
 }
 
@@ -162,7 +171,7 @@ mod tests {
         // Spawn a shell agent (build the request via the typed enum to escape the path safely).
         let req = ControlRequest::SpawnAgent {
             project: repo.path().to_string_lossy().to_string(),
-            task: "demo".into(),
+            name: "demo".into(),
             adapter: "shell".into(),
         };
         let mut line = serde_json::to_string(&req).unwrap();
@@ -230,7 +239,7 @@ mod tests {
         // Spawn a shell agent.
         let req = ControlRequest::SpawnAgent {
             project: repo.path().to_string_lossy().to_string(),
-            task: "demo".into(),
+            name: "demo".into(),
             adapter: "shell".into(),
         };
         let mut line = serde_json::to_string(&req).unwrap();
@@ -282,7 +291,7 @@ mod tests {
 
         let req = ControlRequest::SpawnAgent {
             project: repo.path().to_string_lossy().to_string(),
-            task: "x".into(),
+            name: "x".into(),
             adapter: "nope".into(),
         };
         let mut line = serde_json::to_string(&req).unwrap();
