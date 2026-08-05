@@ -107,10 +107,11 @@ impl Daemon {
                                         Ok(()) => self.tree_event(pane),
                                         Err(e) => ControlEvent::Error { message: e.to_string() },
                                     },
-                                // Dispatch lands in a later task (Task 7). The wire shape exists
-                                // now so both sides of the protocol can be built against it.
-                                Ok(ControlRequest::OpenProjectTerminal { .. }) =>
-                                    ControlEvent::Error { message: "not implemented".into() },
+                                Ok(ControlRequest::OpenProjectTerminal { path }) =>
+                                    match self.open_project_terminal(Path::new(&path)) {
+                                        Ok(pane) => ControlEvent::ProjectTerminalOpened { path, pane },
+                                        Err(e) => ControlEvent::Error { message: e.to_string() },
+                                    },
                                 Err(e) => ControlEvent::Error { message: format!("bad request: {e}") },
                             };
                             write_event(&mut wr, &ev).await?;
@@ -148,6 +149,9 @@ impl Daemon {
                                 project: crate::server::project_info(rec) }).await?,
                         Ok(crate::server::ProjectChange::Removed(p)) =>
                             write_event(&mut wr, &ControlEvent::ProjectRemoved {
+                                path: p.to_string_lossy().to_string() }).await?,
+                        Ok(crate::server::ProjectChange::TerminalClosed(p)) =>
+                            write_event(&mut wr, &ControlEvent::ProjectTerminalClosed {
                                 path: p.to_string_lossy().to_string() }).await?,
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                         Err(_) => break,

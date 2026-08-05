@@ -43,11 +43,11 @@ pub(crate) fn project_info(rec: crate::projects::ProjectRecord) -> clowder_proto
 }
 
 /// A change to the project list, broadcast to every connected client.
-/// Task 7 adds a third variant, `TerminalClosed(PathBuf)`.
 #[derive(Clone, Debug)]
 pub enum ProjectChange {
     Added(crate::projects::ProjectRecord),
     Removed(PathBuf),
+    TerminalClosed(PathBuf),
 }
 
 pub struct Daemon {
@@ -75,6 +75,10 @@ pub struct Daemon {
     registry: Arc<crate::registry::Registry>,
     projects: Arc<crate::projects::ProjectStore>,
     projects_tx: broadcast::Sender<ProjectChange>,
+    /// Project root -> its lazily-spawned terminal pane. Not persisted.
+    project_terms: Arc<Mutex<HashMap<PathBuf, PaneId>>>,
+    /// Terminal pane -> its project root. The inverse of `project_terms`.
+    term_project: Arc<Mutex<HashMap<PaneId, PathBuf>>>,
     /// Agents whose ratios changed since the last flush; drained by the periodic layout flusher.
     layout_dirty: Arc<Mutex<std::collections::HashSet<PaneId>>>,
     /// Idle debounce before content-based attention inspects the screen for a blocking prompt.
@@ -132,6 +136,8 @@ impl Daemon {
             registry: Arc::new(crate::registry::Registry::new(registry_path)),
             projects: Arc::new(crate::projects::ProjectStore::new(projects_path)),
             projects_tx,
+            project_terms: Arc::new(Mutex::new(HashMap::new())),
+            term_project: Arc::new(Mutex::new(HashMap::new())),
             layout_dirty: Arc::new(Mutex::new(std::collections::HashSet::new())),
             content_idle: std::time::Duration::from_millis(500),
         }
@@ -192,10 +198,101 @@ impl Daemon {
         if n > 0 {
             bail!("project {} still has {n} worktree(s) — land or discard them first", canonical.display());
         }
-        // Task 7 adds: kill this project's terminal pane here, before dropping the record.
+        // Kill this project's terminal (and its companions, via forget_project_terminal's
+        // cascade) before dropping the record — a removed project must not leave an orphaned
+        // shell behind. Bind the lookup out of the `if let` scrutinee: in edition 2021, a
+        // MutexGuard temporary created there lives for the whole `if let` body, and the body
+        // below re-locks `project_terms` (via `forget_project_terminal`) — left inline, that
+        // self-deadlocks.
+        let term = self.project_terms.lock().get(&canonical).copied();
+        if let Some(term) = term {
+            if let Some(p) = self.get(term) { let _ = p.kill(); }
+            self.forget_project_terminal(term);
+        }
         self.projects.remove(&canonical)?;
         let _ = self.projects_tx.send(ProjectChange::Removed(canonical));
         Ok(())
+    }
+
+    /// The shell pane rooted at a project. Lazy and idempotent: a second caller attaches to the
+    /// same shell. Not persisted — a daemon restart drops it and the next select respawns.
+    pub fn open_project_terminal(self: &Arc<Self>, path: &Path) -> Result<PaneId> {
+        let root = path.canonicalize()
+            .with_context(|| format!("no such project path: {}", path.display()))?;
+        if !self.projects.contains(&root) {
+            bail!("unknown project: {} — add it first", root.display());
+        }
+        // Bind out of the `if let` scrutinee (same reasoning as remove_project): the MutexGuard
+        // temporary otherwise lives for the whole body, which doesn't deadlock today (`self.get`
+        // locks `panes`, a different mutex) but is one refactor away from doing so.
+        let existing = self.project_terms.lock().get(&root).copied();
+        if let Some(existing) = existing {
+            if self.get(existing).is_some() {
+                return Ok(existing);
+            }
+        }
+        let id = self.spawn_pane(
+            companion_command(self.shell.clone(), root.clone()),
+            self.default_cols,
+            self.default_rows,
+        )?;
+        // Seed exactly what finalize_agent seeds for an agent root, so the split/close/ratio
+        // machinery — which is keyed on a root pane — applies unchanged.
+        self.trees.lock().insert(id, PaneTree::Leaf { pane: id });
+        self.owner.lock().insert(id, id);
+        self.project_terms.lock().insert(root.clone(), id);
+        self.term_project.lock().insert(id, root.clone());
+
+        // When the shell exits, forget it so the next select respawns.
+        if let Some(pane_arc) = self.get(id) {
+            let me = Arc::clone(self);
+            let handle = tokio::spawn(async move {
+                pane_arc.wait_exit().await;
+                me.forget_project_terminal(id);
+            });
+            self.watchers.lock().insert(id, handle);
+        }
+        Ok(id)
+    }
+
+    pub fn project_of_terminal(&self, pane: PaneId) -> Option<PathBuf> {
+        self.term_project.lock().get(&pane).cloned()
+    }
+
+    /// Drop all state for a project terminal whose pane is gone, and tell clients. Idempotent —
+    /// a no-op if `pane` is not (or is no longer) a project terminal, so callers that already
+    /// killed the pane and callers racing the pane's own exit watcher can both call this safely.
+    ///
+    /// Cascades to companions first (mirrors `finish_agent`'s agent-teardown cascade): a project
+    /// terminal that was split must not orphan its companion panes when the root is forgotten,
+    /// whether that happens via a natural exit, an explicit close, or the project being removed
+    /// — every one of those three callers reaches this same cascade instead of each duplicating
+    /// (and risking missing) it.
+    pub(crate) fn forget_project_terminal(&self, pane: PaneId) {
+        let Some(root) = self.term_project.lock().remove(&pane) else { return };
+        self.project_terms.lock().remove(&root);
+
+        let companions: Vec<PaneId> = self.trees.lock().get(&pane)
+            .map(|t| crate::split_tree::leaves(t).into_iter().filter(|p| *p != pane).collect())
+            .unwrap_or_default();
+        for c in &companions {
+            if let Some(p) = self.get(*c) { let _ = p.kill(); }
+            self.panes.lock().remove(c);
+            self.owner.lock().remove(c);
+            if let Some(h) = self.companion_watchers.lock().remove(c) { h.abort(); }
+        }
+
+        self.trees.lock().remove(&pane);
+        self.owner.lock().remove(&pane);
+        if let Some(p) = self.get(pane) { let _ = p.kill(); }
+        self.panes.lock().remove(&pane);
+        // The exit watcher may be calling this itself (natural exit) or a caller that already
+        // killed the pane may not have touched `watchers` (e.g. close_pane) — either way, drop
+        // the entry so it doesn't accumulate under a dead PaneId across respawns.
+        if let Some(h) = self.watchers.lock().remove(&pane) {
+            h.abort();
+        }
+        let _ = self.projects_tx.send(ProjectChange::TerminalClosed(root));
     }
 
     pub fn set_attention(&self, pane: PaneId, state: AttentionState) {
@@ -516,6 +613,15 @@ impl Daemon {
         self.workspaces.lock().get(&pane).cloned()
     }
 
+    /// The working directory for a companion of `root`: an agent's worktree, or a project
+    /// terminal's project root.
+    fn root_cwd(&self, root: PaneId) -> Option<PathBuf> {
+        if let Some(ws) = self.workspaces.lock().get(&root) {
+            return Some(ws.path.clone());
+        }
+        self.term_project.lock().get(&root).cloned()
+    }
+
     /// Kill the agent's process and finalize its workspace (land or discard); drop all
     /// per-pane state.
     fn finish_agent(&self, pane: PaneId, land: bool) -> Result<()> {
@@ -593,11 +699,19 @@ impl Daemon {
 
     /// Finalize the agent's work: commit any dirty changes, remove the worktree, keep the branch.
     pub fn land_agent(&self, pane: PaneId) -> Result<()> {
+        // finish_agent tolerates a missing workspace (`if let Some(ws)`), so without this guard
+        // landing a project terminal would silently succeed and kill it.
+        if self.term_project.lock().contains_key(&pane) {
+            bail!("pane {} is a project terminal — it has no workspace to land", pane.0);
+        }
         self.finish_agent(pane, true)
     }
 
     /// Throw away the agent's work: remove the worktree and delete its branch.
     pub fn discard_agent(&self, pane: PaneId) -> Result<()> {
+        if self.term_project.lock().contains_key(&pane) {
+            bail!("pane {} is a project terminal — it has no workspace to discard", pane.0);
+        }
         self.finish_agent(pane, false)
     }
 
@@ -716,10 +830,7 @@ impl Daemon {
             .get(&target)
             .ok_or_else(|| anyhow::anyhow!("unknown pane {target:?}"))?;
         let path = self
-            .workspaces
-            .lock()
-            .get(&agent)
-            .map(|w| w.path.clone())
+            .root_cwd(agent)
             .ok_or_else(|| anyhow::anyhow!("no workspace for agent {agent:?}"))?;
         let companion = self.spawn_pane(
             companion_command(self.shell.clone(), path),
@@ -783,6 +894,13 @@ impl Daemon {
     /// Close a companion pane (collapsing the tree), or teardown the agent if `pane` is one.
     /// Returns Some(agent) if a companion was closed, None if an agent was torn down.
     pub fn close_pane(&self, pane: PaneId) -> Result<Option<PaneId>> {
+        if self.term_project.lock().contains_key(&pane) {
+            // A project terminal's root: kill it and forget it, rather than taking the agent
+            // teardown path (which would emit AgentRemoved for something that is not a worktree).
+            if let Some(p) = self.get(pane) { let _ = p.kill(); }
+            self.forget_project_terminal(pane);
+            return Ok(None);
+        }
         let is_agent = self.trees.lock().contains_key(&pane);
         if is_agent {
             self.teardown_agent(pane)?;
@@ -2805,5 +2923,86 @@ mod tests {
         let listed = d.list_worktrees();
         assert_eq!(listed[0].project, repo.path().canonicalize().unwrap().to_string_lossy());
         d.teardown_agent(pane).unwrap();
+    }
+
+    #[tokio::test]
+    async fn open_project_terminal_is_idempotent() {
+        let state = tempfile::tempdir().unwrap();
+        let repo = init_repo();
+        let d = test_daemon_in(state.path());
+        d.add_project(repo.path()).unwrap();
+        let a = d.open_project_terminal(repo.path()).unwrap();
+        let b = d.open_project_terminal(repo.path()).unwrap();
+        assert_eq!(a, b, "a second select must attach to the same shell");
+        assert!(d.list_worktrees().is_empty(), "a terminal is not a worktree");
+    }
+
+    #[tokio::test]
+    async fn project_terminal_can_be_split() {
+        let state = tempfile::tempdir().unwrap();
+        let repo = init_repo();
+        let d = test_daemon_in(state.path());
+        d.add_project(repo.path()).unwrap();
+        let term = d.open_project_terminal(repo.path()).unwrap();
+        let companion = d.split_pane(term, clowder_proto::SplitDirection::Right).unwrap();
+        let tree = d.trees.lock().get(&term).cloned().unwrap();
+        assert_eq!(crate::split_tree::leaves(&tree).len(), 2);
+        assert_eq!(d.owner_of(companion), Some(term));
+    }
+
+    #[tokio::test]
+    async fn land_and_discard_refuse_a_project_terminal() {
+        let state = tempfile::tempdir().unwrap();
+        let repo = init_repo();
+        let d = test_daemon_in(state.path());
+        d.add_project(repo.path()).unwrap();
+        let term = d.open_project_terminal(repo.path()).unwrap();
+        // finish_agent tolerates a missing workspace, so without a guard these would silently
+        // succeed and kill the terminal.
+        assert!(d.land_agent(term).is_err(), "land must refuse a project terminal");
+        assert!(d.discard_agent(term).is_err(), "discard must refuse a project terminal");
+        assert!(d.get(term).is_some(), "the terminal must still be alive");
+    }
+
+    #[tokio::test]
+    async fn removing_a_project_kills_its_terminal() {
+        let state = tempfile::tempdir().unwrap();
+        let repo = init_repo();
+        let d = test_daemon_in(state.path());
+        d.add_project(repo.path()).unwrap();
+        let term = d.open_project_terminal(repo.path()).unwrap();
+        d.remove_project(repo.path()).unwrap();
+        assert!(d.get(term).is_none(), "the terminal pane must be gone");
+        assert!(d.project_of_terminal(term).is_none());
+    }
+
+    #[tokio::test]
+    async fn open_project_terminal_rejects_an_unregistered_project() {
+        let state = tempfile::tempdir().unwrap();
+        let repo = init_repo();
+        let d = test_daemon_in(state.path());
+        assert!(d.open_project_terminal(repo.path()).is_err());
+    }
+
+    // Not one of the brief's five tests — added because `finish_agent`'s companion cascade is
+    // the established pattern for tearing down a root+companions unit in this file, and a
+    // previous task in this branch shipped a leak by not reusing it. This pins that
+    // `forget_project_terminal` (reached by close_pane, remove_project, and natural exit alike)
+    // does the same for a split project terminal, instead of orphaning its companion.
+    #[tokio::test]
+    async fn closing_a_project_terminal_kills_its_companion() {
+        let state = tempfile::tempdir().unwrap();
+        let repo = init_repo();
+        let d = test_daemon_in(state.path());
+        d.add_project(repo.path()).unwrap();
+        let term = d.open_project_terminal(repo.path()).unwrap();
+        let companion = d.split_pane(term, clowder_proto::SplitDirection::Right).unwrap();
+        assert!(d.get(companion).is_some(), "sanity: the companion must be alive before closing");
+
+        d.close_pane(term).unwrap();
+
+        assert!(d.get(term).is_none(), "the terminal root must be gone");
+        assert!(d.get(companion).is_none(), "closing the root must not orphan its companion pane");
+        assert!(d.owner_of(companion).is_none(), "the companion's owner entry must not survive its pane");
     }
 }
