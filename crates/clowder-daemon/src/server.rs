@@ -281,28 +281,34 @@ impl Daemon {
     /// Re-run an exited agent in its existing worktree, keeping its pane id (the worktree's
     /// durable identity) and any live companion panes.
     pub fn restart_worktree(self: &Arc<Self>, pane: PaneId) -> Result<()> {
-        if self.attention_of(pane) != Some(AttentionState::Exited) {
-            bail!("agent {} is still running — land or discard it instead", pane.0);
+        match self.attention_of(pane) {
+            None => bail!("no worktree with pane {}", pane.0),
+            Some(AttentionState::Exited) => {}
+            Some(_) => bail!("agent {} is still running — land or discard it instead", pane.0),
         }
-        let mut rec = self
+        let rec = self
             .registry
             .load()
             .into_iter()
             .find(|r| r.agent_id == pane.0)
             .ok_or_else(|| anyhow::anyhow!("no worktree with pane {}", pane.0))?;
 
-        // `resume_agent` unconditionally resets the tree to a bare leaf (via `finalize_agent`)
-        // and then rebuilds it from whatever tree we hand it (via `restore_layout`, if any).
-        // `rec.tree` above is the last snapshot the registry had *persisted* to disk; if a
-        // concurrent split/close on this same agent landed between that load and this point,
-        // it would be stale relative to the live `self.trees` entry, and restoring from it
-        // would silently drop (or duplicate) a companion. Re-reading the live tree right here —
-        // the instant before it gets clobbered — means restart always rebuilds the shape that
-        // was actually live, not a lagging disk copy.
-        rec.tree = self.split_tree_of(pane);
+        // Capture the live tree before anything destructive happens. `resume_agent` →
+        // `finalize_agent` unconditionally overwrites `trees[pane]` with a bare leaf, and
+        // `restore_layout` — if handed a tree — rebuilds it by spawning brand-new companion
+        // processes. That's correct for `reconcile`'s cold-daemon case (nothing is actually
+        // alive to preserve) but wrong here: the daemon is warm, any companions are still
+        // running, and handing their shape to `restore_layout` would duplicate them and orphan
+        // the originals (still in `panes`/`owner`/`companion_watchers`, no longer referenced by
+        // the rebuilt tree, unreapable until the daemon exits). So below we suppress
+        // `restore_layout` entirely and reinstate this captured tree ourselves once the agent's
+        // own pane is back — reusing the exact same companion ids and `owner` entries, which we
+        // never touch.
+        let live_tree = self.split_tree_of(pane);
 
         // Drop the dead pane and its stale exit watcher; `resume_agent` installs fresh ones under
-        // the same id. The split tree and any live companions are deliberately left alone.
+        // the same id. Live companion panes (and their owner/tree bookkeeping) are deliberately
+        // left alone — not killed, not replaced.
         if let Some(h) = self.watchers.lock().remove(&pane) {
             h.abort();
         }
@@ -312,7 +318,24 @@ impl Daemon {
         self.hookless.lock().remove(&pane);
         self.panes.lock().remove(&pane);
 
-        self.resume_agent(&rec)?;
+        // Suppress `resume_agent`'s `restore_layout` call — we restore the tree ourselves below,
+        // from the live snapshot, instead of letting it respawn companions from a persisted one.
+        let mut resume_rec = rec.clone();
+        resume_rec.tree = None;
+        self.resume_agent(&resume_rec)?;
+
+        // Put the real layout back, replacing the bare leaf `finalize_agent` just installed.
+        // Fall back to the persisted tree only if the live one is genuinely gone — `split_tree_of`
+        // returns `Some(Leaf{pane})` for an ordinary unsplit agent, not `None`, so this only fires
+        // if the agent's tree entry vanished from under us entirely, which should not happen while
+        // it was `Exited` (only `finish_agent` removes a tree, and nothing else can be tearing this
+        // agent down concurrently mid-restart) — but an agent restored with no tree at all would be
+        // worse than one restored from a slightly stale snapshot.
+        if let Some(tree) = live_tree.or(rec.tree) {
+            self.trees.lock().insert(pane, tree);
+        }
+        self.broadcast_tree(pane);
+
         Ok(())
     }
 
@@ -2476,7 +2499,44 @@ mod tests {
     async fn restart_of_an_unknown_pane_errors() {
         let state = tempfile::tempdir().unwrap();
         let d = test_daemon_in(state.path());
-        assert!(d.restart_worktree(PaneId(999)).is_err());
+        let e = d.restart_worktree(PaneId(999)).unwrap_err().to_string();
+        assert!(e.contains("no worktree with pane 999"), "should name the missing pane, not claim it's alive: {e}");
+    }
+
+    #[tokio::test]
+    async fn restart_preserves_a_live_companion_pane_without_duplicating_it() {
+        use crate::SyntheticAdapter;
+        use clowder_proto::SplitDirection;
+        let state = tempfile::tempdir().unwrap();
+        let repo = init_repo();
+        let d = test_daemon_in(state.path());
+        d.add_project(repo.path()).unwrap();
+        // An agent that exits immediately; its companion (a plain shell) stays alive.
+        let adapter = SyntheticAdapter { command: crate::PaneCommand {
+            program: "/bin/sh".into(), args: vec!["-c".into(), "exit 0".into()], cwd: None, env: vec![] } };
+        let pane = d.spawn_agent(repo.path(), &adapter, "feat").unwrap();
+        let companion = d.split_pane(pane, SplitDirection::Right).unwrap();
+
+        // Wait for the agent's own process to exit.
+        for _ in 0..100 {
+            if d.attention_of(pane) == Some(AttentionState::Exited) { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(d.attention_of(pane), Some(AttentionState::Exited), "agent should have exited");
+
+        let panes_before = d.panes.lock().len();
+
+        d.restart_worktree(pane).unwrap();
+
+        let tree = d.split_tree_of(pane).expect("tree restored");
+        let leaves = crate::split_tree::leaves(&tree);
+        assert_eq!(leaves.len(), 2, "tree still has exactly agent + companion");
+        assert!(leaves.contains(&companion), "companion pane id unchanged — reused, not respawned");
+
+        let panes_after = d.panes.lock().len();
+        assert_eq!(panes_after, panes_before, "no extra pane created — the original companion was reused, not duplicated");
+
+        d.teardown_agent(pane).unwrap();
     }
 
     #[tokio::test]
