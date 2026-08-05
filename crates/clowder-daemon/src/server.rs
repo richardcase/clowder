@@ -236,12 +236,29 @@ impl Daemon {
             self.default_cols,
             self.default_rows,
         )?;
+        // Two callers can both observe `existing == None` above and both reach this spawn — the
+        // `project_terms` guard was released before the (long) fork, so it does not serialize
+        // spawns. Re-check now, under the guard, before publishing: if another racer already won
+        // while we were spawning, kill our pane and hand back the winner instead of leaving ours
+        // live-but-unreachable via `project_terms` (see the concurrent-open finding). `self.get`
+        // and `self.panes.lock()` stay OUT from under the `project_terms` guard — dropped before
+        // either — so this can't introduce a `project_terms -> panes` lock-ordering inversion.
+        let mut pt = self.project_terms.lock();
+        if let Some(&winner) = pt.get(&root) {
+            drop(pt);
+            if let Some(p) = self.get(id) { let _ = p.kill(); }
+            self.panes.lock().remove(&id);
+            return Ok(winner);
+        }
+        pt.insert(root.clone(), id);
+        drop(pt);
+        self.term_project.lock().insert(id, root.clone());
         // Seed exactly what finalize_agent seeds for an agent root, so the split/close/ratio
-        // machinery — which is keyed on a root pane — applies unchanged.
+        // machinery — which is keyed on a root pane — applies unchanged. Only the winner reaches
+        // here: seeding a loser's tree/owner would let the split machinery believe two panes are
+        // simultaneously the project's terminal.
         self.trees.lock().insert(id, PaneTree::Leaf { pane: id });
         self.owner.lock().insert(id, id);
-        self.project_terms.lock().insert(root.clone(), id);
-        self.term_project.lock().insert(id, root.clone());
 
         // When the shell exits, forget it so the next select respawns.
         if let Some(pane_arc) = self.get(id) {
@@ -270,7 +287,14 @@ impl Daemon {
     /// (and risking missing) it.
     pub(crate) fn forget_project_terminal(&self, pane: PaneId) {
         let Some(root) = self.term_project.lock().remove(&pane) else { return };
-        self.project_terms.lock().remove(&root);
+        // Only clear the forward map if it still points at this pane. A losing racer from
+        // `open_project_terminal`'s spawn window (or a caller that already killed a stale pane)
+        // must not delete a *different*, live winner's mapping out from under it.
+        let mut pt = self.project_terms.lock();
+        if pt.get(&root) == Some(&pane) {
+            pt.remove(&root);
+        }
+        drop(pt);
 
         let companions: Vec<PaneId> = self.trees.lock().get(&pane)
             .map(|t| crate::split_tree::leaves(t).into_iter().filter(|p| *p != pane).collect())
@@ -2935,6 +2959,37 @@ mod tests {
         let b = d.open_project_terminal(repo.path()).unwrap();
         assert_eq!(a, b, "a second select must attach to the same shell");
         assert!(d.list_worktrees().is_empty(), "a terminal is not a worktree");
+    }
+
+    #[tokio::test]
+    async fn forget_project_terminal_does_not_clobber_a_different_live_winner() {
+        // Regression test for the `project_terms`/`term_project` bijection race: a losing
+        // racer's cleanup must not delete a different, live pane's mapping for the same project.
+        // A true concurrency repro is awkward (the race window is inside `spawn_pane`'s fork), so
+        // instead we assert the invariant `forget_project_terminal` is now supposed to preserve:
+        // simulate the losing racer directly by seeding a stale `term_project` entry for the same
+        // project and forgetting it, then check the live winner's mapping survived.
+        let state = tempfile::tempdir().unwrap();
+        let repo = init_repo();
+        let d = test_daemon_in(state.path());
+        d.add_project(repo.path()).unwrap();
+        let root = repo.path().canonicalize().unwrap();
+        let live = d.open_project_terminal(repo.path()).unwrap();
+
+        let stale = PaneId(live.0 + 1_000_000);
+        d.term_project.lock().insert(stale, root.clone());
+        d.forget_project_terminal(stale);
+
+        assert_eq!(
+            d.project_terms.lock().get(&root).copied(),
+            Some(live),
+            "a stale racer's cleanup must not clear the live winner's mapping"
+        );
+        assert_eq!(
+            d.open_project_terminal(repo.path()).unwrap(),
+            live,
+            "the project's terminal must still resolve to the live pane"
+        );
     }
 
     #[tokio::test]

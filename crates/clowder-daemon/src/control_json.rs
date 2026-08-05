@@ -70,12 +70,22 @@ impl Daemon {
                                         }
                                         Err(e) => ControlEvent::Error { message: e.to_string() },
                                     },
-                                Ok(ControlRequest::ClosePane { pane }) =>
+                                Ok(ControlRequest::ClosePane { pane }) => {
+                                    // A project terminal's maps are cleared by `close_pane`, so
+                                    // capture its path first — after the call, `project_of_terminal`
+                                    // can no longer answer.
+                                    let terminal_path = self.project_of_terminal(pane);
                                     match self.close_pane(pane) {
                                         Ok(Some(agent)) => self.tree_event(agent),
-                                        Ok(None) => ControlEvent::AgentRemoved { pane },
+                                        Ok(None) => match terminal_path {
+                                            Some(path) => ControlEvent::ProjectTerminalClosed {
+                                                path: path.to_string_lossy().to_string(),
+                                            },
+                                            None => ControlEvent::AgentRemoved { pane },
+                                        },
                                         Err(e) => ControlEvent::Error { message: e.to_string() },
-                                    },
+                                    }
+                                }
                                 Ok(ControlRequest::SetSplitRatio { split, ratio }) =>
                                     match self.set_split_ratio(split, ratio) {
                                         Ok(agent) => self.tree_event(agent),
@@ -332,6 +342,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn close_pane_on_a_project_terminal_replies_project_terminal_closed() {
+        // Regression test: closing a project terminal must reply `projectTerminalClosed`, not
+        // `agentRemoved` — the terminal was never a worktree, so `agentRemoved` is a lie the
+        // client would act on (e.g. by looking for it in a worktree list it was never part of).
+        let state = tempfile::tempdir().unwrap();
+        let repo = init_repo();
+        let daemon = Arc::new(Daemon::new_with_paths(
+            Arc::new(FakeNotifier::new()),
+            std::path::PathBuf::from("/tmp/unused-cjson5.sock"),
+            state.path().join("agents.json"),
+            state.path().join("projects.json"),
+        ));
+        daemon.add_project(repo.path()).unwrap();
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let d = daemon.clone();
+        tokio::spawn(async move { let _ = d.handle_control_json(server_io).await; });
+
+        let (crd, mut cwr) = tokio::io::split(client_io);
+        let mut clines = BufReader::new(crd).lines();
+        let _snapshot = clines.next_line().await.unwrap().unwrap();
+
+        let req = ControlRequest::OpenProjectTerminal {
+            path: repo.path().to_string_lossy().to_string(),
+        };
+        let mut line = serde_json::to_string(&req).unwrap();
+        line.push('\n');
+        cwr.write_all(line.as_bytes()).await.unwrap();
+
+        let pane = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let l = clines.next_line().await.unwrap().unwrap();
+                if let Ok(ControlEvent::ProjectTerminalOpened { pane, .. }) =
+                    serde_json::from_str::<ControlEvent>(&l)
+                {
+                    break pane;
+                }
+            }
+        })
+        .await
+        .expect("no ProjectTerminalOpened within 5s");
+
+        let req = ControlRequest::ClosePane { pane };
+        let mut line = serde_json::to_string(&req).unwrap();
+        line.push('\n');
+        cwr.write_all(line.as_bytes()).await.unwrap();
+
+        let reply = tokio::time::timeout(Duration::from_secs(5), clines.next_line())
+            .await
+            .expect("no reply to closePane within 5s")
+            .unwrap()
+            .unwrap();
+        assert!(
+            reply.contains(r#""type":"projectTerminalClosed""#),
+            "expected projectTerminalClosed, got: {reply}"
+        );
+        assert!(
+            !reply.contains(r#""type":"agentRemoved""#),
+            "must not reply agentRemoved for a project terminal: {reply}"
+        );
+        match serde_json::from_str::<ControlEvent>(&reply).unwrap() {
+            ControlEvent::ProjectTerminalClosed { path } => {
+                assert_eq!(path, repo.path().canonicalize().unwrap().to_string_lossy());
+            }
+            other => panic!("expected ProjectTerminalClosed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn control_json_spawn_unknown_adapter_errors() {
         let repo = init_repo();
         let daemon = Arc::new(Daemon::new_with(
@@ -394,23 +473,32 @@ mod tests {
         line.push('\n');
         cwr.write_all(line.as_bytes()).await.unwrap();
 
-        // The reply is ProjectAdded, with the kind detected and the name derived.
-        let added = loop {
-            let l = clines.next_line().await.unwrap().unwrap();
-            if let Ok(ControlEvent::ProjectAdded { project }) = serde_json::from_str::<ControlEvent>(&l) {
-                break project;
+        // The reply is ProjectAdded, with the kind detected and the name derived. Bounded: a
+        // regression that stops the daemon sending ProjectAdded must fail fast, not hang CI.
+        let added = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let l = clines.next_line().await.unwrap().unwrap();
+                if let Ok(ControlEvent::ProjectAdded { project }) = serde_json::from_str::<ControlEvent>(&l) {
+                    break project;
+                }
             }
-        };
+        })
+        .await
+        .expect("no ProjectAdded within 5s");
         assert_eq!(added.kind, "git");
         assert_eq!(added.path, repo.path().canonicalize().unwrap().to_string_lossy());
 
         cwr.write_all(b"{\"type\":\"listProjects\"}\n").await.unwrap();
-        let listed = loop {
-            let l = clines.next_line().await.unwrap().unwrap();
-            if let Ok(ControlEvent::ProjectList { projects }) = serde_json::from_str::<ControlEvent>(&l) {
-                if !projects.is_empty() { break projects; }
+        let listed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let l = clines.next_line().await.unwrap().unwrap();
+                if let Ok(ControlEvent::ProjectList { projects }) = serde_json::from_str::<ControlEvent>(&l) {
+                    if !projects.is_empty() { break projects; }
+                }
             }
-        };
+        })
+        .await
+        .expect("no non-empty ProjectList within 5s");
         assert_eq!(listed.len(), 1);
     }
 
@@ -436,7 +524,12 @@ mod tests {
         line.push('\n');
         cwr.write_all(line.as_bytes()).await.unwrap();
 
-        let l = clines.next_line().await.unwrap().unwrap();
+        // Bounded: a regression that stops the daemon replying must fail fast, not hang CI.
+        let l = tokio::time::timeout(std::time::Duration::from_secs(5), clines.next_line())
+            .await
+            .expect("no reply within 5s")
+            .unwrap()
+            .unwrap();
         assert!(l.contains("not a git or jj repository"), "expected a helpful error: {l}");
         assert!(daemon.list_projects().is_empty());
     }

@@ -100,6 +100,20 @@ final class ModelsTests: XCTestCase {
         XCTAssertEqual(ws.count, 1)
         XCTAssertEqual(ws[0].branch, "clowder/task-a")
         XCTAssertEqual(ws[0].state, .needsInput)
+
+        guard case let .splitTreeChanged(agent, tree) =
+                try d.decode(ControlEvent.self, from: fixture("split-tree-changed.json")) else {
+            return XCTFail("split-tree-changed.json did not decode to .splitTreeChanged")
+        }
+        XCTAssertEqual(agent, 2)
+        guard case let .split(id, axis, ratio, first, second) = tree else {
+            return XCTFail("expected a .split root, got \(tree)")
+        }
+        XCTAssertEqual(id, 1)
+        XCTAssertEqual(axis, .horizontal)
+        XCTAssertEqual(ratio, 0.5, accuracy: 0.0001)
+        XCTAssertEqual(first, .leaf(pane: 2))
+        XCTAssertEqual(second, .leaf(pane: 3))
     }
 
     func testSpawnAgentEncodesNameNotTask() throws {
@@ -108,5 +122,37 @@ final class ModelsTests: XCTestCase {
         let s = String(decoding: data, as: UTF8.self)
         XCTAssertTrue(s.contains("\"name\":\"add-projects\""), s)
         XCTAssertFalse(s.contains("\"task\""), s)
+    }
+
+    /// Requests are the mirror image of events: Swift *encodes* a `ControlRequest` and Rust
+    /// decodes it (`request_fixtures_decode_and_roundtrip` in `crates/clowder-proto`). So the
+    /// Swift-side guarantee for a request fixture is that the encoder PRODUCES the fixture —
+    /// the opposite check from the event fixtures above, which Swift only decodes.
+    ///
+    /// This compares decoded JSON objects rather than raw bytes: confirmed empirically,
+    /// `JSONEncoder` on this toolchain does NOT preserve the key order `encode(to:)` calls
+    /// `container.encode(_:forKey:)` in, so a literal byte/string comparison against a fixture
+    /// whose key order comes from Rust's field-declaration order is not stable. Comparing the
+    /// parsed objects still fails exactly like a byte comparison would if a field were renamed,
+    /// dropped, added, or given the wrong value — it just isn't sensitive to key order.
+    func testEncodesEveryGoldenRequestFixtureExactly() throws {
+        let e = JSONEncoder()
+
+        let spawnData = try e.encode(
+            ControlRequest.spawnAgent(project: "/Users/x/code/clowder", name: "add-projects", adapter: "claude"))
+        try assertJSONObjectsEqual(spawnData, fixture("spawn-agent.json"))
+
+        let openData = try e.encode(ControlRequest.openProjectTerminal(path: "/Users/x/code/clowder"))
+        try assertJSONObjectsEqual(openData, fixture("open-project-terminal.json"))
+    }
+
+    private func assertJSONObjectsEqual(
+        _ encoded: Data, _ fixtureData: Data, file: StaticString = #filePath, line: UInt = #line
+    ) throws {
+        let a = try JSONSerialization.jsonObject(with: encoded) as? NSDictionary
+        let b = try JSONSerialization.jsonObject(with: fixtureData) as? NSDictionary
+        XCTAssertNotNil(a, "encoded request did not parse as a JSON object", file: file, line: line)
+        XCTAssertNotNil(b, "fixture did not parse as a JSON object", file: file, line: line)
+        XCTAssertEqual(a, b, file: file, line: line)
     }
 }

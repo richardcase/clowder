@@ -294,10 +294,47 @@ mod tests {
                 branch: "clowder/task-a".into(),
                 state: AttentionState::NeedsInput,
             }] }),
+            ("split-tree-changed.json", ControlEvent::SplitTreeChanged {
+                agent: PaneId(2),
+                tree: PaneTree::Split {
+                    id: SplitId(1),
+                    axis: Axis::Horizontal,
+                    ratio: 0.5,
+                    first: Box::new(PaneTree::Leaf { pane: PaneId(2) }),
+                    second: Box::new(PaneTree::Leaf { pane: PaneId(3) }),
+                },
+            }),
         ];
         for (file, ev) in cases {
             assert_eq!(serde_json::to_string(&ev).unwrap(), fixture(file),
                        "encoder drifted from {file} — update BOTH the fixture and the Swift mirror");
+        }
+    }
+
+    /// Requests are the mirror image of events: Swift *encodes* a `ControlRequest`, Rust
+    /// *decodes* it. So the Rust-side guarantee for a request fixture is the other direction from
+    /// `encoder_matches_the_golden_fixtures`: the fixture must decode to the expected value, AND
+    /// re-encoding that value must reproduce the fixture byte-for-byte (so the two directions
+    /// can't silently diverge from each other while each still "round-trips" on its own).
+    #[test]
+    fn request_fixtures_decode_and_roundtrip() {
+        let cases: Vec<(&str, ControlRequest)> = vec![
+            ("spawn-agent.json", ControlRequest::SpawnAgent {
+                project: "/Users/x/code/clowder".into(),
+                name: "add-projects".into(),
+                adapter: "claude".into(),
+            }),
+            ("open-project-terminal.json", ControlRequest::OpenProjectTerminal {
+                path: "/Users/x/code/clowder".into(),
+            }),
+        ];
+        for (file, expected) in cases {
+            let raw = fixture(file);
+            let decoded: ControlRequest = serde_json::from_str(&raw)
+                .unwrap_or_else(|e| panic!("{file} failed to decode: {e}"));
+            assert_eq!(decoded, expected, "{file} decoded to an unexpected value");
+            assert_eq!(serde_json::to_string(&decoded).unwrap(), raw,
+                       "re-encoding {file} did not reproduce it byte-for-byte");
         }
     }
 }
