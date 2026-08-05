@@ -171,6 +171,41 @@ pub fn detect_kind(project: &Path) -> Option<WorkspaceKind> {
     None
 }
 
+/// Validate a worktree/workspace name. The name becomes BOTH a git ref (`clowder/<name>`)
+/// and a path component (`.clowder/worktrees/<name>`), so it must be safe as both.
+/// Messages are user-facing — they surface directly in the app's error banner.
+pub fn validate_workspace_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        bail!("worktree name must not be empty");
+    }
+    let len = name.chars().count();
+    if len > 64 {
+        bail!("worktree name must be 64 characters or fewer (got {len})");
+    }
+    if name == "." || name == ".." {
+        bail!("worktree name must not be {name:?}");
+    }
+    if name.contains("..") {
+        bail!("worktree name must not contain '..'");
+    }
+    if name.ends_with(".lock") {
+        bail!("worktree name must not end with '.lock' (git reserves that suffix)");
+    }
+    if let Some(c) = name
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || *c == '.' || *c == '_' || *c == '-'))
+    {
+        bail!("worktree name must contain only letters, digits, '.', '_' or '-' (found {c:?})");
+    }
+    // Checked last so the charset message wins for e.g. "  x": a leading '.' or '-' is legal
+    // in a path but reads as a hidden file or a CLI flag.
+    let first = name.chars().next().unwrap();
+    if first == '.' || first == '-' {
+        bail!("worktree name must not start with {first:?}");
+    }
+    Ok(())
+}
+
 /// Pick a workspace driver for `project`. Falls back to git when `project` is not a repo,
 /// preserving the pre-M10 contract; callers that need to REJECT a non-repo use `detect_kind`.
 pub fn driver_for(project: &Path) -> Arc<dyn WorkspaceDriver> {
@@ -417,5 +452,43 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(".git"), b"gitdir: /elsewhere").unwrap();
         assert_eq!(detect_kind(dir.path()), Some(WorkspaceKind::Git));
+    }
+
+    #[test]
+    fn validate_workspace_name_accepts_reasonable_names() {
+        for ok in ["a", "add-projects", "fix_bug", "v1.2", "M10a", "a-b_c.d"] {
+            assert!(validate_workspace_name(ok).is_ok(), "should accept {ok:?}");
+        }
+    }
+
+    #[test]
+    fn validate_workspace_name_rejects_unsafe_names() {
+        let too_long = "a".repeat(65);
+        let cases: [&str; 11] = [
+            "",              // empty
+            &too_long,       // > 64 chars
+            ".",             // path component
+            "..",            // path component
+            "a..b",          // traversal fragment
+            "x.lock",        // git reserves the .lock suffix
+            "my feature",    // space
+            "feat/x",        // slash would nest the path AND the ref
+            ".hidden",       // leading dot
+            "-dash",         // leading dash reads as a flag
+            "caf\u{e9}",     // non-ASCII
+        ];
+        for bad in cases {
+            assert!(validate_workspace_name(bad).is_err(), "should reject {bad:?}");
+        }
+    }
+
+    #[test]
+    fn validate_workspace_name_errors_name_the_problem() {
+        // The message is user-facing (it surfaces in the app's error banner), so it must say
+        // what is wrong, not just that something is.
+        let e = validate_workspace_name("my feature").unwrap_err().to_string();
+        assert!(e.contains("letters"), "unhelpful message: {e}");
+        let e = validate_workspace_name(&"a".repeat(65)).unwrap_err().to_string();
+        assert!(e.contains("64"), "unhelpful message: {e}");
     }
 }
