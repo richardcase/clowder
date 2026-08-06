@@ -1,29 +1,146 @@
 # Versioning & releases
 
-The version lives in one place: the top-level `VERSION` file (currently `0.2.0`).
+The version lives in one place: the top-level `VERSION` file.
 
 - **Rust crates** inherit it via `[workspace.package] version` in the root `Cargo.toml`
   (`version.workspace = true` in each crate).
 - **The macOS app** (`Clowder.app` Info.plist `CFBundleShortVersionString`/`CFBundleVersion`) reads
-  `VERSION` in `scripts/build-app.sh`.
+  `VERSION` in `scripts/build-app.sh`. A pre-release suffix is trimmed there — those keys must be
+  dot-separated integers — so `0.5.0-rc1` ships a plist version of `0.5.0`.
 
-## Bumping the version
+You do not bump `VERSION` by hand for a release. The release workflow computes it and opens the PR
+that changes it.
+
+## Cutting a release
+
+**Actions → Release → Run workflow**, from `main`. That is the whole procedure.
+
+| Input | Effect |
+|---|---|
+| `dry_run` | Compute the version, print the plan to the job summary, change nothing. |
+| `version_override` | Use an explicit version instead of the computed one — the escape hatch for cutting `1.0.0`. |
+| `prerelease` | Append an identifier (e.g. `rc1`). Publishes as a GitHub pre-release and skips the Homebrew cask bump. |
+
+Start with `dry_run: true` if you want to see what it would do.
+
+## How the version is computed
+
+`scripts/next-version.sh` finds the last release tag and reads the Conventional Commit subjects
+since it (`--no-merges` — every PR lands as a `Merge pull request #N …` commit, which carries no
+type). Run it locally any time; it changes nothing.
+
+```sh
+scripts/next-version.sh              # what would the next release be?
+scripts/next-version.sh --notes      # the changelog for that range
+scripts/next-version.sh --self-test  # the bump rules, as unit tests
+```
+
+| Commit type | Bump |
+|---|---|
+| `feat` | minor |
+| `fix`, `perf` | patch |
+| `!` before the colon, or a `BREAKING CHANGE:` footer | major — **but see the 0.x rule** |
+| `docs`, `test`, `refactor`, `ci`, `chore`, `build`, `style`, `revert` | none |
+
+The largest bump across the range wins. If **nothing** is releasable — a range of only docs and
+chores, or no commits at all — the workflow reports that and exits green, having done nothing.
+Non-releasable commits still appear in the release notes when a release does happen.
+
+### The 0.x rule
+
+**While the major version is 0, a breaking change bumps the minor version**, not the major: `0.4.0`
++ `feat!` → `0.5.0`. Under SemVer anything may change at any time in `0.x`, and promoting the
+project to `1.0.0` should be a deliberate decision rather than a side effect of a commit marker.
+
+When you do want `1.0.0`, pass it as `version_override`. After that the normal rules apply and `!`
+bumps the major version.
+
+The job summary reports the *effective* bump and, when the 0.x rule folded it, what the commits
+originally asked for.
+
+## What the workflow actually does
 
 ```
-scripts/set-version.sh 0.2.0     # writes VERSION + the Cargo workspace version + refreshes Cargo.lock
-git commit -am "chore: v0.2.0"
-git tag -a v0.2.0 -m "v0.2.0"    # annotated (plain `git tag` is rejected in this repo)
-git push && git push origin v0.2.0   # the v* tag triggers .github/workflows/release.yml
+plan     compute the version; guard rails; dry_run stops here
+  ↓
+bump     set-version.sh → signed commit → PR → start CI → wait → merge   (skipped if VERSION is already correct)
+  ↓
+release  build → sign → notarize → TAG → publish → Homebrew cask bump
 ```
 
-## Releasing
+Two constraints shape this, and both are worth knowing before changing it:
 
-Pushing a `vX.Y.Z` tag runs `.github/workflows/release.yml`, which builds the app and publishes a
-GitHub Release. The tag must match `VERSION` (the workflow checks this). When signing is configured it
-attaches a **signed + notarized `Clowder-vX.Y.Z-macos.dmg`**; otherwise it falls back to an unsigned
-zipped `.app` (Gatekeeper-quarantined on download — right-click → Open, or
-`xattr -dr com.apple.quarantine Clowder.app`).
+**The bump goes through a PR because it has to.** `main`'s ruleset requires a pull request, signed
+commits and passing checks, and has **no bypass actors** — `GITHUB_TOKEN` cannot push to `main`. The
+commit is created with the GraphQL `createCommitOnBranch` mutation specifically because GitHub signs
+commits made that way; a plain `git commit` in CI is unsigned and the merge would be rejected. (The
+REST git-data API does *not* sign for you — its `signature` field is caller-supplied.)
 
-Signing/notarization and its one-time setup (signing material fetched from Doppler with a single
-read-only service token) are documented in [`code-signing.md`](code-signing.md). A final release also
-auto-bumps the Homebrew cask — see [`homebrew.md`](homebrew.md).
+**CI on the bump branch is started explicitly.** Refs pushed with `GITHUB_TOKEN` do not start
+workflow runs, so the PR's required checks would never report and it could never merge.
+`workflow_dispatch` is the documented exception, which is why `ci.yml` accepts it and the release
+workflow calls `gh workflow run ci.yml --ref release/vX.Y.Z`. The resulting check runs attach to the
+PR head SHA, which is what the ruleset evaluates.
+
+A consequence: each release builds macOS twice — once for the bump PR's required check, once to
+produce the artifact. That is the cost of requiring a green `main`.
+
+**Tagging happens last, after the build succeeds.** A tag is the *input* to the next version
+computation, so a tag left behind by a failed build would make the next run measure from it and
+silently skip a version that never shipped.
+
+## When something goes wrong
+
+**The build failed after the bump merged.** This is the designed-for case and needs no cleanup:
+`VERSION` on `main` is already correct, so re-dispatching recomputes the same version, sees the bump
+is unnecessary, skips that job entirely, and goes straight to build → tag → publish.
+
+**The bump PR did not merge.** It is left open on purpose, with the reason in the job summary. Merge
+it by hand and re-dispatch, or close it and delete the `release/vX.Y.Z` branch to start over.
+
+**The workflow refuses to start.** The guard rails in `plan` fail loudly rather than doing something
+surprising:
+
+- the tag already exists → that version shipped; `gh release delete vX.Y.Z --cleanup-tag`, or pass
+  `version_override`
+- a release PR is already open → merge or close it first
+- a `release/vX.Y.Z` branch is left over → delete it
+- dispatched from a branch other than `main` → only `dry_run` is allowed off `main`
+
+## Artifacts
+
+| | |
+|---|---|
+| Signed | `Clowder-X.Y.Z-macos.dmg` (no `v` prefix) |
+| Unsigned fallback | `Clowder-X.Y.Z-macos.zip` |
+| Tag | `vX.Y.Z` — annotated, created by CI |
+
+Signing and notarization, and their one-time setup (signing material fetched from Doppler with a
+single read-only service token), are documented in [`code-signing.md`](code-signing.md). A final
+release also auto-bumps the Homebrew cask — see [`homebrew.md`](homebrew.md). Pre-releases are kept
+out of "Latest" and skip the cask bump. The unsigned zip is Gatekeeper-quarantined on download —
+right-click → Open, or `xattr -dr com.apple.quarantine Clowder.app`.
+
+## Tags
+
+Release tags are created by CI; don't tag by hand. They are **annotated but not signed** — no
+ruleset requires a signed tag, and putting the signing key into Actions would be a worse trade than
+the tag being merely annotated. The commit a tag points at is GitHub-signed either way.
+
+On a dev machine a bare `git tag vX.Y.Z` fails with "no tag message?" — that is `tag.gpgsign = true`
+in the maintainer's global git config, **not** a repo hook. CI has no such config, which is exactly
+why `release.yml` passes `-a` explicitly: without it, CI would silently create a lightweight tag.
+
+## One-time repo setup
+
+The workflow depends on two settings that are easy to lose and hard to diagnose:
+
+```sh
+# Actions must be allowed to open the bump PR, or `POST /pulls` returns 403.
+gh api -X PUT repos/richardcase/clowder/actions/permissions/workflow \
+  -F default_workflow_permissions=read -F can_approve_pull_request_reviews=true
+
+# The `release` label marks the bump PR so it is excluded from its own release notes
+# (see .github/release.yml) and so the guard rail can find an already-open one.
+gh label create release -c 0E8A16 -d "Automated release version bump"
+```

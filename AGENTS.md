@@ -53,6 +53,8 @@ cd macos && swift build -c release
 | `set-version.sh` | Set the version everywhere from `VERSION` (Cargo `[workspace.package]` + refresh `Cargo.lock`) | `scripts/set-version.sh <X.Y.Z>` |
 | `gen-icon.swift` | Render the placeholder app icon PNG (called by `build-app.sh`) | `swift scripts/gen-icon.swift <out.png> [size]` |
 | `check-commit-messages.sh` | Verify this branch's non-merge commits are Conventional Commits (CI runs it on every PR) | `scripts/check-commit-messages.sh [base] [head]` |
+| `next-version.sh` | Derive the next release version from the commits since the last tag (used by `release.yml`) | `scripts/next-version.sh [--notes\|--self-test]` |
+| `lib/conventional.sh` | The Conventional Commits grammar, sourced by both of the above so they can't drift | (sourced, not run) |
 
 ## Runtime model
 
@@ -86,8 +88,10 @@ An optional remote TCP listener (`[remote] listen`/`host`) can be hardened with 
   `cargo run -p clowder-daemon` yourself and set `CLOWDER_BIN` to the `clowder` binary
   (`CLOWDER_BIN="$PWD/../target/debug/clowder"`). The packaged `.app` auto-spawns + supervises its bundled
   daemon.
-- **Tags:** this repo requires **annotated** tags — `git tag -a vX.Y.Z -m "…"` (plain `git tag vX.Y.Z`
-  fails with "no tag message?").
+- **Tags:** release tags are created by CI — don't tag by hand. A bare `git tag vX.Y.Z` fails locally
+  with "no tag message?" because of `tag.gpgsign = true` in the maintainer's **global** git config,
+  *not* a repo hook; CI has no such config, which is why `release.yml` passes `-a` explicitly (without
+  it CI would silently create a lightweight tag).
 - **Editor diagnostics:** ignore stale SourceKit "No such module" / "cannot find type" errors — trust
   the actual `swift build` / `swift test` output.
 - **Versioning:** `VERSION` is canonical; bump via `scripts/set-version.sh` and commit the regenerated
@@ -100,8 +104,10 @@ An optional remote TCP listener (`[remote] listen`/`host`) can be hardened with 
 - `.github/workflows/ci.yml` (**CI**) — on push to `main` + PRs, `runs-on: macos-15`: select Xcode 16,
   install zig (Homebrew) + Rust, cache/build libghostty, `cargo test --workspace --locked`,
   `swift test` (ClowderCore), assemble the unsigned `Clowder.app`, upload it as an artifact. **Must be green.**
-- `.github/workflows/release.yml` (**Release**) — on `v*` tags, builds + publishes a GitHub Release with
-  the unsigned zipped app.
+- `.github/workflows/release.yml` (**Release**) — **manually dispatched** (Actions → Release → Run
+  workflow), never on a tag. Computes the next version from the Conventional Commit types since the
+  last `v*` tag, opens + merges a `chore: vX.Y.Z` bump PR, then builds, tags, and publishes. Does
+  nothing when no `feat`/`fix`/`perf` commits have landed. See `docs/versioning.md`.
 - Anything touching libghostty/the app requires full Xcode; the libghostty build is cached by the
   pin/patch hash.
 
@@ -113,6 +119,9 @@ An optional remote TCP listener (`[remote] listen`/`host`) can be hardened with 
 - **Commit messages are Conventional Commits** — `type(scope): subject`, with `type` one of `feat`,
   `fix`, `docs`, `test`, `refactor`, `perf`, `ci`, `chore`, `build`, `style`, `revert`; scope
   optional and free-form (`daemon`, `app`, `m10c`, `proto,daemon` are all fine); `!` before the colon
-  for a breaking change. PRs merge with a merge commit, so **every** commit on the branch keeps its
+  for a breaking change. The type also **drives the released version** — `feat` → minor, `fix`/`perf`
+  → patch, `!` → major (folded to minor while the version is `0.x`); see `docs/versioning.md`. So a
+  wrong type is not just a lint failure, it mis-versions the next release.
+  PRs merge with a merge commit, so **every** commit on the branch keeps its
   subject in `main`'s history — CI checks them individually. Run
   `scripts/check-commit-messages.sh` before pushing.
