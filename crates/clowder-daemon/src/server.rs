@@ -699,21 +699,39 @@ impl Daemon {
             h.abort();
         }
         self.hookless.lock().remove(&pane);
-        if let Some(ws) = self.workspace_of(pane) {
-            let driver = driver_for_kind(ws.kind);
-            if land {
-                driver.land(&ws)?;
-            } else {
-                driver.discard(&ws)?;
+        // Rule: drop the row only when there is NO WAY BACK — i.e. when the worktree is gone.
+        // The pane is already dead by this point, so returning early on a driver error used to
+        // leave a permanently stuck row: Discard could not be retried (the directory was already
+        // removed) and Restart could not help (`resume_agent` needs the worktree to exist).
+        let driver_result = match self.workspace_of(pane) {
+            Some(ws) => {
+                let driver = driver_for_kind(ws.kind);
+                let r = if land { driver.land(&ws) } else { driver.discard(&ws) };
+                if r.is_err() && ws.path.exists() {
+                    // Recoverable: the worktree — and, for a failed land, its uncommitted work —
+                    // survives. Keep the record so the operation can be retried, and mark the
+                    // now-dead agent Exited so the UI offers Restart. This is load-bearing: the
+                    // exit watcher was aborted above, so nothing else will ever set this, and
+                    // `restart_worktree` refuses anything that is not Exited.
+                    self.set_attention(pane, AttentionState::Exited);
+                    return r;
+                }
+                r
             }
-        }
+            None => Ok(()),
+        };
+
         self.workspaces.lock().remove(&pane);
         self.panes.lock().remove(&pane);
         self.attention.lock().remove(&pane);
         self.agents.lock().remove(&pane);
         self.registry.remove(pane.0);
         let _ = self.removed_tx.send(pane);
-        Ok(())
+
+        // The teardown completed; surface any driver error so the client can show it. The client
+        // gets this as its direct reply AND `AgentRemoved` via the broadcast above, so the row
+        // disappears and the banner explains why.
+        driver_result
     }
 
     /// Kill the agent's process and remove its worktree without keeping the branch.
@@ -2856,6 +2874,65 @@ mod tests {
         assert_eq!(rec.kind, "git");
         assert_eq!(d.list_projects().len(), 1);
         assert!(d.is_registered_project(repo.path()), "uncanonical path must still match");
+    }
+
+    /// A long-lived synthetic agent, so teardown is what ends it rather than the process exiting.
+    fn sleeping_adapter() -> crate::SyntheticAdapter {
+        crate::SyntheticAdapter {
+            command: crate::PaneCommand {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), "sleep 30".into()],
+                cwd: None,
+                env: vec![],
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn discard_on_a_repo_with_no_commits_removes_the_row() {
+        // The reported bug, end to end: a project with no commits puts the worktree on an unborn
+        // branch, so `branch -D` found nothing and the whole discard failed — leaving a row that
+        // could be neither retried nor restarted.
+        let state = tempfile::tempdir().unwrap();
+        let repo = crate::test_support::init_empty_repo();
+        let d = test_daemon_in(state.path());
+        d.add_project(repo.path()).unwrap();
+        let pane = d.spawn_agent(repo.path(), &sleeping_adapter(), "feat").unwrap();
+
+        d.discard_agent(pane).unwrap();
+        assert!(d.list_worktrees().is_empty(), "the row must be gone");
+        assert!(d.registry.load().is_empty(), "the registry record must be gone");
+    }
+
+    #[tokio::test]
+    async fn failed_land_keeps_the_row_and_marks_it_exited() {
+        // Land fails BEFORE removing the worktree, so the work survives on disk. The row must
+        // survive with it — dropping it would strand a worktree holding uncommitted work that
+        // cannot be re-adopted (spawning the same name would collide).
+        let state = tempfile::tempdir().unwrap();
+        let repo = init_repo();
+        crate::test_support::install_failing_precommit_hook(repo.path());
+        let d = test_daemon_in(state.path());
+        d.add_project(repo.path()).unwrap();
+        let pane = d.spawn_agent(repo.path(), &sleeping_adapter(), "feat").unwrap();
+
+        let ws = d.workspace_of(pane).expect("workspace");
+        std::fs::write(ws.path.join("work.txt"), b"uncommitted work").unwrap();
+
+        let err = d.land_agent(pane).unwrap_err();
+        assert!(ws.path.exists(), "the worktree and its work must survive a failed land: {err}");
+        assert_eq!(d.list_worktrees().len(), 1, "the row must survive");
+        assert_eq!(d.registry.load().len(), 1, "the record must survive so land can be retried");
+        assert_eq!(
+            d.attention_of(pane),
+            Some(AttentionState::Exited),
+            "the dead agent must read Exited so the UI offers Restart — its watcher was aborted",
+        );
+
+        // And the row is genuinely recoverable, not merely present.
+        d.restart_worktree(pane).unwrap();
+        assert_eq!(d.attention_of(pane), Some(AttentionState::Working));
+        d.teardown_agent(pane).unwrap();
     }
 
     #[tokio::test]

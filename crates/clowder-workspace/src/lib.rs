@@ -83,12 +83,39 @@ impl WorkspaceDriver for GitWorktreeDriver {
     }
 
     fn discard(&self, ws: &Workspace) -> Result<()> {
-        let path_str = ws.path.to_string_lossy().to_string();
-        Self::git(&ws.project, &["worktree", "remove", "--force", &path_str])?;
+        // Discard means "throw this away", so an already-absent worktree or branch is the desired
+        // end state, not a failure. Each step is best-effort; the END STATE is what we assert, which
+        // is more robust than matching on git's stderr.
+        if ws.path.exists() {
+            let path_str = ws.path.to_string_lossy().to_string();
+            let _ = Self::git(&ws.project, &["worktree", "remove", "--force", &path_str]);
+        }
         let _ = Command::new("git").arg("-C").arg(&ws.project).args(["worktree", "prune"]).output();
-        Self::git(&ws.project, &["branch", "-D", &ws.branch])?;   // force-delete the unmerged branch
+
+        // A worktree provisioned in a repo with NO COMMITS sits on an UNBORN branch: `worktree add -b`
+        // succeeds (git infers `--orphan`) but no ref exists until the first commit, so there is
+        // nothing to delete. Deleting unconditionally is what made Discard fail on such repos.
+        if branch_exists(&ws.project, &ws.branch) {
+            let _ = Self::git(&ws.project, &["branch", "-D", &ws.branch]);   // unmerged: force
+        }
+
+        if ws.path.exists() {
+            bail!("could not remove worktree {}", ws.path.display());
+        }
         Ok(())
     }
+}
+
+/// Does `refs/heads/<branch>` exist? False for an **unborn** branch — which is what a worktree
+/// provisioned in a repo with no commits is checked out to.
+fn branch_exists(project: &Path, branch: &str) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(project)
+        .args(["show-ref", "--verify", "--quiet", &format!("refs/heads/{branch}")])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// A jujutsu workspace driver: each agent gets its own `jj workspace` (a working copy
@@ -145,10 +172,14 @@ impl WorkspaceDriver for JjDriver {
         let ws_name = format!("clowder-{name}");
         // Drop the working-copy change (best-effort — an empty `@` needn't block cleanup),
         // then detach + remove the workspace. No bookmark was created, so nothing persists.
+        // Every step is best-effort and the END STATE is asserted instead, mirroring the git
+        // driver: an already-forgotten workspace is the desired outcome, not an error.
         let _ = Self::jj(&ws.path, &["abandon", "-r", "@"]);
-        Self::jj(&ws.project, &["workspace", "forget", &ws_name])?;
-        // Best-effort removal: work was abandoned, so transient lock errors must not fail cleanup.
+        let _ = Self::jj(&ws.project, &["workspace", "forget", &ws_name]);
         let _ = std::fs::remove_dir_all(&ws.path);
+        if ws.path.exists() {
+            bail!("could not remove jj workspace {}", ws.path.display());
+        }
         Ok(())
     }
 }
@@ -303,6 +334,82 @@ mod tests {
         d.discard(&ws).unwrap();
         assert!(!ws.path.exists(), "worktree removed");
         assert!(!branch_exists(repo.path(), "clowder/task-b"), "branch deleted");
+    }
+
+    /// A repo with NO commits: `git init` and nothing else. `HEAD` is an unborn `main`.
+    fn init_empty_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        let run = |args: &[&str]| {
+            assert!(Command::new("git").arg("-C").arg(p).args(args).status().unwrap().success());
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@t.test"]);
+        run(&["config", "user.name", "t"]);
+        dir
+    }
+
+    #[test]
+    fn discard_succeeds_when_the_branch_is_unborn() {
+        // The reported bug: in a repo with no commits, `worktree add -b` succeeds (git infers
+        // `--orphan`) but the branch ref never exists, so `branch -D` used to fail the whole discard.
+        let repo = init_empty_repo();
+        let ws = GitWorktreeDriver.provision(repo.path(), "feat").unwrap();
+        assert!(ws.path.is_dir(), "provision must still create the worktree on an empty repo");
+        assert!(!branch_exists(repo.path(), &ws.branch), "the branch should be unborn");
+
+        GitWorktreeDriver.discard(&ws).unwrap();
+        assert!(!ws.path.exists(), "worktree removed");
+    }
+
+    #[test]
+    fn discard_is_idempotent() {
+        let repo = init_repo();
+        let ws = GitWorktreeDriver.provision(repo.path(), "task-i").unwrap();
+        GitWorktreeDriver.discard(&ws).unwrap();
+        // A second discard must not fail: the end state is already what discard wants.
+        GitWorktreeDriver.discard(&ws).unwrap();
+        assert!(!ws.path.exists());
+    }
+
+    #[test]
+    fn discard_after_land_is_ok_and_removes_the_branch() {
+        let repo = init_repo();
+        let ws = GitWorktreeDriver.provision(repo.path(), "task-al").unwrap();
+        std::fs::write(ws.path.join("work.txt"), b"x").unwrap();
+        GitWorktreeDriver.land(&ws).unwrap();            // removes the worktree, KEEPS the branch
+        assert!(branch_exists(repo.path(), &ws.branch));
+        GitWorktreeDriver.discard(&ws).unwrap();         // worktree already gone
+        assert!(!branch_exists(repo.path(), &ws.branch), "discard still deletes the branch");
+    }
+
+    #[test]
+    fn discard_reports_when_the_worktree_cannot_be_removed() {
+        // A path that exists but is not a registered worktree: `worktree remove` cannot remove it,
+        // so the end-state check must fail rather than silently reporting success.
+        let repo = init_repo();
+        let stray = repo.path().join("not-a-worktree");
+        std::fs::create_dir_all(&stray).unwrap();
+        let ws = Workspace {
+            path: stray.clone(),
+            branch: "clowder/nope".into(),
+            project: repo.path().to_path_buf(),
+            kind: WorkspaceKind::Git,
+        };
+        let e = GitWorktreeDriver.discard(&ws).unwrap_err().to_string();
+        assert!(e.contains("could not remove worktree"), "unhelpful message: {e}");
+        assert!(stray.exists(), "nothing was destroyed");
+    }
+
+    #[test]
+    fn branch_exists_is_false_for_an_unborn_branch() {
+        let repo = init_empty_repo();
+        assert!(!branch_exists(repo.path(), "main"), "an unborn HEAD has no ref");
+        let with_commits = init_repo();
+        let head = Command::new("git").arg("-C").arg(with_commits.path())
+            .args(["symbolic-ref", "--short", "HEAD"]).output().unwrap();
+        let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
+        assert!(branch_exists(with_commits.path(), &head), "a born branch is found");
     }
 
     #[test]
