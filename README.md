@@ -19,7 +19,8 @@ native SwiftUI macOS app renders every agent's live terminal via [libghostty](ht
 - **Orchestrate a fleet of CLI coding agents** — Claude Code, OpenAI Codex, or a plain shell — from
   one native app.
 - **Per-agent isolation** — each agent runs in its own **git worktree or jj workspace** (auto-detected
-  per project). Finish work with **Land** (commit + keep the branch/bookmark, hand off to you) or throw
+  per project), created **outside your repo** under `~/.local/share/clowder/worktrees` so the project
+  stays clean. Finish work with **Land** (commit + keep the branch/bookmark, hand off to you) or throw
   it away with **Discard** — both from the UI, with confirmation.
 - **Attention routing** — know which agent needs you: native tool hooks (Claude/Codex turn-complete)
   plus a VT-signal fallback (BEL, OSC 9, OSC 777) drive sidebar badges and a **menu-bar attention
@@ -30,9 +31,9 @@ native SwiftUI macOS app renders every agent's live terminal via [libghostty](ht
 - **Survivable** — the daemon owns the agent PTYs and keeps them running while the window is closed; the
   app **launches + supervises its own daemon** and **auto-reconnects** (bounded backoff) if the
   connection drops.
-- **Robust daemon** — a `~/.config/clowder/config.toml` config file, per-user sockets, a single-instance
-  guard, graceful shutdown that kills child PTYs, companion-crash reaping, and structured `tracing`
-  logs.
+- **Robust daemon** — a `~/.config/clowder/config.toml` config file (sockets, pane defaults, and
+  `[worktrees] base` to put worktrees wherever you like), per-user sockets, a single-instance guard,
+  graceful shutdown that kills child PTYs, companion-crash reaping, and structured `tracing` logs.
 
 ## Architecture
 

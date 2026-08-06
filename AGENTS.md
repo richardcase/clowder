@@ -16,12 +16,12 @@ socket drives the app's sidebar, spawning, and splits.
 | Crate / dir | Role | Binary |
 |---|---|---|
 | `crates/clowder-proto` | Wire protocol: `ClientToDaemon`/`DaemonToClient`, `HookEvent`, `PaneId`, `MsgStream` (postcard), and control types (`ControlRequest`/`ControlEvent`, `PaneTree`, splits) | lib |
-| `crates/clowder-config` | Fully-resolved `Config` (sockets, backlog cap, shell, pane size); loads `config.toml` then env overrides (**env › file › default**) | lib |
+| `crates/clowder-config` | Fully-resolved `Config` (sockets, backlog cap, shell, pane size, worktree base); loads `config.toml` then env overrides (**env › file › default**) | lib |
 | `crates/clowder-daemon` | Headless daemon: agent PTYs in panes, attention routing/notify, control-JSON + hook servers, split-tree, single-instance lock | **`clowder-daemon`** |
 | `crates/clowder-client` | Client library + interactive attach (raw-mode terminal); the `clowder` CLI | **`clowder`** |
 | `crates/clowder-hook` | Sends exactly one `HookEvent` to the daemon's hook socket (agent lifecycle shim) | **`clowder-hook`** |
 | `crates/clowder-vt` | Headless scanner for terminal attention signals (BEL, OSC 9, OSC 777) via `vte` — signal detection only, no cell grid | lib |
-| `crates/clowder-workspace` | Per-agent worktree provisioning: `WorkspaceDriver` (`GitWorktreeDriver` / jj), `WorkspaceKind {Git, Jj}`, provision/land/discard | lib |
+| `crates/clowder-workspace` | Per-agent worktree provisioning: `WorkspaceDriver` (`GitWorktreeDriver` / jj), `WorkspaceKind {Git, Jj}`, provision/land/discard; `WorktreeLayout` owns where worktrees go (outside the project) | lib |
 | `macos/` | SwiftPM package: `ClowderCore` (lib, libghostty-free, unit-tested) + `clowder-app` (exe, links vendored libghostty via `GhosttyKit`) | — |
 | `scripts/` | `build-app.sh`, `build-libghostty.sh`, `set-version.sh`, `gen-icon.swift` | — |
 | `docs/` | `superpowers/` (design specs + plans), `versioning.md`, `building-libghostty.md`, `code-signing.md` | — |
@@ -63,7 +63,13 @@ The daemon owns the agent PTYs and binds three Unix sockets under `<runtime_dir>
 - `clowder-hook.sock` (agent hooks) — `CLOWDER_HOOK_SOCK`
 
 Config file: `$XDG_CONFIG_HOME/clowder/config.toml` (else `~/.config/clowder/config.toml`); other keys:
-`CLOWDER_BACKLOG_CAP` (default 262144), `SHELL`, default 80×24. The app runs `clowder attach <pane>` in a
+`CLOWDER_BACKLOG_CAP` (default 262144), `SHELL`, default 80×24.
+
+**Worktrees live outside the project** (`[worktrees] base` / `CLOWDER_WORKTREE_BASE`), defaulting to
+`$XDG_DATA_HOME/clowder/worktrees` › `~/.local/share/clowder/worktrees`. The per-agent path is
+`<base>/<project-basename>-<hash12>/<name>`, so two repos with the same name never collide. Pre-#65
+worktrees at `<project>/.clowder/worktrees/<name>` are **not migrated** — they keep working, since
+the daemon resumes from the absolute path in `agents.json`. The app runs `clowder attach <pane>` in a
 libghostty surface. **Adapters:** `claude` (Claude Code), `codex` (OpenAI Codex), `shell` (plain shell,
 no hooks). The `clowder` CLI: `clowder spawn <project> <task> [adapter]` and `clowder attach <pane-id>`.
 An optional remote TCP listener (`[remote] listen`/`host`) can be hardened with `[remote] tls`/`token`

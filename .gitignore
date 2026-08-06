@@ -1,4 +1,6 @@
 /target
+# Pre-#65 in-repo worktrees. New ones go to $XDG_DATA_HOME/clowder/worktrees, but existing
+# ones are deliberately not migrated, so this stays.
 /.clowder/
 /dist/
 /.cache/
