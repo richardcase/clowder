@@ -53,8 +53,9 @@ impl WorktreeLayout {
     /// insist on creating the destination themselves.
     pub fn prepare(&self, project: &Path, name: &str) -> Result<PathBuf> {
         let path = self.worktree_path(project, name);
-        std::fs::create_dir_all(self.project_dir(project))
-            .with_context(|| format!("create worktree parent dir {}", self.base.display()))?;
+        let parent = self.project_dir(project);
+        std::fs::create_dir_all(&parent)
+            .with_context(|| format!("create worktree parent dir {}", parent.display()))?;
         self.mark_ignored();
         Ok(path)
     }

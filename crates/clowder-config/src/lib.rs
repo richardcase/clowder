@@ -104,8 +104,9 @@ impl Config {
 /// `DATA` rather than `STATE`/`CACHE` because worktrees hold *uncommitted user work*.
 ///
 /// The `/tmp` last resort is a data-loss footgun — macOS periodically purges `/tmp`, which would
-/// take unlanded agent work with it. It is kept only for consistency with `remote_state_dir()`, and
-/// is unreachable whenever `HOME` is set.
+/// take unlanded agent work with it. It is kept only for consistency with `remote_state_dir()`. It
+/// is reached only when BOTH `XDG_DATA_HOME` and `HOME` are unset *or empty* — an empty value is
+/// treated as unset throughout, so `HOME=""` still lands here.
 ///
 /// Pure: the environment arrives via `get_env`, so `resolve` and its tests drive this same code
 /// path. `default_worktree_base()` is the wrapper for callers holding no `Config`.
@@ -200,6 +201,24 @@ mod tests {
         assert_eq!(
             Config::resolve(FileConfig::default(), &no_env).worktree_base,
             PathBuf::from("/tmp/clowder/worktrees")
+        );
+
+        // An EMPTY value is treated as unset at every step, so this still reaches /tmp.
+        let empty = |k: &str| matches!(k, "XDG_DATA_HOME" | "HOME").then(String::new);
+        assert_eq!(
+            Config::resolve(FileConfig::default(), &empty).worktree_base,
+            PathBuf::from("/tmp/clowder/worktrees")
+        );
+
+        // An empty XDG_DATA_HOME falls through to HOME rather than to /tmp.
+        let empty_xdg = |k: &str| match k {
+            "XDG_DATA_HOME" => Some(String::new()),
+            "HOME" => Some("/home/rc".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            Config::resolve(FileConfig::default(), &empty_xdg).worktree_base,
+            PathBuf::from("/home/rc/.local/share/clowder/worktrees")
         );
     }
 
