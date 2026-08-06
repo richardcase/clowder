@@ -8,26 +8,18 @@
 #        scripts/check-commit-messages.sh --check-subject "<subject>" (validate one literal subject)
 set -euo pipefail
 
-# Scope is free-form on purpose: milestone scopes (`m10c`) and comma-joined scopes (`proto,daemon`)
-# are both already in use. A trailing `!` marks a breaking change.
-TYPES='feat|fix|docs|test|refactor|perf|ci|chore|build|style|revert'
-PATTERN="^(${TYPES})(\([^)]+\))?!?: .+"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# The grammar lives in one place so this linter and scripts/next-version.sh cannot disagree about
+# what a valid subject is — the bumper needs capture groups this script does not.
+# shellcheck source=lib/conventional.sh
+. "$ROOT/scripts/lib/conventional.sh"
+TYPES="$CC_TYPES"   # used by `explain` below
 
 usage() {
   cat <<'EOF'
 Usage: scripts/check-commit-messages.sh [<base-ref> [<head-ref>]]   (default: origin/main HEAD)
        scripts/check-commit-messages.sh --check-subject "<subject>" (validate one literal subject)
 EOF
-}
-
-# Returns 0 if the subject conforms. Reverts produced by GitHub's revert button (`Revert "…"`) are
-# exempt — that subject is not ours to shape. `fixup!`/`squash!` are deliberately NOT exempt: an
-# unsquashed fixup would land in main forever.
-subject_ok() {
-  case "$1" in
-    'Revert "'*) return 0 ;;
-  esac
-  printf '%s\n' "$1" | grep -Eq "$PATTERN"
 }
 
 explain() {
@@ -61,7 +53,7 @@ case "${1:-}" in
       echo "error: --check-subject takes exactly one argument" >&2
       exit 2
     fi
-    if subject_ok "$2"; then exit 0; else exit 1; fi
+    if cc_subject_ok "$2"; then exit 0; else exit 1; fi
     ;;
 esac
 
@@ -70,7 +62,6 @@ if [ "$#" -gt 2 ]; then
   exit 2
 fi
 
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 BASE="${1:-origin/main}"
@@ -97,7 +88,7 @@ while IFS= read -r sha; do
   [ -n "$sha" ] || continue
   total=$((total + 1))
   subject="$(git log -1 --format=%s "$sha")"
-  if ! subject_ok "$subject"; then
+  if ! cc_subject_ok "$subject"; then
     bad="${bad}    $(git rev-parse --short "$sha") ${subject}"$'\n'
     bad_count=$((bad_count + 1))
   fi
