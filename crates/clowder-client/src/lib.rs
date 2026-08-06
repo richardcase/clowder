@@ -383,6 +383,7 @@ mod tests {
             std::path::PathBuf::from("/tmp/unused-cli.sock"),
             state.path().join("agents.json"),
             state.path().join("projects.json"),
+            state.path().join("worktrees"),
         ));
         daemon.add_project(repo.path()).unwrap();
         let listener = tokio::net::UnixListener::bind(&sock).unwrap();

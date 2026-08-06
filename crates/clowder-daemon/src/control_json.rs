@@ -197,6 +197,7 @@ mod tests {
             std::path::PathBuf::from("/tmp/unused-cjson.sock"),
             state.path().join("agents.json"),
             state.path().join("projects.json"),
+            state.path().join("worktrees"),
         ));
         daemon.add_project(repo.path()).unwrap();
 
@@ -279,6 +280,7 @@ mod tests {
             std::path::PathBuf::from("/tmp/unused-cjson3.sock"),
             state.path().join("agents.json"),
             state.path().join("projects.json"),
+            state.path().join("worktrees"),
         ));
         daemon.add_project(repo.path()).unwrap();
 
@@ -353,6 +355,7 @@ mod tests {
             std::path::PathBuf::from("/tmp/unused-cjson5.sock"),
             state.path().join("agents.json"),
             state.path().join("projects.json"),
+            state.path().join("worktrees"),
         ));
         daemon.add_project(repo.path()).unwrap();
 
@@ -459,6 +462,7 @@ mod tests {
             std::path::PathBuf::from("/tmp/unused-projects.sock"),
             state.path().join("agents.json"),
             state.path().join("projects.json"),
+            state.path().join("worktrees"),
         ));
 
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
@@ -511,6 +515,7 @@ mod tests {
             std::path::PathBuf::from("/tmp/unused-projects2.sock"),
             state.path().join("agents.json"),
             state.path().join("projects.json"),
+            state.path().join("worktrees"),
         ));
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let d = daemon.clone();
