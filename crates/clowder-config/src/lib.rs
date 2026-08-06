@@ -19,6 +19,8 @@ pub struct Config {
     pub remote_host: Option<String>,
     pub remote_tls: bool,
     pub remote_token: Option<String>,
+    /// Directory that agent worktrees are provisioned under. See `default_worktree_base_from`.
+    pub worktree_base: PathBuf,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -26,6 +28,7 @@ struct FileConfig {
     sockets: Option<Sockets>,
     pane: Option<PaneCfg>,
     remote: Option<Remote>,
+    worktrees: Option<Worktrees>,
 }
 #[derive(Debug, Default, Deserialize)]
 struct Sockets { client: Option<PathBuf>, control: Option<PathBuf>, hook: Option<PathBuf> }
@@ -33,6 +36,8 @@ struct Sockets { client: Option<PathBuf>, control: Option<PathBuf>, hook: Option
 struct PaneCfg { backlog_cap: Option<usize>, shell: Option<String>, cols: Option<u16>, rows: Option<u16> }
 #[derive(Debug, Default, Deserialize)]
 struct Remote { listen: Option<String>, host: Option<String>, tls: Option<bool>, token: Option<String> }
+#[derive(Debug, Default, Deserialize)]
+struct Worktrees { base: Option<PathBuf> }
 
 impl Config {
     /// Load `$XDG_CONFIG_HOME/clowder/config.toml` (else `$HOME/.config/clowder/config.toml`), then apply
@@ -47,6 +52,7 @@ impl Config {
         let s = f.sockets.unwrap_or_default();
         let p = f.pane.unwrap_or_default();
         let r = f.remote.unwrap_or_default();
+        let w = f.worktrees.unwrap_or_default();
 
         // Per-user runtime dir for sockets: $XDG_RUNTIME_DIR › $TMPDIR › /tmp (mirrors the daemon's
         // single-instance PID lock dir). Env socket vars still override below.
@@ -82,8 +88,39 @@ impl Config {
             remote_host: nonempty("CLOWDER_REMOTE_HOST").or(r.host.filter(|s| !s.is_empty())),
             remote_tls: env_bool("CLOWDER_REMOTE_TLS").unwrap_or(r.tls.unwrap_or(false)),
             remote_token: nonempty("CLOWDER_REMOTE_TOKEN").or(r.token.filter(|s| !s.is_empty())),
+            // Empty means "unset" from EITHER source — unlike the socket keys above. An empty base
+            // would be a relative path, silently provisioning worktrees into the daemon's cwd.
+            worktree_base: nonempty("CLOWDER_WORKTREE_BASE")
+                .map(PathBuf::from)
+                .or(w.base.filter(|p| !p.as_os_str().is_empty()))
+                .unwrap_or_else(|| default_worktree_base_from(get_env)),
         }
     }
+}
+
+/// Where agent worktrees are provisioned: `$XDG_DATA_HOME/clowder/worktrees` ›
+/// `$HOME/.local/share/clowder/worktrees` › `/tmp/clowder/worktrees`.
+///
+/// `DATA` rather than `STATE`/`CACHE` because worktrees hold *uncommitted user work*.
+///
+/// The `/tmp` last resort is a data-loss footgun — macOS periodically purges `/tmp`, which would
+/// take unlanded agent work with it. It is kept only for consistency with `remote_state_dir()`, and
+/// is unreachable whenever `HOME` is set.
+///
+/// Pure: the environment arrives via `get_env`, so `resolve` and its tests drive this same code
+/// path. `default_worktree_base()` is the wrapper for callers holding no `Config`.
+fn default_worktree_base_from(get_env: &dyn Fn(&str) -> Option<String>) -> PathBuf {
+    let base = get_env("XDG_DATA_HOME")
+        .filter(|s| !s.is_empty())
+        .or_else(|| get_env("HOME").filter(|s| !s.is_empty()).map(|h| format!("{h}/.local/share")))
+        .unwrap_or_else(|| "/tmp".to_string());
+    PathBuf::from(base).join("clowder").join("worktrees")
+}
+
+/// The default worktree base against the real environment, for callers with no `Config`
+/// (e.g. `Daemon::new_with`). Same family as `remote_state_dir()`.
+pub fn default_worktree_base() -> PathBuf {
+    default_worktree_base_from(&|k| std::env::var(k).ok())
 }
 
 impl Default for Config {
@@ -131,6 +168,72 @@ mod tests {
         assert_eq!(c.backlog_cap, 262144);
         assert_eq!(c.shell, "/bin/sh");
         assert_eq!((c.default_cols, c.default_rows), (80, 24));
+        // No XDG_DATA_HOME/HOME in `no_env` → the /tmp last resort.
+        assert_eq!(c.worktree_base, PathBuf::from("/tmp/clowder/worktrees"));
+    }
+
+    #[test]
+    fn worktree_base_honors_xdg_data_home_then_home_then_tmp() {
+        let xdg = |k: &str| (k == "XDG_DATA_HOME").then(|| "/xdg/data".to_string());
+        assert_eq!(
+            Config::resolve(FileConfig::default(), &xdg).worktree_base,
+            PathBuf::from("/xdg/data/clowder/worktrees")
+        );
+
+        // XDG_DATA_HOME wins over HOME when both are set.
+        let both = |k: &str| match k {
+            "XDG_DATA_HOME" => Some("/xdg/data".to_string()),
+            "HOME" => Some("/home/rc".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            Config::resolve(FileConfig::default(), &both).worktree_base,
+            PathBuf::from("/xdg/data/clowder/worktrees")
+        );
+
+        let home = |k: &str| (k == "HOME").then(|| "/home/rc".to_string());
+        assert_eq!(
+            Config::resolve(FileConfig::default(), &home).worktree_base,
+            PathBuf::from("/home/rc/.local/share/clowder/worktrees")
+        );
+
+        assert_eq!(
+            Config::resolve(FileConfig::default(), &no_env).worktree_base,
+            PathBuf::from("/tmp/clowder/worktrees")
+        );
+    }
+
+    #[test]
+    fn worktree_base_env_over_file_then_default() {
+        let f: FileConfig = toml::from_str("[worktrees]\nbase = \"/file/wt\"\n").unwrap();
+        let env = |k: &str| (k == "CLOWDER_WORKTREE_BASE").then(|| "/env/wt".to_string());
+        assert_eq!(Config::resolve(f, &env).worktree_base, PathBuf::from("/env/wt"));
+
+        // file only — and it wins over the XDG default
+        let f2: FileConfig = toml::from_str("[worktrees]\nbase = \"/file/wt\"\n").unwrap();
+        let home = |k: &str| (k == "HOME").then(|| "/home/rc".to_string());
+        assert_eq!(Config::resolve(f2, &home).worktree_base, PathBuf::from("/file/wt"));
+    }
+
+    #[test]
+    fn empty_worktree_base_is_treated_as_unset() {
+        // An empty base is a RELATIVE path; taking it would provision into the daemon's cwd.
+        let env = |k: &str| match k {
+            "CLOWDER_WORKTREE_BASE" => Some(String::new()),
+            "HOME" => Some("/home/rc".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            Config::resolve(FileConfig::default(), &env).worktree_base,
+            PathBuf::from("/home/rc/.local/share/clowder/worktrees")
+        );
+
+        let f: FileConfig = toml::from_str("[worktrees]\nbase = \"\"\n").unwrap();
+        let home = |k: &str| (k == "HOME").then(|| "/home/rc".to_string());
+        assert_eq!(
+            Config::resolve(f, &home).worktree_base,
+            PathBuf::from("/home/rc/.local/share/clowder/worktrees")
+        );
     }
 
     #[test]
