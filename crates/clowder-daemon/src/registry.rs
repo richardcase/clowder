@@ -1,9 +1,6 @@
-use anyhow::Result;
 use clowder_proto::PaneTree;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentRecord {
@@ -22,19 +19,14 @@ pub struct AgentRecord {
     pub tree: Option<PaneTree>,
 }
 
-/// Durable, restart-surviving list of live agents. All state is in one JSON file written atomically.
+/// Durable, restart-surviving list of live agents, stored as one atomically-written JSON file.
 pub struct Registry {
-    path: PathBuf,
-    /// Serializes the load-modify-write in `upsert`/`remove`. The daemon is the sole writer, but its
-    /// control handlers run as concurrent Tokio tasks (app, CLI, remote client), so two unsynchronized
-    /// `load()`-append-`write()` cycles would race and drop one update. One `Arc<Registry>` is shared,
-    /// so this in-process mutex is the whole story (a single-instance flock guarantees one daemon).
-    write_lock: Mutex<()>,
+    store: crate::store::JsonStore<AgentRecord>,
 }
 
 impl Registry {
     pub fn new(path: PathBuf) -> Self {
-        Self { path, write_lock: Mutex::new(()) }
+        Self { store: crate::store::JsonStore::new(path) }
     }
 
     /// `$CLOWDER_STATE_FILE` › `$XDG_STATE_HOME/clowder/agents.json` › `$HOME/.local/state/clowder/agents.json`.
@@ -49,60 +41,31 @@ impl Registry {
     }
 
     pub fn load(&self) -> Vec<AgentRecord> {
-        match std::fs::read(&self.path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
-                tracing::warn!("agent registry {} is unreadable ({e}); starting empty", self.path.display());
-                Vec::new()
-            }),
-            Err(_) => Vec::new(), // missing = empty
-        }
+        self.store.load()
     }
 
     pub fn upsert(&self, rec: AgentRecord) {
-        // Hold the lock across the whole load-modify-write; recover a poisoned lock rather than
-        // wedging the daemon (load/write never panic, so poisoning is not expected).
-        let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let mut all = self.load();
-        all.retain(|r| r.agent_id != rec.agent_id);
-        all.push(rec);
-        self.write(&all);
+        self.store.mutate(|all| {
+            all.retain(|r| r.agent_id != rec.agent_id);
+            all.push(rec);
+        });
     }
 
     pub fn remove(&self, agent_id: u64) {
-        let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let mut all = self.load();
-        all.retain(|r| r.agent_id != agent_id);
-        self.write(&all);
+        self.store.mutate(|all| all.retain(|r| r.agent_id != agent_id));
     }
 
-    /// Update just one agent's persisted split tree (no-op if the agent isn't in the registry —
-    /// e.g. it was landed between a tree change and this call). Atomic, under `write_lock`.
+    /// Update just one agent's persisted split tree. If `agent_id` isn't in the registry — e.g.
+    /// it was landed between a tree change and this call — this is a true no-op: no write, no
+    /// mtime bump, no disk I/O.
     pub fn set_tree(&self, agent_id: u64, tree: Option<PaneTree>) {
-        let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let mut all = self.load();
-        if let Some(rec) = all.iter_mut().find(|r| r.agent_id == agent_id) {
-            rec.tree = tree;
-            self.write(&all);
-        }
-    }
-
-    fn write(&self, all: &[AgentRecord]) {
-        if let Err(e) = self.try_write(all) {
-            tracing::warn!("failed to persist agent registry {}: {e}", self.path.display());
-        }
-    }
-
-    fn try_write(&self, all: &[AgentRecord]) -> Result<()> {
-        if let Some(dir) = self.path.parent() { std::fs::create_dir_all(dir)?; }
-        // Unique temp name (pid + counter) so a write never clobbers another writer's temp file
-        // before its rename — belt-and-suspenders alongside `write_lock`.
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let tmp = self.path.with_extension(format!(
-            "json.{}.{}.tmp", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::write(&tmp, serde_json::to_vec_pretty(all)?)?;
-        std::fs::rename(&tmp, &self.path)?;   // atomic replace
-        Ok(())
+        self.store.mutate_if(|all| match all.iter_mut().find(|r| r.agent_id == agent_id) {
+            Some(rec) => {
+                rec.tree = tree;
+                true
+            }
+            None => false,
+        });
     }
 }
 

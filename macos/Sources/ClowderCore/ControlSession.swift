@@ -21,7 +21,7 @@ public extension ControlTransport {
 }
 
 /// Drives the control channel: inbound lines → decode → AgentStore; auto-refreshes
-/// (sends `listAgents`) whenever the store can't fully hydrate from a streamed event.
+/// (sends `listWorktrees`) whenever the store can't fully hydrate from a streamed event.
 public final class ControlSession {
     private let transport: ControlTransport
     public let store: AgentStore
@@ -40,7 +40,7 @@ public final class ControlSession {
         store.apply(event)
         if store.needsRefresh {
             store.clearRefresh()
-            try? send(.listAgents)
+            try? send(.listWorktrees)
         }
     }
 

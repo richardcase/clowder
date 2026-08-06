@@ -34,20 +34,20 @@ func fuzzyRank(_ query: String, _ text: String) -> Int? {
     return qi == q.count ? (firstMatch ?? 0) : nil
 }
 
-/// Fuzzy-filter commands (matched on title) and agents (matched on "project task") into one
-/// ranked list — commands section first, then agents. Ties keep input order.
-public func paletteResults(query: String, commands: [Command], agents: [AgentInfo]) -> [PaletteItem] {
+/// Fuzzy-filter commands (matched on title) and worktrees (matched on "project name") into one
+/// ranked list — commands section first, then worktrees. Ties keep input order.
+public func paletteResults(query: String, commands: [Command], worktrees: [WorktreeInfo]) -> [PaletteItem] {
     let trimmed = query.trimmingCharacters(in: .whitespaces)
 
     let cmdItems = commands.enumerated().compactMap { (i, c) -> (Int, Int, PaletteItem)? in
         guard let r = fuzzyRank(trimmed, c.title) else { return nil }
         return (r, i, PaletteItem(id: .command(c.id), title: c.title, subtitle: c.subtitle, kind: .command(c.id)))
     }
-    let agentItems = agents.enumerated().compactMap { (i, a) -> (Int, Int, PaletteItem)? in
-        guard let r = fuzzyRank(trimmed, "\(a.project) \(a.task)") else { return nil }
+    let agentItems = worktrees.enumerated().compactMap { (i, a) -> (Int, Int, PaletteItem)? in
+        guard let r = fuzzyRank(trimmed, "\(a.project) \(a.name)") else { return nil }
         let proj = (a.project as NSString).lastPathComponent
         let sub = proj.isEmpty ? a.project : proj
-        return (r, i, PaletteItem(id: .agent(pane: a.pane), title: a.task, subtitle: sub, kind: .agent(pane: a.pane)))
+        return (r, i, PaletteItem(id: .agent(pane: a.pane), title: a.name, subtitle: sub, kind: .agent(pane: a.pane)))
     }
 
     let sortedCmds = cmdItems.sorted { ($0.0, $0.1) < ($1.0, $1.1) }.map(\.2)

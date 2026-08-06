@@ -7,8 +7,8 @@ final class LifecycleTests: XCTestCase {
         let fake = FakeControlTransport()
         let model = AppModel(makeTransport: { fake })
         model.connect()
-        fake.deliver(#"{"type":"agentList","agents":[{"pane":1,"project":"/p","task":"fix-bug","state":"Completed"}]}"#)
-        model.selectedPane = 1
+        fake.deliver(#"{"type":"worktreeList","worktrees":[{"pane":1,"project":"/p","name":"fix-bug","branch":"clowder/fix-bug","state":"Completed"}]}"#)
+        model.selection = .worktree(1)
         return (model, fake)
     }
 
@@ -24,7 +24,7 @@ final class LifecycleTests: XCTestCase {
     func testRunLandSetsPendingConfirmationAndDoesNotSend() {
         let (model, fake) = modelWithAgent()
         model.run(.landAgent)
-        XCTAssertEqual(model.pendingLifecycle, PendingLifecycle(action: .land, pane: 1, task: "fix-bug"))
+        XCTAssertEqual(model.pendingLifecycle, PendingLifecycle(action: .land, pane: 1, name: "fix-bug"))
         XCTAssertFalse(fake.sentLines.contains { $0.contains("\"type\":\"landAgent\"") }, "must not send before confirm")
     }
 
@@ -69,7 +69,7 @@ final class LifecycleTests: XCTestCase {
     func testConfirmUsesCapturedPaneNotCurrentSelection() {
         let (model, fake) = modelWithAgent()   // agent at pane 1, selectedPane == 1
         model.run(.landAgent)                  // captures pane 1 into pendingLifecycle
-        model.selectedPane = 2                 // selection moves after the request
+        model.selection = .worktree(2)         // selection moves after the request
         model.confirmLifecycle()
         // must send to the CAPTURED pane (1), not the current selection (2)
         XCTAssertTrue(fake.sentLines.contains { $0.contains("\"type\":\"landAgent\"") && $0.contains("\"pane\":1") })

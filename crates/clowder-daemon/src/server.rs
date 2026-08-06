@@ -1,7 +1,7 @@
 use crate::agent::AgentAdapter;
 use crate::notify::{Notifier, OsNotifier};
 use crate::{Pane, PaneCommand};
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use clowder_proto::AttentionState;
 use clowder_proto::{ClientToDaemon, DaemonToClient, MsgStream, PaneId};
 use clowder_proto::{PaneTree, SplitDirection, SplitId};
@@ -17,8 +17,10 @@ use tokio::net::UnixListener;
 use tokio::sync::broadcast;
 
 struct AgentMeta {
+    /// Full path to the project root.
     project: String,
-    task: String,
+    name: String,
+    branch: String,
 }
 
 /// How often the coalesced layout flusher persists agents whose divider ratios changed.
@@ -27,6 +29,25 @@ const LAYOUT_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_mil
 /// The command for a companion pane: the login shell, rooted in the worktree, with no hook env.
 pub(crate) fn companion_command(shell: String, cwd: std::path::PathBuf) -> PaneCommand {
     PaneCommand { program: shell, args: vec![], cwd: Some(cwd), env: vec![] }
+}
+
+/// Wire form of a project record: display name derived from the path's last component.
+pub(crate) fn project_info(rec: crate::projects::ProjectRecord) -> clowder_proto::ProjectInfo {
+    let name = rec.path.file_name().map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| rec.path.to_string_lossy().to_string());
+    clowder_proto::ProjectInfo {
+        path: rec.path.to_string_lossy().to_string(),
+        name,
+        kind: rec.kind,
+    }
+}
+
+/// A change to the project list, broadcast to every connected client.
+#[derive(Clone, Debug)]
+pub enum ProjectChange {
+    Added(crate::projects::ProjectRecord),
+    Removed(PathBuf),
+    TerminalClosed(PathBuf),
 }
 
 pub struct Daemon {
@@ -52,10 +73,26 @@ pub struct Daemon {
     pub(crate) default_rows: u16,
     pub(crate) shell: String,
     registry: Arc<crate::registry::Registry>,
+    projects: Arc<crate::projects::ProjectStore>,
+    projects_tx: broadcast::Sender<ProjectChange>,
+    /// Project root -> its lazily-spawned terminal pane. Not persisted.
+    project_terms: Arc<Mutex<HashMap<PathBuf, PaneId>>>,
+    /// Terminal pane -> its project root. The inverse of `project_terms`.
+    term_project: Arc<Mutex<HashMap<PaneId, PathBuf>>>,
     /// Agents whose ratios changed since the last flush; drained by the periodic layout flusher.
     layout_dirty: Arc<Mutex<std::collections::HashSet<PaneId>>>,
     /// Idle debounce before content-based attention inspects the screen for a blocking prompt.
     pub(crate) content_idle: std::time::Duration,
+    /// Serializes project-list mutations against agent spawns. `spawn_agent` validates the project
+    /// then provisions for hundreds of milliseconds before it appears in `agents`; without this,
+    /// a concurrent `remove_project` counts zero worktrees and removes a project out from under a
+    /// live agent. Held across the WHOLE of each operation, not just the check.
+    ///
+    /// Lock ordering: this is the OUTERMOST lock of the pair. `remove_project` takes
+    /// `project_terms` (and, via `forget_project_terminal`, other per-pane maps) while already
+    /// holding this one — so nothing reachable from inside a `project_mutation`-guarded section
+    /// may re-acquire `project_mutation` itself.
+    project_mutation: Mutex<()>,
 }
 
 impl Daemon {
@@ -64,9 +101,26 @@ impl Daemon {
     }
 
     pub fn new_with(notifier: Arc<dyn Notifier>, hook_sock: PathBuf) -> Daemon {
+        Daemon::new_with_paths(
+            notifier,
+            hook_sock,
+            crate::registry::Registry::default_path(),
+            crate::projects::ProjectStore::default_path(),
+        )
+    }
+
+    /// Like `new_with`, but with both state files given explicitly. Tests use this to point at a
+    /// temp dir without setting process-global env vars (which would force them to serialize).
+    pub fn new_with_paths(
+        notifier: Arc<dyn Notifier>,
+        hook_sock: PathBuf,
+        registry_path: PathBuf,
+        projects_path: PathBuf,
+    ) -> Daemon {
         let (attention_tx, _) = broadcast::channel(256);
         let (removed_tx, _) = broadcast::channel(256);
         let (split_tx, _) = broadcast::channel(256);
+        let (projects_tx, _) = broadcast::channel(256);
         Daemon {
             panes: Arc::new(Mutex::new(HashMap::new())),
             next_id: AtomicU64::new(1),
@@ -89,9 +143,14 @@ impl Daemon {
             default_cols: 80,
             default_rows: 24,
             shell: std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()),
-            registry: Arc::new(crate::registry::Registry::new(crate::registry::Registry::default_path())),
+            registry: Arc::new(crate::registry::Registry::new(registry_path)),
+            projects: Arc::new(crate::projects::ProjectStore::new(projects_path)),
+            projects_tx,
+            project_terms: Arc::new(Mutex::new(HashMap::new())),
+            term_project: Arc::new(Mutex::new(HashMap::new())),
             layout_dirty: Arc::new(Mutex::new(std::collections::HashSet::new())),
             content_idle: std::time::Duration::from_millis(500),
+            project_mutation: Mutex::new(()),
         }
     }
 
@@ -104,6 +163,179 @@ impl Daemon {
         d.default_rows = config.default_rows;
         d.shell = config.shell;
         d
+    }
+
+    pub fn subscribe_projects(&self) -> broadcast::Receiver<ProjectChange> {
+        self.projects_tx.subscribe()
+    }
+
+    pub fn list_projects(&self) -> Vec<clowder_proto::ProjectInfo> {
+        let mut recs = self.projects.list();
+        recs.sort_by(|a, b| a.path.cmp(&b.path));
+        recs.into_iter().map(project_info).collect()
+    }
+
+    /// Is `path` (canonicalized here) a registered project?
+    pub fn is_registered_project(&self, path: &Path) -> bool {
+        match path.canonicalize() {
+            Ok(c) => self.projects.contains(&c),
+            Err(_) => false,
+        }
+    }
+
+    pub fn add_project(&self, path: &Path) -> Result<crate::projects::ProjectRecord> {
+        let rec = self.projects.add(path)?;
+        let _ = self.projects_tx.send(ProjectChange::Added(rec.clone()));
+        Ok(rec)
+    }
+
+    /// Remove a project. Refused while any worktree still belongs to it — there must be no path
+    /// by which removing a sidebar row abandons live work.
+    pub fn remove_project(&self, path: &Path) -> Result<()> {
+        let _mutation = self.project_mutation.lock();
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        // Canonicalize BOTH sides. Task 5 makes spawn_agent store a canonical path, but this
+        // must be correct before that lands too — otherwise on macOS an uncanonical
+        // AgentMeta.project (/var/...) never matches a canonical project (/private/var/...),
+        // the count comes back 0, and the guard silently lets the removal through.
+        let n = self
+            .agents
+            .lock()
+            .values()
+            .filter(|m| {
+                let p = Path::new(&m.project);
+                p.canonicalize().unwrap_or_else(|_| p.to_path_buf()) == canonical
+            })
+            .count();
+        if n > 0 {
+            bail!("project {} still has {n} worktree(s) — land or discard them first", canonical.display());
+        }
+        // Kill this project's terminal (and its companions, via forget_project_terminal's
+        // cascade) before dropping the record — a removed project must not leave an orphaned
+        // shell behind. Bind the lookup out of the `if let` scrutinee: in edition 2021, a
+        // MutexGuard temporary created there lives for the whole `if let` body, and the body
+        // below re-locks `project_terms` (via `forget_project_terminal`) — left inline, that
+        // self-deadlocks.
+        let term = self.project_terms.lock().get(&canonical).copied();
+        if let Some(term) = term {
+            if let Some(p) = self.get(term) { let _ = p.kill(); }
+            self.forget_project_terminal(term);
+        }
+        self.projects.remove(&canonical)?;
+        let _ = self.projects_tx.send(ProjectChange::Removed(canonical));
+        Ok(())
+    }
+
+    /// The shell pane rooted at a project. Lazy and idempotent: a second caller attaches to the
+    /// same shell. Not persisted — a daemon restart drops it and the next select respawns.
+    pub fn open_project_terminal(self: &Arc<Self>, path: &Path) -> Result<PaneId> {
+        // Serializes against `remove_project`: without this, a project can be observed as
+        // registered here, then removed (no `project_terms` entry yet, no agents) before the
+        // spawn below publishes into `project_terms` — leaving a live shell rooted in an
+        // unregistered, unreachable project. `forget_project_terminal` (called by the spawned
+        // exit watcher below) never takes `project_mutation`, so this introduces no new lock
+        // ordering.
+        let _mutation = self.project_mutation.lock();
+        let root = path.canonicalize()
+            .with_context(|| format!("no such project path: {}", path.display()))?;
+        if !self.projects.contains(&root) {
+            bail!("unknown project: {} — add it first", root.display());
+        }
+        // Bind out of the `if let` scrutinee (same reasoning as remove_project): the MutexGuard
+        // temporary otherwise lives for the whole body, which doesn't deadlock today (`self.get`
+        // locks `panes`, a different mutex) but is one refactor away from doing so.
+        let existing = self.project_terms.lock().get(&root).copied();
+        if let Some(existing) = existing {
+            if self.get(existing).is_some() {
+                return Ok(existing);
+            }
+        }
+        let id = self.spawn_pane(
+            companion_command(self.shell.clone(), root.clone()),
+            self.default_cols,
+            self.default_rows,
+        )?;
+        // Two callers can both observe `existing == None` above and both reach this spawn — the
+        // `project_terms` guard was released before the (long) fork, so it does not serialize
+        // spawns. Re-check now, under the guard, before publishing: if another racer already won
+        // while we were spawning, kill our pane and hand back the winner instead of leaving ours
+        // live-but-unreachable via `project_terms` (see the concurrent-open finding). `self.get`
+        // and `self.panes.lock()` stay OUT from under the `project_terms` guard — dropped before
+        // either — so this can't introduce a `project_terms -> panes` lock-ordering inversion.
+        let mut pt = self.project_terms.lock();
+        if let Some(&winner) = pt.get(&root) {
+            drop(pt);
+            if let Some(p) = self.get(id) { let _ = p.kill(); }
+            self.panes.lock().remove(&id);
+            return Ok(winner);
+        }
+        pt.insert(root.clone(), id);
+        drop(pt);
+        self.term_project.lock().insert(id, root.clone());
+        // Seed exactly what finalize_agent seeds for an agent root, so the split/close/ratio
+        // machinery — which is keyed on a root pane — applies unchanged. Only the winner reaches
+        // here: seeding a loser's tree/owner would let the split machinery believe two panes are
+        // simultaneously the project's terminal.
+        self.trees.lock().insert(id, PaneTree::Leaf { pane: id });
+        self.owner.lock().insert(id, id);
+
+        // When the shell exits, forget it so the next select respawns.
+        if let Some(pane_arc) = self.get(id) {
+            let me = Arc::clone(self);
+            let handle = tokio::spawn(async move {
+                pane_arc.wait_exit().await;
+                me.forget_project_terminal(id);
+            });
+            self.watchers.lock().insert(id, handle);
+        }
+        Ok(id)
+    }
+
+    pub fn project_of_terminal(&self, pane: PaneId) -> Option<PathBuf> {
+        self.term_project.lock().get(&pane).cloned()
+    }
+
+    /// Drop all state for a project terminal whose pane is gone, and tell clients. Idempotent —
+    /// a no-op if `pane` is not (or is no longer) a project terminal, so callers that already
+    /// killed the pane and callers racing the pane's own exit watcher can both call this safely.
+    ///
+    /// Cascades to companions first (mirrors `finish_agent`'s agent-teardown cascade): a project
+    /// terminal that was split must not orphan its companion panes when the root is forgotten,
+    /// whether that happens via a natural exit, an explicit close, or the project being removed
+    /// — every one of those three callers reaches this same cascade instead of each duplicating
+    /// (and risking missing) it.
+    pub(crate) fn forget_project_terminal(&self, pane: PaneId) {
+        let Some(root) = self.term_project.lock().remove(&pane) else { return };
+        // Only clear the forward map if it still points at this pane. A losing racer from
+        // `open_project_terminal`'s spawn window (or a caller that already killed a stale pane)
+        // must not delete a *different*, live winner's mapping out from under it.
+        let mut pt = self.project_terms.lock();
+        if pt.get(&root) == Some(&pane) {
+            pt.remove(&root);
+        }
+        drop(pt);
+
+        let companions: Vec<PaneId> = self.trees.lock().get(&pane)
+            .map(|t| crate::split_tree::leaves(t).into_iter().filter(|p| *p != pane).collect())
+            .unwrap_or_default();
+        for c in &companions {
+            if let Some(p) = self.get(*c) { let _ = p.kill(); }
+            self.panes.lock().remove(c);
+            self.owner.lock().remove(c);
+            if let Some(h) = self.companion_watchers.lock().remove(c) { h.abort(); }
+        }
+
+        self.trees.lock().remove(&pane);
+        self.owner.lock().remove(&pane);
+        if let Some(p) = self.get(pane) { let _ = p.kill(); }
+        self.panes.lock().remove(&pane);
+        // The exit watcher may be calling this itself (natural exit) or a caller that already
+        // killed the pane may not have touched `watchers` (e.g. close_pane) — either way, drop
+        // the entry so it doesn't accumulate under a dead PaneId across respawns.
+        if let Some(h) = self.watchers.lock().remove(&pane) {
+            h.abort();
+        }
+        let _ = self.projects_tx.send(ProjectChange::TerminalClosed(root));
     }
 
     pub fn set_attention(&self, pane: PaneId, state: AttentionState) {
@@ -147,54 +379,104 @@ impl Daemon {
         let max_id = records.iter().map(|r| r.agent_id).max().unwrap_or(0);
         self.bump_next_id_above(max_id);
         for rec in records {
-            let id = PaneId(rec.agent_id);
-            if !rec.worktree_path.exists() {
-                tracing::warn!(
-                    "agent {} worktree {} is gone; pruning",
-                    rec.agent_id,
-                    rec.worktree_path.display()
-                );
+            if let Err(e) = self.resume_agent(&rec) {
+                tracing::warn!("resume agent {} failed: {e}; pruning", rec.agent_id);
                 self.registry.remove(rec.agent_id);
-                continue;
-            }
-            let Some(kind) = clowder_workspace::WorkspaceKind::from_str(&rec.workspace_kind) else {
-                tracing::warn!("agent {} has unknown workspace kind {:?}; pruning", rec.agent_id, rec.workspace_kind);
-                self.registry.remove(rec.agent_id);
-                continue;
-            };
-            let Some(adapter) = crate::agent::build_adapter(&rec.adapter_id) else {
-                tracing::warn!("agent {} has unknown adapter {:?}; pruning", rec.agent_id, rec.adapter_id);
-                self.registry.remove(rec.agent_id);
-                continue;
-            };
-            let ws = Workspace {
-                path: rec.worktree_path.clone(),
-                branch: rec.branch.clone(),
-                project: rec.project.clone(),
-                kind,
-            };
-            let spawn = (|| -> Result<Pane> {
-                adapter.provision_hooks(&ws.path, id, &self.hook_sock)?;
-                let mut cmd = adapter.resume_command(&ws.path);
-                cmd.cwd = Some(ws.path.clone());
-                cmd.env.push(("CLOWDER_AGENT_ID".into(), id.0.to_string()));
-                cmd.env.push(("CLOWDER_HOOK_SOCK".into(), self.hook_sock.to_string_lossy().to_string()));
-                Pane::spawn(id, cmd, rec.cols, rec.rows, self.backlog_cap)
-            })();
-            match spawn {
-                Ok(pane) => {
-                    let restore_cwd = ws.path.clone();
-                    self.finalize_agent(id, pane, ws, &rec.task, adapter.as_ref());
-                    if let Some(tree) = rec.tree.clone() {
-                        self.restore_layout(id, tree, restore_cwd);
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("resume agent {} failed: {e}; pruning", rec.agent_id);
-                    self.registry.remove(rec.agent_id);
-                }
             }
         }
+    }
+
+    /// Re-spawn one recorded agent under its original pane id: provision hooks, run the adapter's
+    /// resume command, finalize, restore its companion layout. Shared by `reconcile` (daemon
+    /// restart) and `restart_worktree` (user request), so the two cannot drift apart.
+    fn resume_agent(self: &Arc<Self>, rec: &crate::registry::AgentRecord) -> Result<PaneId> {
+        let id = PaneId(rec.agent_id);
+        if !rec.worktree_path.exists() {
+            bail!("worktree {} is gone", rec.worktree_path.display());
+        }
+        let kind = clowder_workspace::WorkspaceKind::from_str(&rec.workspace_kind)
+            .ok_or_else(|| anyhow::anyhow!("unknown workspace kind {:?}", rec.workspace_kind))?;
+        let adapter = crate::agent::build_adapter(&rec.adapter_id)
+            .ok_or_else(|| anyhow::anyhow!("unknown adapter {:?}", rec.adapter_id))?;
+        let ws = Workspace {
+            path: rec.worktree_path.clone(),
+            branch: rec.branch.clone(),
+            project: rec.project.clone(),
+            kind,
+        };
+        adapter.provision_hooks(&ws.path, id, &self.hook_sock)?;
+        let mut cmd = adapter.resume_command(&ws.path);
+        cmd.cwd = Some(ws.path.clone());
+        cmd.env.push(("CLOWDER_AGENT_ID".into(), id.0.to_string()));
+        cmd.env.push(("CLOWDER_HOOK_SOCK".into(), self.hook_sock.to_string_lossy().to_string()));
+        let pane = Pane::spawn(id, cmd, rec.cols, rec.rows, self.backlog_cap)?;
+        let restore_cwd = ws.path.clone();
+        self.finalize_agent(id, pane, ws, &rec.task, adapter.as_ref());
+        if let Some(tree) = rec.tree.clone() {
+            self.restore_layout(id, tree, restore_cwd);
+        }
+        Ok(id)
+    }
+
+    /// Re-run an exited agent in its existing worktree, keeping its pane id (the worktree's
+    /// durable identity) and any live companion panes.
+    pub fn restart_worktree(self: &Arc<Self>, pane: PaneId) -> Result<()> {
+        match self.attention_of(pane) {
+            None => bail!("no worktree with pane {}", pane.0),
+            Some(AttentionState::Exited) => {}
+            Some(_) => bail!("agent {} is still running — land or discard it instead", pane.0),
+        }
+        let rec = self
+            .registry
+            .load()
+            .into_iter()
+            .find(|r| r.agent_id == pane.0)
+            .ok_or_else(|| anyhow::anyhow!("no worktree with pane {}", pane.0))?;
+
+        // Capture the live tree before anything destructive happens. `resume_agent` →
+        // `finalize_agent` unconditionally overwrites `trees[pane]` with a bare leaf, and
+        // `restore_layout` — if handed a tree — rebuilds it by spawning brand-new companion
+        // processes. That's correct for `reconcile`'s cold-daemon case (nothing is actually
+        // alive to preserve) but wrong here: the daemon is warm, any companions are still
+        // running, and handing their shape to `restore_layout` would duplicate them and orphan
+        // the originals (still in `panes`/`owner`/`companion_watchers`, no longer referenced by
+        // the rebuilt tree, unreapable until the daemon exits). So below we suppress
+        // `restore_layout` entirely and reinstate this captured tree ourselves once the agent's
+        // own pane is back — reusing the exact same companion ids and `owner` entries, which we
+        // never touch.
+        let live_tree = self.split_tree_of(pane);
+
+        // Drop the dead pane and its stale exit watcher; `resume_agent` installs fresh ones under
+        // the same id. Live companion panes (and their owner/tree bookkeeping) are deliberately
+        // left alone — not killed, not replaced.
+        if let Some(h) = self.watchers.lock().remove(&pane) {
+            h.abort();
+        }
+        if let Some(h) = self.scanners.lock().remove(&pane) {
+            h.abort();
+        }
+        self.hookless.lock().remove(&pane);
+        self.panes.lock().remove(&pane);
+
+        // Suppress `resume_agent`'s `restore_layout` call — we restore the tree ourselves below,
+        // from the live snapshot, instead of letting it respawn companions from a persisted one.
+        let mut resume_rec = rec.clone();
+        resume_rec.tree = None;
+        self.resume_agent(&resume_rec)?;
+
+        // Put the real layout back, replacing the bare leaf `finalize_agent` just installed.
+        // Fall back to the persisted tree only if the live one is genuinely gone — `split_tree_of`
+        // returns `Some(Leaf{pane})` for an ordinary unsplit agent, not `None`, so this only fires
+        // if the agent's tree entry vanished from under us entirely, which should not happen while
+        // it was `Exited` (only `finish_agent` removes a tree, and nothing else can be tearing this
+        // agent down concurrently mid-restart) — but an agent restored with no tree at all would be
+        // worse than one restored from a slightly stale snapshot.
+        if let Some(tree) = live_tree.or(rec.tree) {
+            self.trees.lock().insert(pane, tree);
+        }
+        self.broadcast_tree(pane);
+
+        Ok(())
     }
 
     fn register_pane(&self, id: PaneId, pane: Pane) {
@@ -209,10 +491,33 @@ impl Daemon {
     }
 
     /// Provision an isolated worktree, inject the adapter's hooks, and spawn the agent in it.
-    pub fn spawn_agent(self: &Arc<Self>, project: &Path, adapter: &dyn AgentAdapter, task: &str) -> Result<PaneId> {
+    pub fn spawn_agent(self: &Arc<Self>, project: &Path, adapter: &dyn AgentAdapter, name: &str) -> Result<PaneId> {
+        let _mutation = self.project_mutation.lock();
+        // Canonicalize first — the registered-project check compares canonical paths, and on
+        // macOS /tmp resolves to /private/tmp.
+        let project = project
+            .canonicalize()
+            .with_context(|| format!("no such project path: {}", project.display()))?;
+        if !self.projects.contains(&project) {
+            bail!("unknown project: {} — add it first", project.display());
+        }
+        clowder_workspace::validate_workspace_name(name)?;
+
+        // Fail on a collision with a clear message instead of a raw `git worktree add` error.
+        // reconcile prunes a registry record when resume fails but leaves the worktree on disk,
+        // so an untracked directory here is a real case, not a hypothetical.
+        let wt = project.join(".clowder").join("worktrees").join(name);
+        if wt.exists() {
+            bail!("a worktree named '{name}' already exists at {} — land/discard it or choose another name", wt.display());
+        }
+        if branch_exists(&project, &format!("clowder/{name}")) {
+            bail!("branch clowder/{name} already exists in {} — choose another name", project.display());
+        }
+
+        let task = name;
         let id = self.alloc_id();
-        let driver = driver_for(project);
-        let ws = driver.provision(project, task)?;
+        let driver = driver_for(&project);
+        let ws = driver.provision(&project, task)?;
 
         // If any post-provision step fails (e.g. the agent binary isn't on PATH), tear down
         // the freshly-provisioned worktree/branch instead of leaking it — otherwise a retry
@@ -265,19 +570,16 @@ impl Daemon {
         id: PaneId,
         pane: Pane,
         ws: Workspace,
-        task: &str,
+        name: &str,
         adapter: &dyn AgentAdapter,
     ) {
-        let project_name = ws
-            .project
-            .file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| ws.project.to_string_lossy().to_string());
+        let project = ws.project.to_string_lossy().to_string();
+        let branch = ws.branch.clone();
         self.register_pane(id, pane);
         self.workspaces.lock().insert(id, ws);
         self.agents.lock().insert(
             id,
-            AgentMeta { project: project_name, task: task.to_string() },
+            AgentMeta { project, name: name.to_string(), branch },
         );
         self.set_attention(id, AttentionState::Working);
 
@@ -355,6 +657,15 @@ impl Daemon {
         self.workspaces.lock().get(&pane).cloned()
     }
 
+    /// The working directory for a companion of `root`: an agent's worktree, or a project
+    /// terminal's project root.
+    fn root_cwd(&self, root: PaneId) -> Option<PathBuf> {
+        if let Some(ws) = self.workspaces.lock().get(&root) {
+            return Some(ws.path.clone());
+        }
+        self.term_project.lock().get(&root).cloned()
+    }
+
     /// Kill the agent's process and finalize its workspace (land or discard); drop all
     /// per-pane state.
     fn finish_agent(&self, pane: PaneId, land: bool) -> Result<()> {
@@ -388,21 +699,39 @@ impl Daemon {
             h.abort();
         }
         self.hookless.lock().remove(&pane);
-        if let Some(ws) = self.workspace_of(pane) {
-            let driver = driver_for_kind(ws.kind);
-            if land {
-                driver.land(&ws)?;
-            } else {
-                driver.discard(&ws)?;
+        // Rule: drop the row only when there is NO WAY BACK — i.e. when the worktree is gone.
+        // The pane is already dead by this point, so returning early on a driver error used to
+        // leave a permanently stuck row: Discard could not be retried (the directory was already
+        // removed) and Restart could not help (`resume_agent` needs the worktree to exist).
+        let driver_result = match self.workspace_of(pane) {
+            Some(ws) => {
+                let driver = driver_for_kind(ws.kind);
+                let r = if land { driver.land(&ws) } else { driver.discard(&ws) };
+                if r.is_err() && ws.path.exists() {
+                    // Recoverable: the worktree — and, for a failed land, its uncommitted work —
+                    // survives. Keep the record so the operation can be retried, and mark the
+                    // now-dead agent Exited so the UI offers Restart. This is load-bearing: the
+                    // exit watcher was aborted above, so nothing else will ever set this, and
+                    // `restart_worktree` refuses anything that is not Exited.
+                    self.set_attention(pane, AttentionState::Exited);
+                    return r;
+                }
+                r
             }
-        }
+            None => Ok(()),
+        };
+
         self.workspaces.lock().remove(&pane);
         self.panes.lock().remove(&pane);
         self.attention.lock().remove(&pane);
         self.agents.lock().remove(&pane);
         self.registry.remove(pane.0);
         let _ = self.removed_tx.send(pane);
-        Ok(())
+
+        // The teardown completed; surface any driver error so the client can show it. The client
+        // gets this as its direct reply AND `AgentRemoved` via the broadcast above, so the row
+        // disappears and the banner explains why.
+        driver_result
     }
 
     /// Kill the agent's process and remove its worktree without keeping the branch.
@@ -432,11 +761,19 @@ impl Daemon {
 
     /// Finalize the agent's work: commit any dirty changes, remove the worktree, keep the branch.
     pub fn land_agent(&self, pane: PaneId) -> Result<()> {
+        // finish_agent tolerates a missing workspace (`if let Some(ws)`), so without this guard
+        // landing a project terminal would silently succeed and kill it.
+        if self.term_project.lock().contains_key(&pane) {
+            bail!("pane {} is a project terminal — it has no workspace to land", pane.0);
+        }
         self.finish_agent(pane, true)
     }
 
     /// Throw away the agent's work: remove the worktree and delete its branch.
     pub fn discard_agent(&self, pane: PaneId) -> Result<()> {
+        if self.term_project.lock().contains_key(&pane) {
+            bail!("pane {} is a project terminal — it has no workspace to discard", pane.0);
+        }
         self.finish_agent(pane, false)
     }
 
@@ -555,10 +892,7 @@ impl Daemon {
             .get(&target)
             .ok_or_else(|| anyhow::anyhow!("unknown pane {target:?}"))?;
         let path = self
-            .workspaces
-            .lock()
-            .get(&agent)
-            .map(|w| w.path.clone())
+            .root_cwd(agent)
             .ok_or_else(|| anyhow::anyhow!("no workspace for agent {agent:?}"))?;
         let companion = self.spawn_pane(
             companion_command(self.shell.clone(), path),
@@ -622,6 +956,13 @@ impl Daemon {
     /// Close a companion pane (collapsing the tree), or teardown the agent if `pane` is one.
     /// Returns Some(agent) if a companion was closed, None if an agent was torn down.
     pub fn close_pane(&self, pane: PaneId) -> Result<Option<PaneId>> {
+        if self.term_project.lock().contains_key(&pane) {
+            // A project terminal's root: kill it and forget it, rather than taking the agent
+            // teardown path (which would emit AgentRemoved for something that is not a worktree).
+            if let Some(p) = self.get(pane) { let _ = p.kill(); }
+            self.forget_project_terminal(pane);
+            return Ok(None);
+        }
         let is_agent = self.trees.lock().contains_key(&pane);
         if is_agent {
             self.teardown_agent(pane)?;
@@ -673,15 +1014,16 @@ impl Daemon {
         self.owner.lock().get(&pane).copied()
     }
 
-    pub fn list_agents(&self) -> Vec<clowder_proto::AgentInfo> {
+    pub fn list_worktrees(&self) -> Vec<clowder_proto::WorktreeInfo> {
         let agents = self.agents.lock();
         let attention = self.attention.lock();
-        let mut out: Vec<clowder_proto::AgentInfo> = agents
+        let mut out: Vec<clowder_proto::WorktreeInfo> = agents
             .iter()
-            .map(|(pane, meta)| clowder_proto::AgentInfo {
+            .map(|(pane, meta)| clowder_proto::WorktreeInfo {
                 pane: *pane,
                 project: meta.project.clone(),
-                task: meta.task.clone(),
+                name: meta.name.clone(),
+                branch: meta.branch.clone(),
                 state: attention.get(pane).copied().unwrap_or(clowder_proto::AttentionState::Working),
             })
             .collect();
@@ -725,7 +1067,7 @@ impl Daemon {
                     Some(p) => break p,
                     None => return Ok(()), // unknown pane: end session
                 },
-                Some(ClientToDaemon::ListAgents) => {
+                Some(ClientToDaemon::ListWorktrees) => {
                     return self.handle_control(msgs).await;
                 }
                 Some(_) => continue, // ignore until attached
@@ -775,7 +1117,7 @@ impl Daemon {
                         Some(ClientToDaemon::Resize { cols, rows, .. }) => { let _ = pane.resize(cols, rows); }
                         Some(ClientToDaemon::Detach) | None => break,
                         Some(ClientToDaemon::Attach { .. }) => continue,
-                        Some(ClientToDaemon::ListAgents) => continue,
+                        Some(ClientToDaemon::ListWorktrees) => continue,
                     }
                 }
                 att = att_rx.recv() => {
@@ -806,10 +1148,10 @@ impl Daemon {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send,
     {
-        // Snapshot the agent list, then stream every attention change.
+        // Snapshot the worktree list, then stream every attention change.
         let mut att_rx = self.subscribe_attention();
         let mut removed_rx = self.subscribe_removed();
-        msgs.send(&DaemonToClient::AgentList { agents: self.list_agents() }).await?;
+        msgs.send(&DaemonToClient::WorktreeList { worktrees: self.list_worktrees() }).await?;
         loop {
             tokio::select! {
                 att = att_rx.recv() => {
@@ -830,9 +1172,9 @@ impl Daemon {
                 }
                 incoming = msgs.recv::<ClientToDaemon>() => {
                     match incoming? {
-                        Some(ClientToDaemon::ListAgents) => {
+                        Some(ClientToDaemon::ListWorktrees) => {
                             // Client asked to refresh the list.
-                            msgs.send(&DaemonToClient::AgentList { agents: self.list_agents() }).await?;
+                            msgs.send(&DaemonToClient::WorktreeList { worktrees: self.list_worktrees() }).await?;
                         }
                         Some(_) => continue,     // control conn ignores pane ops
                         None => break,           // client disconnected
@@ -844,9 +1186,24 @@ impl Daemon {
     }
 }
 
+/// Does `branch` already exist in `project`? Best-effort: a false negative just means the
+/// underlying driver reports the collision instead, which is the pre-M10b behaviour.
+fn branch_exists(project: &Path, branch: &str) -> bool {
+    use clowder_workspace::WorkspaceKind;
+    match clowder_workspace::detect_kind(project) {
+        Some(WorkspaceKind::Jj) => std::process::Command::new("jj")
+            .arg("-R").arg(project).args(["bookmark", "list", "-r", branch])
+            .output().map(|o| o.status.success() && !o.stdout.is_empty()).unwrap_or(false),
+        _ => std::process::Command::new("git")
+            .arg("-C").arg(project).args(["branch", "--list", branch])
+            .output().map(|o| !o.stdout.is_empty()).unwrap_or(false),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::init_repo;
     use std::time::Duration;
 
     fn sh(script: &str) -> PaneCommand {
@@ -1115,28 +1472,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_agents_reports_project_task_and_state() {
+    async fn list_worktrees_reports_project_name_branch_and_state() {
         use crate::{FakeNotifier, SyntheticAdapter};
         use clowder_proto::AttentionState;
-        use std::process::Command as PCommand;
         use std::sync::Arc as StdArc;
 
-        // temp git repo
-        let repo = tempfile::tempdir().unwrap();
-        let run = |args: &[&str]| {
-            assert!(PCommand::new("git").arg("-C").arg(repo.path()).args(args).status().unwrap().success());
-        };
-        run(&["init", "-q"]);
-        run(&["config", "user.email", "t@t.test"]);
-        run(&["config", "user.name", "t"]);
-        std::fs::write(repo.path().join("README.md"), b"hi").unwrap();
-        run(&["add", "."]);
-        run(&["commit", "-qm", "init"]);
-
-        let daemon = StdArc::new(Daemon::new_with(
+        let repo = init_repo();
+        let state = tempfile::tempdir().unwrap();
+        let daemon = StdArc::new(Daemon::new_with_paths(
             StdArc::new(FakeNotifier::new()),
             std::path::PathBuf::from("/tmp/unused-listagents.sock"),
+            state.path().join("agents.json"),
+            state.path().join("projects.json"),
         ));
+        daemon.add_project(repo.path()).unwrap();
         let adapter = SyntheticAdapter {
             command: crate::PaneCommand {
                 program: "/bin/sh".into(),
@@ -1148,17 +1497,19 @@ mod tests {
         let pane = daemon.spawn_agent(repo.path(), &adapter, "task-a").unwrap();
         daemon.set_attention(pane, AttentionState::NeedsInput);
 
-        let list = daemon.list_agents();
+        let list = daemon.list_worktrees();
         assert_eq!(list.len(), 1);
         let a = &list[0];
         assert_eq!(a.pane, pane);
-        assert_eq!(a.task, "task-a");
-        // project display name is the repo dir's basename
-        assert_eq!(a.project, repo.path().file_name().unwrap().to_string_lossy());
+        assert_eq!(a.name, "task-a");
+        assert_eq!(a.branch, "clowder/task-a");
+        // project is now the FULL, CANONICAL path (spawn_agent canonicalizes it) — two repos
+        // with the same dir name must not collapse into one sidebar group.
+        assert_eq!(a.project, repo.path().canonicalize().unwrap().to_string_lossy());
         assert_eq!(a.state, AttentionState::NeedsInput);
 
         daemon.teardown_agent(pane).unwrap();
-        assert!(daemon.list_agents().is_empty());
+        assert!(daemon.list_worktrees().is_empty());
     }
 
     #[tokio::test]
@@ -1181,10 +1532,13 @@ mod tests {
         let _state_lock = crate::STATE_FILE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLOWDER_STATE_FILE", statedir.path().join("agents.json"));
 
-        let daemon = Arc::new(Daemon::new_with(
+        let daemon = Arc::new(Daemon::new_with_paths(
             Arc::new(FakeNotifier::new()),
             std::path::PathBuf::from("/tmp/unused-m9.sock"),
+            statedir.path().join("agents.json"),
+            statedir.path().join("projects.json"),
         ));
+        daemon.add_project(repo.path()).unwrap();
         let adapter = SyntheticAdapter {
             command: crate::PaneCommand {
                 program: "/bin/sh".into(),
@@ -1226,12 +1580,16 @@ mod tests {
         let _state_lock = crate::STATE_FILE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLOWDER_STATE_FILE", statedir.path().join("agents.json"));
         let state_path = statedir.path().join("agents.json");
+        let projects_path = statedir.path().join("projects.json");
 
         // First daemon: spawn an agent so a worktree + registry record exist.
-        let daemon = Arc::new(Daemon::new_with(
+        let daemon = Arc::new(Daemon::new_with_paths(
             Arc::new(FakeNotifier::new()),
             std::path::PathBuf::from("/tmp/unused-reconcile1.sock"),
+            state_path.clone(),
+            projects_path.clone(),
         ));
+        daemon.add_project(repo.path()).unwrap();
         let adapter = SyntheticAdapter {
             command: crate::PaneCommand {
                 program: "/bin/sh".into(),
@@ -1244,16 +1602,19 @@ mod tests {
         let worktree_path = daemon.workspace_of(id).unwrap().path;
 
         // Simulate a fresh daemon (e.g. after a restart): a NEW Daemon on the same state file,
-        // with no in-memory agents, reconciling from the registry alone.
-        let d2 = Arc::new(Daemon::new_with(
+        // with no in-memory agents, reconciling from the registry alone. The project store
+        // (like the registry) persists across a restart, so it points at the same file too.
+        let d2 = Arc::new(Daemon::new_with_paths(
             Arc::new(FakeNotifier::new()),
             std::path::PathBuf::from("/tmp/unused-reconcile2.sock"),
+            state_path.clone(),
+            projects_path.clone(),
         ));
         d2.reconcile();
-        let list = d2.list_agents();
+        let list = d2.list_worktrees();
         assert_eq!(list.len(), 1, "reconcile must re-register the recorded agent");
         assert_eq!(list[0].pane, id, "re-registered under the original id");
-        assert_eq!(list[0].task, "demo");
+        assert_eq!(list[0].name, "demo");
 
         // New spawns on d2 must not collide with the restored id.
         let fresh = d2.spawn_agent(repo.path(), &adapter, "fresh").unwrap();
@@ -1263,13 +1624,15 @@ mod tests {
         // Now corrupt: remove the worktree dir out from under the registry, then reconcile a
         // third daemon → the stale record is pruned, both in memory and on disk.
         std::fs::remove_dir_all(&worktree_path).unwrap();
-        let d3 = Arc::new(Daemon::new_with(
+        let d3 = Arc::new(Daemon::new_with_paths(
             Arc::new(FakeNotifier::new()),
             std::path::PathBuf::from("/tmp/unused-reconcile3.sock"),
+            state_path.clone(),
+            projects_path.clone(),
         ));
         d3.reconcile();
         assert!(
-            d3.list_agents().iter().all(|a| a.pane != id),
+            d3.list_worktrees().iter().all(|a| a.pane != id),
             "agent whose worktree is gone must be pruned"
         );
         assert!(
@@ -1301,11 +1664,16 @@ mod tests {
         let statedir = tempfile::tempdir().unwrap();
         let _state_lock = crate::STATE_FILE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLOWDER_STATE_FILE", statedir.path().join("agents.json"));
+        let state_path = statedir.path().join("agents.json");
+        let projects_path = statedir.path().join("projects.json");
 
-        let d1 = Arc::new(Daemon::new_with(
+        let d1 = Arc::new(Daemon::new_with_paths(
             Arc::new(FakeNotifier::new()),
             std::path::PathBuf::from("/tmp/unused-restore1.sock"),
+            state_path.clone(),
+            projects_path.clone(),
         ));
+        d1.add_project(repo.path()).unwrap();
         let adapter = SyntheticAdapter {
             command: crate::PaneCommand {
                 program: "/bin/sh".into(), args: vec!["-c".into(), "sleep 30".into()],
@@ -1320,9 +1688,11 @@ mod tests {
         d1.flush_dirty_layouts();
 
         // Fresh daemon over the same state file → reconcile rebuilds the layout.
-        let d2 = Arc::new(Daemon::new_with(
+        let d2 = Arc::new(Daemon::new_with_paths(
             Arc::new(FakeNotifier::new()),
             std::path::PathBuf::from("/tmp/unused-restore2.sock"),
+            state_path,
+            projects_path,
         ));
         d2.reconcile();
 
@@ -1363,10 +1733,13 @@ mod tests {
         let _state_lock = crate::STATE_FILE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLOWDER_STATE_FILE", &state_path);
 
-        let daemon = Arc::new(Daemon::new_with(
+        let daemon = Arc::new(Daemon::new_with_paths(
             Arc::new(FakeNotifier::new()),
             std::path::PathBuf::from("/tmp/unused-persist.sock"),
+            state_path.clone(),
+            statedir.path().join("projects.json"),
         ));
+        daemon.add_project(repo.path()).unwrap();
         let adapter = SyntheticAdapter {
             command: crate::PaneCommand {
                 program: "/bin/sh".into(), args: vec!["-c".into(), "sleep 30".into()],
@@ -1409,10 +1782,14 @@ mod tests {
         run(&["add", "."]);
         run(&["commit", "-qm", "init"]);
 
-        let daemon = Arc::new(Daemon::new_with(
+        let state = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(Daemon::new_with_paths(
             Arc::new(FakeNotifier::new()),
             std::path::PathBuf::from("/tmp/unused-control.sock"),
+            state.path().join("agents.json"),
+            state.path().join("projects.json"),
         ));
+        daemon.add_project(repo.path()).unwrap();
         let adapter = SyntheticAdapter {
             command: crate::PaneCommand {
                 program: "/bin/sh".into(),
@@ -1428,16 +1805,16 @@ mod tests {
         tokio::spawn(async move { let _ = d.handle_conn(server_io).await; });
 
         let mut client = MsgStream::<_>::new(client_io);
-        client.send(&ClientToDaemon::ListAgents).await.unwrap();
+        client.send(&ClientToDaemon::ListWorktrees).await.unwrap();
 
-        // First reply is the agent list.
+        // First reply is the worktree list.
         match client.recv::<DaemonToClient>().await.unwrap().unwrap() {
-            DaemonToClient::AgentList { agents } => {
-                assert_eq!(agents.len(), 1);
-                assert_eq!(agents[0].pane, pane);
-                assert_eq!(agents[0].task, "task-a");
+            DaemonToClient::WorktreeList { worktrees } => {
+                assert_eq!(worktrees.len(), 1);
+                assert_eq!(worktrees[0].pane, pane);
+                assert_eq!(worktrees[0].name, "task-a");
             }
-            other => panic!("expected AgentList, got {other:?}"),
+            other => panic!("expected WorktreeList, got {other:?}"),
         }
 
         // A later attention change streams over the SAME control connection,
@@ -1474,10 +1851,14 @@ mod tests {
         run(&["add", "."]);
         run(&["commit", "-qm", "init"]);
 
-        let daemon = Arc::new(Daemon::new_with(
+        let state = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(Daemon::new_with_paths(
             Arc::new(FakeNotifier::new()),
             std::path::PathBuf::from("/tmp/unused-reaper.sock"),
+            state.path().join("agents.json"),
+            state.path().join("projects.json"),
         ));
+        daemon.add_project(repo.path()).unwrap();
         let adapter = SyntheticAdapter {
             command: crate::PaneCommand {
                 program: "/bin/sh".into(),
@@ -1496,7 +1877,7 @@ mod tests {
         }
         assert!(exited, "agent was not marked Exited after its process exited");
         // It stays in the list (mark-exited-and-keep), still reported with Exited state.
-        let list = daemon.list_agents();
+        let list = daemon.list_worktrees();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].state, AttentionState::Exited);
 
@@ -1520,10 +1901,14 @@ mod tests {
         run(&["add", "."]);
         run(&["commit", "-qm", "init"]);
 
-        let daemon = Arc::new(Daemon::new_with(
+        let state = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(Daemon::new_with_paths(
             Arc::new(FakeNotifier::new()),
             std::path::PathBuf::from("/tmp/unused-teardown-race.sock"),
+            state.path().join("agents.json"),
+            state.path().join("projects.json"),
         ));
+        daemon.add_project(repo.path()).unwrap();
         let adapter = SyntheticAdapter {
             command: crate::PaneCommand {
                 program: "/bin/sh".into(),
@@ -1561,10 +1946,14 @@ mod tests {
         run(&["add", "."]);
         run(&["commit", "-qm", "init"]);
 
-        let daemon = Arc::new(Daemon::new_with(
+        let state = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(Daemon::new_with_paths(
             Arc::new(FakeNotifier::new()),
             std::path::PathBuf::from("/tmp/unused-removed.sock"),
+            state.path().join("agents.json"),
+            state.path().join("projects.json"),
         ));
+        daemon.add_project(repo.path()).unwrap();
         let adapter = SyntheticAdapter {
             command: crate::PaneCommand {
                 program: "/bin/sh".into(),
@@ -1580,8 +1969,8 @@ mod tests {
         tokio::spawn(async move { let _ = d.handle_conn(server_io).await; });
 
         let mut client = MsgStream::<_>::new(client_io);
-        client.send(&ClientToDaemon::ListAgents).await.unwrap();
-        // Drain the initial AgentList.
+        client.send(&ClientToDaemon::ListWorktrees).await.unwrap();
+        // Drain the initial WorktreeList.
         let _ = client.recv::<DaemonToClient>().await.unwrap().unwrap();
 
         daemon.teardown_agent(pane).unwrap();
@@ -1598,27 +1987,22 @@ mod tests {
         assert_eq!(removed, Some(pane));
     }
 
-    /// Temp git repo + a daemon wired up the same way the other integration tests build one.
-    fn daemon_with_repo() -> (Arc<Daemon>, tempfile::TempDir) {
+    /// Temp git repo + a daemon wired up the same way the other integration tests build one,
+    /// with the repo already registered as a project. Returns the state TempDir too — it must
+    /// outlive the daemon, since the project/registry stores re-read their file on every call.
+    fn daemon_with_repo() -> (Arc<Daemon>, tempfile::TempDir, tempfile::TempDir) {
         use crate::FakeNotifier;
-        use std::process::Command as PCommand;
 
-        let repo = tempfile::tempdir().unwrap();
-        let run = |args: &[&str]| {
-            assert!(PCommand::new("git").arg("-C").arg(repo.path()).args(args).status().unwrap().success());
-        };
-        run(&["init", "-q"]);
-        run(&["config", "user.email", "t@t.test"]);
-        run(&["config", "user.name", "t"]);
-        std::fs::write(repo.path().join("README.md"), b"hi").unwrap();
-        run(&["add", "."]);
-        run(&["commit", "-qm", "init"]);
-
-        let daemon = Arc::new(Daemon::new_with(
+        let repo = init_repo();
+        let state = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(Daemon::new_with_paths(
             Arc::new(FakeNotifier::new()),
             std::path::PathBuf::from("/tmp/unused-split-tree.sock"),
+            state.path().join("agents.json"),
+            state.path().join("projects.json"),
         ));
-        (daemon, repo)
+        daemon.add_project(repo.path()).unwrap();
+        (daemon, repo, state)
     }
 
     #[test]
@@ -1635,7 +2019,7 @@ mod tests {
         use crate::split_tree;
 
         // temp git repo + daemon with the shell adapter (reuse the existing helpers/pattern)
-        let (daemon, repo) = daemon_with_repo();
+        let (daemon, repo, _state) = daemon_with_repo();
         let agent = daemon
             .spawn_agent(
                 repo.path(),
@@ -1682,7 +2066,7 @@ mod tests {
     async fn teardown_kills_multiple_live_companions() {
         use crate::split_tree;
 
-        let (daemon, repo) = daemon_with_repo();
+        let (daemon, repo, _state) = daemon_with_repo();
         let agent = daemon
             .spawn_agent(
                 repo.path(),
@@ -1728,7 +2112,7 @@ mod tests {
 
     #[tokio::test]
     async fn hookless_agent_bell_sets_needs_input() {
-        let (daemon, repo) = daemon_with_repo();
+        let (daemon, repo, _state) = daemon_with_repo();
         let agent = daemon.spawn_agent(repo.path(), &crate::agent::SyntheticAdapter { command: bell_then_sleep() }, "t").unwrap();
         let mut ok = false;
         for _ in 0..100 {
@@ -1740,7 +2124,7 @@ mod tests {
 
     #[tokio::test]
     async fn hooked_agent_bell_is_ignored() {
-        let (daemon, repo) = daemon_with_repo();
+        let (daemon, repo, _state) = daemon_with_repo();
         let agent = daemon.spawn_agent(repo.path(), &HookedTestAdapter { cmd: bell_then_sleep() }, "t").unwrap();
         // give the BEL time to be produced; attention must stay Working (no scanner).
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -1749,7 +2133,7 @@ mod tests {
 
     #[tokio::test]
     async fn input_clears_hookless_needs_input_to_working() {
-        let (daemon, repo) = daemon_with_repo();
+        let (daemon, repo, _state) = daemon_with_repo();
         let agent = daemon.spawn_agent(repo.path(), &crate::agent::SyntheticAdapter { command: bell_then_sleep() }, "t").unwrap();
         // wait for NeedsInput
         for _ in 0..100 {
@@ -1780,7 +2164,7 @@ mod tests {
 
     #[tokio::test]
     async fn input_clears_hooked_completed_to_working() {
-        let (daemon, repo) = daemon_with_repo();
+        let (daemon, repo, _state) = daemon_with_repo();
         let agent = daemon
             .spawn_agent(
                 repo.path(),
@@ -1827,7 +2211,7 @@ mod tests {
 
     #[tokio::test]
     async fn land_agent_keeps_branch_and_removes_agent() {
-        let (daemon, repo) = daemon_with_repo();
+        let (daemon, repo, _state) = daemon_with_repo();
         let agent = daemon.spawn_agent(repo.path(), &crate::agent::SyntheticAdapter {
             command: PaneCommand { program: "/bin/sh".into(), args: vec!["-c".into(), "sleep 30".into()], cwd: None, env: vec![] },
         }, "task-a").unwrap();
@@ -1843,7 +2227,7 @@ mod tests {
 
     #[tokio::test]
     async fn discard_agent_deletes_branch_and_removes_agent() {
-        let (daemon, repo) = daemon_with_repo();
+        let (daemon, repo, _state) = daemon_with_repo();
         let agent = daemon.spawn_agent(repo.path(), &crate::agent::SyntheticAdapter {
             command: PaneCommand { program: "/bin/sh".into(), args: vec!["-c".into(), "sleep 30".into()], cwd: None, env: vec![] },
         }, "task-b").unwrap();
@@ -1889,10 +2273,14 @@ mod tests {
         use crate::{FakeNotifier, SyntheticAdapter};
 
         let repo = init_jj_repo();
-        let daemon = Arc::new(Daemon::new_with(
+        let state = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(Daemon::new_with_paths(
             Arc::new(FakeNotifier::new()),
             std::path::PathBuf::from("/tmp/unused-jj.sock"),
+            state.path().join("agents.json"),
+            state.path().join("projects.json"),
         ));
+        daemon.add_project(repo.path()).unwrap();
         let adapter = SyntheticAdapter {
             command: PaneCommand {
                 program: "/bin/sh".into(),
@@ -1904,13 +2292,13 @@ mod tests {
         let pane = daemon.spawn_agent(repo.path(), &adapter, "task-a").unwrap();
         assert_eq!(daemon.workspace_of(pane).unwrap().kind, clowder_workspace::WorkspaceKind::Jj);
         daemon.land_agent(pane).unwrap();
-        assert!(daemon.list_agents().is_empty());
+        assert!(daemon.list_worktrees().is_empty());
         assert!(jj_bookmark_exists(repo.path(), "clowder/task-a"));
     }
 
     #[tokio::test]
     async fn set_ratio_updates_and_broadcasts() {
-        let (daemon, repo) = daemon_with_repo();
+        let (daemon, repo, _state) = daemon_with_repo();
         let agent = daemon
             .spawn_agent(
                 repo.path(),
@@ -1938,7 +2326,7 @@ mod tests {
     #[tokio::test]
     async fn companion_crash_removes_leaf_and_broadcasts_tree() {
         use crate::split_tree;
-        let (daemon, repo) = daemon_with_repo();
+        let (daemon, repo, _state) = daemon_with_repo();
         let agent = daemon
             .spawn_agent(
                 repo.path(),
@@ -1994,7 +2382,7 @@ mod tests {
     #[tokio::test]
     async fn reap_companion_is_idempotent() {
         use crate::split_tree;
-        let (daemon, repo) = daemon_with_repo();
+        let (daemon, repo, _state) = daemon_with_repo();
         let agent = daemon
             .spawn_agent(
                 repo.path(),
@@ -2094,10 +2482,13 @@ mod tests {
         let _state_lock = crate::STATE_FILE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLOWDER_STATE_FILE", &state_path);
 
-        let daemon = Arc::new(Daemon::new_with(
+        let daemon = Arc::new(Daemon::new_with_paths(
             Arc::new(FakeNotifier::new()),
             std::path::PathBuf::from("/tmp/unused-ratio.sock"),
+            state_path.clone(),
+            statedir.path().join("projects.json"),
         ));
+        daemon.add_project(repo.path()).unwrap();
         let adapter = SyntheticAdapter {
             command: crate::PaneCommand {
                 program: "/bin/sh".into(), args: vec!["-c".into(), "sleep 30".into()],
@@ -2147,11 +2538,16 @@ mod tests {
         let statedir = tempfile::tempdir().unwrap();
         let _state_lock = crate::STATE_FILE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLOWDER_STATE_FILE", statedir.path().join("agents.json"));
+        let state_path = statedir.path().join("agents.json");
+        let projects_path = statedir.path().join("projects.json");
 
-        let d1 = Arc::new(Daemon::new_with(
+        let d1 = Arc::new(Daemon::new_with_paths(
             Arc::new(FakeNotifier::new()),
             std::path::PathBuf::from("/tmp/unused-collide1.sock"),
+            state_path.clone(),
+            projects_path.clone(),
         ));
+        d1.add_project(repo.path()).unwrap();
         let adapter = SyntheticAdapter {
             command: crate::PaneCommand {
                 program: "/bin/sh".into(), args: vec!["-c".into(), "sleep 30".into()],
@@ -2165,14 +2561,16 @@ mod tests {
 
         // Fresh daemon reconciles A (with layout) then B. Without the early next_id bump, A's
         // restored companion could grab B's id.
-        let d2 = Arc::new(Daemon::new_with(
+        let d2 = Arc::new(Daemon::new_with_paths(
             Arc::new(FakeNotifier::new()),
             std::path::PathBuf::from("/tmp/unused-collide2.sock"),
+            state_path,
+            projects_path,
         ));
         d2.reconcile();
 
         // Both agents came back under their original ids.
-        let ids: std::collections::HashSet<_> = d2.list_agents().iter().map(|x| x.pane).collect();
+        let ids: std::collections::HashSet<_> = d2.list_worktrees().iter().map(|x| x.pane).collect();
         assert!(ids.contains(&a) && ids.contains(&b), "both agents restored: {ids:?}");
 
         // A's companion leaf id differs from BOTH agent ids.
@@ -2204,11 +2602,16 @@ mod tests {
         let statedir = tempfile::tempdir().unwrap();
         let _state_lock = crate::STATE_FILE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLOWDER_STATE_FILE", statedir.path().join("agents.json"));
+        let state_path = statedir.path().join("agents.json");
+        let projects_path = statedir.path().join("projects.json");
 
-        let d1 = Arc::new(Daemon::new_with(
+        let d1 = Arc::new(Daemon::new_with_paths(
             Arc::new(FakeNotifier::new()),
             std::path::PathBuf::from("/tmp/unused-nolt1.sock"),
+            state_path.clone(),
+            projects_path.clone(),
         ));
+        d1.add_project(repo.path()).unwrap();
         let adapter = SyntheticAdapter {
             command: crate::PaneCommand {
                 program: "/bin/sh".into(), args: vec!["-c".into(), "sleep 30".into()],
@@ -2218,14 +2621,102 @@ mod tests {
         // A plain agent, never split → its record's tree is None (the M9a shape).
         let id = d1.spawn_agent(repo.path(), &adapter, "demo").unwrap();
 
-        let d2 = Arc::new(Daemon::new_with(
+        let d2 = Arc::new(Daemon::new_with_paths(
             Arc::new(FakeNotifier::new()),
             std::path::PathBuf::from("/tmp/unused-nolt2.sock"),
+            state_path,
+            projects_path,
         ));
         d2.reconcile();
         assert_eq!(d2.split_tree_of(id), Some(clowder_proto::PaneTree::Leaf { pane: id }));
         d2.shutdown();
         std::env::remove_var("CLOWDER_STATE_FILE");
+    }
+
+    #[tokio::test]
+    async fn restart_revives_an_exited_agent_under_the_same_pane_id() {
+        use crate::SyntheticAdapter;
+        let state = tempfile::tempdir().unwrap();
+        let repo = init_repo();
+        let d = test_daemon_in(state.path());
+        d.add_project(repo.path()).unwrap();
+        // An agent that exits immediately.
+        let adapter = SyntheticAdapter { command: crate::PaneCommand {
+            program: "/bin/sh".into(), args: vec!["-c".into(), "exit 0".into()], cwd: None, env: vec![] } };
+        let pane = d.spawn_agent(repo.path(), &adapter, "feat").unwrap();
+
+        // Wait for the exit watcher to mark it Exited.
+        for _ in 0..100 {
+            if d.attention_of(pane) == Some(AttentionState::Exited) { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(d.attention_of(pane), Some(AttentionState::Exited), "agent should have exited");
+
+        d.restart_worktree(pane).unwrap();
+        assert_eq!(d.attention_of(pane), Some(AttentionState::Working), "restart resets attention");
+        let listed = d.list_worktrees();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].pane, pane, "restart must reuse the pane id — it is the worktree identity");
+        d.teardown_agent(pane).unwrap();
+    }
+
+    #[tokio::test]
+    async fn restart_is_refused_while_the_agent_is_alive() {
+        use crate::SyntheticAdapter;
+        let state = tempfile::tempdir().unwrap();
+        let repo = init_repo();
+        let d = test_daemon_in(state.path());
+        d.add_project(repo.path()).unwrap();
+        let adapter = SyntheticAdapter { command: crate::PaneCommand {
+            program: "/bin/sh".into(), args: vec!["-c".into(), "sleep 30".into()], cwd: None, env: vec![] } };
+        let pane = d.spawn_agent(repo.path(), &adapter, "feat").unwrap();
+        let e = d.restart_worktree(pane).unwrap_err().to_string();
+        assert!(e.contains("still running"), "unhelpful message: {e}");
+        d.teardown_agent(pane).unwrap();
+    }
+
+    #[tokio::test]
+    async fn restart_of_an_unknown_pane_errors() {
+        let state = tempfile::tempdir().unwrap();
+        let d = test_daemon_in(state.path());
+        let e = d.restart_worktree(PaneId(999)).unwrap_err().to_string();
+        assert!(e.contains("no worktree with pane 999"), "should name the missing pane, not claim it's alive: {e}");
+    }
+
+    #[tokio::test]
+    async fn restart_preserves_a_live_companion_pane_without_duplicating_it() {
+        use crate::SyntheticAdapter;
+        use clowder_proto::SplitDirection;
+        let state = tempfile::tempdir().unwrap();
+        let repo = init_repo();
+        let d = test_daemon_in(state.path());
+        d.add_project(repo.path()).unwrap();
+        // An agent that exits immediately; its companion (a plain shell) stays alive.
+        let adapter = SyntheticAdapter { command: crate::PaneCommand {
+            program: "/bin/sh".into(), args: vec!["-c".into(), "exit 0".into()], cwd: None, env: vec![] } };
+        let pane = d.spawn_agent(repo.path(), &adapter, "feat").unwrap();
+        let companion = d.split_pane(pane, SplitDirection::Right).unwrap();
+
+        // Wait for the agent's own process to exit.
+        for _ in 0..100 {
+            if d.attention_of(pane) == Some(AttentionState::Exited) { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(d.attention_of(pane), Some(AttentionState::Exited), "agent should have exited");
+
+        let panes_before = d.panes.lock().len();
+
+        d.restart_worktree(pane).unwrap();
+
+        let tree = d.split_tree_of(pane).expect("tree restored");
+        let leaves = crate::split_tree::leaves(&tree);
+        assert_eq!(leaves.len(), 2, "tree still has exactly agent + companion");
+        assert!(leaves.contains(&companion), "companion pane id unchanged — reused, not respawned");
+
+        let panes_after = d.panes.lock().len();
+        assert_eq!(panes_after, panes_before, "no extra pane created — the original companion was reused, not duplicated");
+
+        d.teardown_agent(pane).unwrap();
     }
 
     #[tokio::test]
@@ -2249,9 +2740,15 @@ mod tests {
         let _lock = crate::STATE_FILE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLOWDER_STATE_FILE", statedir.path().join("agents.json"));
 
-        let mut d = Daemon::new_with(Arc::new(FakeNotifier::new()), "/tmp/unused-vt1.sock".into());
+        let mut d = Daemon::new_with_paths(
+            Arc::new(FakeNotifier::new()),
+            "/tmp/unused-vt1.sock".into(),
+            statedir.path().join("agents.json"),
+            statedir.path().join("projects.json"),
+        );
         d.content_idle = Duration::from_millis(40);
         let daemon = Arc::new(d);
+        daemon.add_project(repo.path()).unwrap();
         let adapter = SyntheticAdapter {
             command: crate::PaneCommand {
                 program: "/bin/sh".into(),
@@ -2297,9 +2794,15 @@ mod tests {
         let lock = crate::STATE_FILE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("CLOWDER_STATE_FILE", statedir.path().join("agents.json"));
 
-        let mut d = Daemon::new_with(Arc::new(FakeNotifier::new()), "/tmp/unused-vt.sock".into());
+        let mut d = Daemon::new_with_paths(
+            Arc::new(FakeNotifier::new()),
+            "/tmp/unused-vt.sock".into(),
+            statedir.path().join("agents.json"),
+            statedir.path().join("projects.json"),
+        );
         d.content_idle = Duration::from_millis(40);
         let daemon = Arc::new(d);
+        daemon.add_project(repo.path()).unwrap();
         let adapter = SyntheticAdapter {
             command: crate::PaneCommand {
                 program: "/bin/sh".into(),
@@ -2349,5 +2852,403 @@ mod tests {
             "BEL must still escalate to NeedsInput");
         daemon.shutdown();
         std::env::remove_var("CLOWDER_STATE_FILE");
+    }
+
+    /// A daemon whose registry AND project store live in `dir` — no env vars, no global lock.
+    fn test_daemon_in(dir: &std::path::Path) -> Arc<Daemon> {
+        Arc::new(Daemon::new_with_paths(
+            Arc::new(crate::FakeNotifier::new()),
+            std::path::PathBuf::from("/tmp/unused-m10b.sock"),
+            dir.join("agents.json"),
+            dir.join("projects.json"),
+        ))
+    }
+
+    #[tokio::test]
+    async fn add_and_list_projects_round_trips() {
+        let state = tempfile::tempdir().unwrap();
+        let repo = init_repo();
+        let d = test_daemon_in(state.path());
+        let rec = d.add_project(repo.path()).unwrap();
+        assert_eq!(rec.path, repo.path().canonicalize().unwrap());
+        assert_eq!(rec.kind, "git");
+        assert_eq!(d.list_projects().len(), 1);
+        assert!(d.is_registered_project(repo.path()), "uncanonical path must still match");
+    }
+
+    /// A long-lived synthetic agent, so teardown is what ends it rather than the process exiting.
+    fn sleeping_adapter() -> crate::SyntheticAdapter {
+        crate::SyntheticAdapter {
+            command: crate::PaneCommand {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), "sleep 30".into()],
+                cwd: None,
+                env: vec![],
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn discard_on_a_repo_with_no_commits_removes_the_row() {
+        // The reported bug, end to end: a project with no commits puts the worktree on an unborn
+        // branch, so `branch -D` found nothing and the whole discard failed — leaving a row that
+        // could be neither retried nor restarted.
+        let state = tempfile::tempdir().unwrap();
+        let repo = crate::test_support::init_empty_repo();
+        let d = test_daemon_in(state.path());
+        d.add_project(repo.path()).unwrap();
+        let pane = d.spawn_agent(repo.path(), &sleeping_adapter(), "feat").unwrap();
+
+        d.discard_agent(pane).unwrap();
+        assert!(d.list_worktrees().is_empty(), "the row must be gone");
+        assert!(d.registry.load().is_empty(), "the registry record must be gone");
+    }
+
+    #[tokio::test]
+    async fn failed_land_keeps_the_row_and_marks_it_exited() {
+        // Land fails BEFORE removing the worktree, so the work survives on disk. The row must
+        // survive with it — dropping it would strand a worktree holding uncommitted work that
+        // cannot be re-adopted (spawning the same name would collide).
+        let state = tempfile::tempdir().unwrap();
+        let repo = init_repo();
+        crate::test_support::install_failing_precommit_hook(repo.path());
+        let d = test_daemon_in(state.path());
+        d.add_project(repo.path()).unwrap();
+        let pane = d.spawn_agent(repo.path(), &sleeping_adapter(), "feat").unwrap();
+
+        let ws = d.workspace_of(pane).expect("workspace");
+        std::fs::write(ws.path.join("work.txt"), b"uncommitted work").unwrap();
+
+        let err = d.land_agent(pane).unwrap_err();
+        assert!(ws.path.exists(), "the worktree and its work must survive a failed land: {err}");
+        assert_eq!(d.list_worktrees().len(), 1, "the row must survive");
+        assert_eq!(d.registry.load().len(), 1, "the record must survive so land can be retried");
+        assert_eq!(
+            d.attention_of(pane),
+            Some(AttentionState::Exited),
+            "the dead agent must read Exited so the UI offers Restart — its watcher was aborted",
+        );
+
+        // And the row is genuinely recoverable, not merely present.
+        d.restart_worktree(pane).unwrap();
+        assert_eq!(d.attention_of(pane), Some(AttentionState::Working));
+        d.teardown_agent(pane).unwrap();
+    }
+
+    #[tokio::test]
+    async fn remove_project_is_refused_while_a_worktree_exists() {
+        use crate::SyntheticAdapter;
+        let state = tempfile::tempdir().unwrap();
+        let repo = init_repo();
+        let d = test_daemon_in(state.path());
+        d.add_project(repo.path()).unwrap();
+        let adapter = SyntheticAdapter {
+            command: crate::PaneCommand {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), "sleep 30".into()],
+                cwd: None,
+                env: vec![],
+            },
+        };
+        let pane = d.spawn_agent(repo.path(), &adapter, "feat").unwrap();
+
+        let e = d.remove_project(repo.path()).unwrap_err().to_string();
+        assert!(e.contains("1"), "message should say how many: {e}");
+        assert_eq!(d.list_projects().len(), 1, "project must survive a refused removal");
+
+        d.discard_agent(pane).unwrap();
+        d.remove_project(repo.path()).unwrap();      // now allowed
+        assert!(d.list_projects().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remove_project_cannot_race_a_spawn_into_it() {
+        use crate::SyntheticAdapter;
+        use std::sync::Arc as StdArc;
+        let state = tempfile::tempdir().unwrap();
+        let repo = crate::test_support::init_repo();
+        let d = test_daemon_in(state.path());
+        d.add_project(repo.path()).unwrap();
+
+        let adapter = SyntheticAdapter { command: crate::PaneCommand {
+            program: "/bin/sh".into(), args: vec!["-c".into(), "sleep 30".into()], cwd: None, env: vec![] } };
+
+        // Spawn on a blocking thread while the main task hammers remove_project. Without the
+        // serialization, remove_project can observe an empty `agents` map during the provisioning
+        // window and drop the project out from under a live agent.
+        //
+        // spawn_agent's hookless-scanner setup (finalize_agent) does a bare `tokio::spawn`, which
+        // needs ambient runtime context. A plain `std::thread` has none, so enter the current
+        // Handle here — otherwise the thread panics with "no reactor running" before the race
+        // between remove_project and spawn_agent is ever exercised.
+        let rt = tokio::runtime::Handle::current();
+        let d2 = StdArc::clone(&d);
+        let path = repo.path().to_path_buf();
+        let spawner = std::thread::spawn(move || {
+            let _guard = rt.enter();
+            d2.spawn_agent(&path, &adapter, "racy")
+        });
+
+        let mut removed_while_spawning = false;
+        for _ in 0..200 {
+            if d.remove_project(repo.path()).is_ok() {
+                removed_while_spawning = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let pane = spawner.join().unwrap();
+
+        if let Ok(pane) = pane {
+            assert!(!removed_while_spawning,
+                    "removed the project while an agent was being spawned into it");
+            assert!(d.is_registered_project(repo.path()), "project must still be registered");
+            d.teardown_agent(pane).unwrap();
+        } else {
+            // The spawn lost the race and was rejected — acceptable, but then the project must
+            // genuinely be gone, not half-removed.
+            assert!(!d.is_registered_project(repo.path()));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remove_project_cannot_race_open_project_terminal() {
+        use std::sync::Arc as StdArc;
+        let state = tempfile::tempdir().unwrap();
+        let repo = crate::test_support::init_repo();
+        let d = test_daemon_in(state.path());
+        d.add_project(repo.path()).unwrap();
+
+        // Hammer open_project_terminal on a blocking thread while the main task hammers
+        // remove_project. Before the `project_mutation` fix, `open_project_terminal` could
+        // observe the project as registered, fork its shell, and only THEN publish into
+        // `project_terms` — a window in which `remove_project` sees no `project_terms` entry and
+        // no agents, so it removes the project out from under the about-to-be-published terminal,
+        // leaving a live shell rooted in an unregistered, unreachable project.
+        let rt = tokio::runtime::Handle::current();
+        let d2 = StdArc::clone(&d);
+        let path = repo.path().to_path_buf();
+        let opener = std::thread::spawn(move || {
+            let _guard = rt.enter();
+            d2.open_project_terminal(&path)
+        });
+
+        for _ in 0..200 {
+            if d.remove_project(repo.path()).is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let opened = opener.join().unwrap();
+
+        if let Ok(pane) = opened {
+            // The open won its race and completed. If the project ended up removed anyway, the
+            // pane it opened must be dead too — never a live-but-unreachable orphan.
+            if !d.is_registered_project(repo.path()) {
+                assert!(d.get(pane).is_none(),
+                        "terminal opened into a project removed out from under it — leaked shell");
+            }
+        } else {
+            // The open lost the race and was rejected — acceptable, but then the project must be
+            // genuinely gone, not half-removed.
+            assert!(!d.is_registered_project(repo.path()));
+        }
+    }
+
+    #[tokio::test]
+    async fn project_changes_broadcast_to_subscribers() {
+        let state = tempfile::tempdir().unwrap();
+        let repo = init_repo();
+        let d = test_daemon_in(state.path());
+        let mut rx = d.subscribe_projects();
+        d.add_project(repo.path()).unwrap();
+        match tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await {
+            Ok(Ok(crate::server::ProjectChange::Added(rec))) => {
+                assert_eq!(rec.path, repo.path().canonicalize().unwrap());
+            }
+            other => panic!("expected Added, got {other:?}"),
+        }
+        d.remove_project(repo.path()).unwrap();
+        match tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await {
+            Ok(Ok(crate::server::ProjectChange::Removed(p))) => {
+                assert_eq!(p, repo.path().canonicalize().unwrap());
+            }
+            other => panic!("expected Removed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_rejects_an_unregistered_project_and_leaves_nothing_behind() {
+        use crate::SyntheticAdapter;
+        let state = tempfile::tempdir().unwrap();
+        let repo = init_repo();
+        let d = test_daemon_in(state.path());
+        let adapter = SyntheticAdapter { command: crate::PaneCommand {
+            program: "/bin/sh".into(), args: vec!["-c".into(), "sleep 30".into()], cwd: None, env: vec![] } };
+
+        let e = d.spawn_agent(repo.path(), &adapter, "feat").unwrap_err().to_string();
+        assert!(e.contains("unknown project"), "unhelpful message: {e}");
+        assert!(!repo.path().join(".clowder/worktrees/feat").exists(), "must not leave a worktree");
+        let branches = std::process::Command::new("git").arg("-C").arg(repo.path())
+            .args(["branch", "--list", "clowder/feat"]).output().unwrap();
+        assert!(branches.stdout.is_empty(), "must not leave a branch");
+        assert!(d.list_worktrees().is_empty());
+    }
+
+    #[tokio::test]
+    async fn spawn_rejects_an_invalid_name_before_provisioning() {
+        use crate::SyntheticAdapter;
+        let state = tempfile::tempdir().unwrap();
+        let repo = init_repo();
+        let d = test_daemon_in(state.path());
+        d.add_project(repo.path()).unwrap();
+        let adapter = SyntheticAdapter { command: crate::PaneCommand {
+            program: "/bin/sh".into(), args: vec!["-c".into(), "sleep 30".into()], cwd: None, env: vec![] } };
+        let e = d.spawn_agent(repo.path(), &adapter, "my feature").unwrap_err().to_string();
+        assert!(e.contains("letters"), "should be the name-validation message: {e}");
+        assert!(!repo.path().join(".clowder/worktrees").exists());
+    }
+
+    #[tokio::test]
+    async fn spawn_rejects_a_colliding_worktree_with_a_real_message() {
+        use crate::SyntheticAdapter;
+        let state = tempfile::tempdir().unwrap();
+        let repo = init_repo();
+        let d = test_daemon_in(state.path());
+        d.add_project(repo.path()).unwrap();
+        // Simulate reconcile's orphan: a worktree dir on disk that the daemon knows nothing about.
+        std::fs::create_dir_all(repo.path().join(".clowder/worktrees/feat")).unwrap();
+        let adapter = SyntheticAdapter { command: crate::PaneCommand {
+            program: "/bin/sh".into(), args: vec!["-c".into(), "sleep 30".into()], cwd: None, env: vec![] } };
+        let e = d.spawn_agent(repo.path(), &adapter, "feat").unwrap_err().to_string();
+        assert!(e.contains("already exists"), "should name the collision, not a raw git error: {e}");
+        assert!(!e.contains("fatal:"), "must not surface a raw git error: {e}");
+    }
+
+    #[tokio::test]
+    async fn spawn_stores_the_canonical_project_path() {
+        use crate::SyntheticAdapter;
+        let state = tempfile::tempdir().unwrap();
+        let repo = init_repo();
+        let d = test_daemon_in(state.path());
+        d.add_project(repo.path()).unwrap();
+        let adapter = SyntheticAdapter { command: crate::PaneCommand {
+            program: "/bin/sh".into(), args: vec!["-c".into(), "sleep 30".into()], cwd: None, env: vec![] } };
+        let pane = d.spawn_agent(repo.path(), &adapter, "feat").unwrap();
+        let listed = d.list_worktrees();
+        assert_eq!(listed[0].project, repo.path().canonicalize().unwrap().to_string_lossy());
+        d.teardown_agent(pane).unwrap();
+    }
+
+    #[tokio::test]
+    async fn open_project_terminal_is_idempotent() {
+        let state = tempfile::tempdir().unwrap();
+        let repo = init_repo();
+        let d = test_daemon_in(state.path());
+        d.add_project(repo.path()).unwrap();
+        let a = d.open_project_terminal(repo.path()).unwrap();
+        let b = d.open_project_terminal(repo.path()).unwrap();
+        assert_eq!(a, b, "a second select must attach to the same shell");
+        assert!(d.list_worktrees().is_empty(), "a terminal is not a worktree");
+    }
+
+    #[tokio::test]
+    async fn forget_project_terminal_does_not_clobber_a_different_live_winner() {
+        // Regression test for the `project_terms`/`term_project` bijection race: a losing
+        // racer's cleanup must not delete a different, live pane's mapping for the same project.
+        // A true concurrency repro is awkward (the race window is inside `spawn_pane`'s fork), so
+        // instead we assert the invariant `forget_project_terminal` is now supposed to preserve:
+        // simulate the losing racer directly by seeding a stale `term_project` entry for the same
+        // project and forgetting it, then check the live winner's mapping survived.
+        let state = tempfile::tempdir().unwrap();
+        let repo = init_repo();
+        let d = test_daemon_in(state.path());
+        d.add_project(repo.path()).unwrap();
+        let root = repo.path().canonicalize().unwrap();
+        let live = d.open_project_terminal(repo.path()).unwrap();
+
+        let stale = PaneId(live.0 + 1_000_000);
+        d.term_project.lock().insert(stale, root.clone());
+        d.forget_project_terminal(stale);
+
+        assert_eq!(
+            d.project_terms.lock().get(&root).copied(),
+            Some(live),
+            "a stale racer's cleanup must not clear the live winner's mapping"
+        );
+        assert_eq!(
+            d.open_project_terminal(repo.path()).unwrap(),
+            live,
+            "the project's terminal must still resolve to the live pane"
+        );
+    }
+
+    #[tokio::test]
+    async fn project_terminal_can_be_split() {
+        let state = tempfile::tempdir().unwrap();
+        let repo = init_repo();
+        let d = test_daemon_in(state.path());
+        d.add_project(repo.path()).unwrap();
+        let term = d.open_project_terminal(repo.path()).unwrap();
+        let companion = d.split_pane(term, clowder_proto::SplitDirection::Right).unwrap();
+        let tree = d.trees.lock().get(&term).cloned().unwrap();
+        assert_eq!(crate::split_tree::leaves(&tree).len(), 2);
+        assert_eq!(d.owner_of(companion), Some(term));
+    }
+
+    #[tokio::test]
+    async fn land_and_discard_refuse_a_project_terminal() {
+        let state = tempfile::tempdir().unwrap();
+        let repo = init_repo();
+        let d = test_daemon_in(state.path());
+        d.add_project(repo.path()).unwrap();
+        let term = d.open_project_terminal(repo.path()).unwrap();
+        // finish_agent tolerates a missing workspace, so without a guard these would silently
+        // succeed and kill the terminal.
+        assert!(d.land_agent(term).is_err(), "land must refuse a project terminal");
+        assert!(d.discard_agent(term).is_err(), "discard must refuse a project terminal");
+        assert!(d.get(term).is_some(), "the terminal must still be alive");
+    }
+
+    #[tokio::test]
+    async fn removing_a_project_kills_its_terminal() {
+        let state = tempfile::tempdir().unwrap();
+        let repo = init_repo();
+        let d = test_daemon_in(state.path());
+        d.add_project(repo.path()).unwrap();
+        let term = d.open_project_terminal(repo.path()).unwrap();
+        d.remove_project(repo.path()).unwrap();
+        assert!(d.get(term).is_none(), "the terminal pane must be gone");
+        assert!(d.project_of_terminal(term).is_none());
+    }
+
+    #[tokio::test]
+    async fn open_project_terminal_rejects_an_unregistered_project() {
+        let state = tempfile::tempdir().unwrap();
+        let repo = init_repo();
+        let d = test_daemon_in(state.path());
+        assert!(d.open_project_terminal(repo.path()).is_err());
+    }
+
+    // Not one of the brief's five tests — added because `finish_agent`'s companion cascade is
+    // the established pattern for tearing down a root+companions unit in this file, and a
+    // previous task in this branch shipped a leak by not reusing it. This pins that
+    // `forget_project_terminal` (reached by close_pane, remove_project, and natural exit alike)
+    // does the same for a split project terminal, instead of orphaning its companion.
+    #[tokio::test]
+    async fn closing_a_project_terminal_kills_its_companion() {
+        let state = tempfile::tempdir().unwrap();
+        let repo = init_repo();
+        let d = test_daemon_in(state.path());
+        d.add_project(repo.path()).unwrap();
+        let term = d.open_project_terminal(repo.path()).unwrap();
+        let companion = d.split_pane(term, clowder_proto::SplitDirection::Right).unwrap();
+        assert!(d.get(companion).is_some(), "sanity: the companion must be alive before closing");
+
+        d.close_pane(term).unwrap();
+
+        assert!(d.get(term).is_none(), "the terminal root must be gone");
+        assert!(d.get(companion).is_none(), "closing the root must not orphan its companion pane");
+        assert!(d.owner_of(companion).is_none(), "the companion's owner entry must not survive its pane");
     }
 }

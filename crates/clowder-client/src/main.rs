@@ -1,18 +1,44 @@
 use anyhow::{anyhow, Result};
-use clowder_client::{attach, spawn_via_control};
+use clowder_client::{
+    add_project_via_control, attach, list_projects_via_control, remove_project_via_control,
+    spawn_via_control,
+};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(|s| s.as_str()) {
         Some("spawn") => {
-            let project = args.get(2).ok_or_else(|| anyhow!("usage: clowder spawn <project> <task> [adapter]"))?;
-            let task = args.get(3).ok_or_else(|| anyhow!("usage: clowder spawn <project> <task> [adapter]"))?;
+            let project = args.get(2).ok_or_else(|| anyhow!("usage: clowder spawn <project> <name> [adapter]"))?;
+            let task = args.get(3).ok_or_else(|| anyhow!("usage: clowder spawn <project> <name> [adapter]"))?;
             let adapter = args.get(4).map(|s| s.as_str()).unwrap_or("claude");
             let sock = clowder_config::Config::load().control_sock;
             let pane = spawn_via_control(&sock, project, task, adapter).await?;
             println!("{}", pane.0);
             Ok(())
+        }
+        Some("project") => {
+            let sock = clowder_config::Config::load().control_sock;
+            match args.get(2).map(|s| s.as_str()) {
+                Some("add") => {
+                    let path = args.get(3).ok_or_else(|| anyhow!("usage: clowder project add <path>"))?;
+                    let p = add_project_via_control(&sock, path).await?;
+                    println!("{} ({})", p.path, p.kind);
+                    Ok(())
+                }
+                Some("list") => {
+                    for p in list_projects_via_control(&sock).await? {
+                        println!("{}\t{}\t{}", p.kind, p.name, p.path);
+                    }
+                    Ok(())
+                }
+                Some("rm") => {
+                    let path = args.get(3).ok_or_else(|| anyhow!("usage: clowder project rm <path>"))?;
+                    remove_project_via_control(&sock, path).await?;
+                    Ok(())
+                }
+                _ => Err(anyhow!("usage: clowder project <add|list|rm> [path]")),
+            }
         }
         Some("attach") => {
             let pane = args.get(2).and_then(|s| s.parse().ok())
@@ -50,6 +76,6 @@ async fn main() -> Result<()> {
         }
         // Legacy: `clowder <pane-id>` still attaches.
         Some(other) if other.parse::<u64>().is_ok() => attach(other.parse().unwrap()).await,
-        _ => Err(anyhow!("usage: clowder <spawn|attach|connect|remote-host|remote-token> ...")),
+        _ => Err(anyhow!("usage: clowder <spawn|project|attach|connect|remote-host|remote-token> ...")),
     }
 }

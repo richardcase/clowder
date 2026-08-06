@@ -1,8 +1,26 @@
 use anyhow::Result;
-use clowder_proto::{ClientToDaemon, ControlEvent, ControlRequest, DaemonToClient, MsgStream, PaneId};
+use clowder_proto::{
+    ClientToDaemon, ControlEvent, ControlRequest, DaemonToClient, MsgStream, PaneId, ProjectInfo,
+};
 use std::path::Path;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
+
+/// How long a `*_via_control` helper waits for its reply before giving up. This stack has a
+/// history of hangs-instead-of-failures (a stuck daemon, a lock held by a concurrent request) —
+/// bounding the wait means the CLI reports a timeout instead of sitting silently forever.
+const CONTROL_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Read the next control-socket line, bounded by `CONTROL_REPLY_TIMEOUT`.
+async fn next_control_line<R: AsyncRead + Unpin>(
+    lines: &mut tokio::io::Lines<BufReader<R>>,
+) -> anyhow::Result<Option<String>> {
+    tokio::time::timeout(CONTROL_REPLY_TIMEOUT, lines.next_line())
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out waiting for a reply from the daemon"))?
+        .map_err(anyhow::Error::from)
+}
 
 pub mod forward;
 mod tofu;
@@ -71,7 +89,7 @@ pub async fn attach(pane_id: u64) -> Result<()> {
 pub async fn spawn_via_control(
     control_sock: &Path,
     project: &str,
-    task: &str,
+    name: &str,
     adapter: &str,
 ) -> anyhow::Result<PaneId> {
     let stream = UnixStream::connect(control_sock).await?;
@@ -80,23 +98,106 @@ pub async fn spawn_via_control(
 
     let req = ControlRequest::SpawnAgent {
         project: project.to_string(),
-        task: task.to_string(),
+        name: name.to_string(),
         adapter: adapter.to_string(),
     };
     let mut line = serde_json::to_string(&req)?;
     line.push('\n');
     wr.write_all(line.as_bytes()).await?;
 
-    // Skip the initial AgentList / any streamed events until the spawn result.
+    // Skip the initial WorktreeList / any streamed events until the spawn result.
     loop {
-        match lines.next_line().await? {
+        match next_control_line(&mut lines).await? {
             Some(l) => match serde_json::from_str::<ControlEvent>(&l) {
                 Ok(ControlEvent::AgentSpawned { pane }) => return Ok(pane),
                 Ok(ControlEvent::Error { message }) => return Err(anyhow::anyhow!(message)),
-                Ok(_) => continue, // AgentList / AttentionChanged / AgentRemoved
+                Ok(_) => continue, // WorktreeList / AttentionChanged / AgentRemoved
                 Err(_) => continue, // ignore unparseable lines defensively
             },
             None => return Err(anyhow::anyhow!("control socket closed before spawn result")),
+        }
+    }
+}
+
+/// Connect the JSON control socket, register a project, and return it as the daemon sees it.
+pub async fn add_project_via_control(
+    control_sock: &std::path::Path,
+    path: &str,
+) -> anyhow::Result<ProjectInfo> {
+    let stream = UnixStream::connect(control_sock).await?;
+    let (rd, mut wr) = tokio::io::split(stream);
+    let mut lines = BufReader::new(rd).lines();
+
+    let req = ControlRequest::AddProject { path: path.to_string() };
+    let mut line = serde_json::to_string(&req)?;
+    line.push('\n');
+    wr.write_all(line.as_bytes()).await?;
+
+    // Skip the initial WorktreeList / any streamed events until our result.
+    loop {
+        match next_control_line(&mut lines).await? {
+            Some(l) => match serde_json::from_str::<ControlEvent>(&l) {
+                Ok(ControlEvent::ProjectAdded { project }) => return Ok(project),
+                Ok(ControlEvent::Error { message }) => return Err(anyhow::anyhow!(message)),
+                Ok(_) => continue,
+                Err(_) => continue, // ignore unparseable lines defensively
+            },
+            None => return Err(anyhow::anyhow!("control socket closed before the result")),
+        }
+    }
+}
+
+/// Connect the JSON control socket and list all registered projects.
+pub async fn list_projects_via_control(
+    control_sock: &std::path::Path,
+) -> anyhow::Result<Vec<ProjectInfo>> {
+    let stream = UnixStream::connect(control_sock).await?;
+    let (rd, mut wr) = tokio::io::split(stream);
+    let mut lines = BufReader::new(rd).lines();
+
+    let req = ControlRequest::ListProjects;
+    let mut line = serde_json::to_string(&req)?;
+    line.push('\n');
+    wr.write_all(line.as_bytes()).await?;
+
+    // Skip the initial WorktreeList / any streamed events until our result.
+    loop {
+        match next_control_line(&mut lines).await? {
+            Some(l) => match serde_json::from_str::<ControlEvent>(&l) {
+                Ok(ControlEvent::ProjectList { projects }) => return Ok(projects),
+                Ok(ControlEvent::Error { message }) => return Err(anyhow::anyhow!(message)),
+                Ok(_) => continue,
+                Err(_) => continue, // ignore unparseable lines defensively
+            },
+            None => return Err(anyhow::anyhow!("control socket closed before the result")),
+        }
+    }
+}
+
+/// Connect the JSON control socket and remove a registered project.
+pub async fn remove_project_via_control(
+    control_sock: &std::path::Path,
+    path: &str,
+) -> anyhow::Result<()> {
+    let stream = UnixStream::connect(control_sock).await?;
+    let (rd, mut wr) = tokio::io::split(stream);
+    let mut lines = BufReader::new(rd).lines();
+
+    let req = ControlRequest::RemoveProject { path: path.to_string() };
+    let mut line = serde_json::to_string(&req)?;
+    line.push('\n');
+    wr.write_all(line.as_bytes()).await?;
+
+    // Skip the initial WorktreeList / any streamed events until our result.
+    loop {
+        match next_control_line(&mut lines).await? {
+            Some(l) => match serde_json::from_str::<ControlEvent>(&l) {
+                Ok(ControlEvent::ProjectRemoved { .. }) => return Ok(()),
+                Ok(ControlEvent::Error { message }) => return Err(anyhow::anyhow!(message)),
+                Ok(_) => continue,
+                Err(_) => continue, // ignore unparseable lines defensively
+            },
+            None => return Err(anyhow::anyhow!("control socket closed before the result")),
         }
     }
 }
@@ -138,7 +239,7 @@ where
                     Some(DaemonToClient::PaneExited { .. }) | None => break,
                     Some(DaemonToClient::Attached { .. }) => {}
                     Some(DaemonToClient::AttentionChanged { .. }) => {}
-                    Some(DaemonToClient::AgentList { .. }) => {}
+                    Some(DaemonToClient::WorktreeList { .. }) => {}
                     Some(DaemonToClient::AgentRemoved { .. }) => {}
                 }
             }
@@ -276,10 +377,14 @@ mod tests {
         // daemon + control socket on a temp path
         let sockdir = tempfile::tempdir().unwrap();
         let sock = sockdir.path().join("control.sock");
-        let daemon = Arc::new(Daemon::new_with(
+        let state = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(Daemon::new_with_paths(
             Arc::new(FakeNotifier::new()),
             std::path::PathBuf::from("/tmp/unused-cli.sock"),
+            state.path().join("agents.json"),
+            state.path().join("projects.json"),
         ));
+        daemon.add_project(repo.path()).unwrap();
         let listener = tokio::net::UnixListener::bind(&sock).unwrap();
         let d = daemon.clone();
         tokio::spawn(async move { let _ = d.serve_control_json(listener).await; });
@@ -288,11 +393,51 @@ mod tests {
             .await
             .unwrap();
 
-        let agents = daemon.list_agents();
+        let agents = daemon.list_worktrees();
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].pane, pane);
-        assert_eq!(agents[0].task, "demo");
+        assert_eq!(agents[0].name, "demo");
 
         daemon.teardown_agent(pane).unwrap();
+    }
+
+    #[tokio::test]
+    async fn add_project_via_control_returns_the_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("c.sock");
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (rd, mut wr) = tokio::io::split(stream);
+            let mut lines = tokio::io::BufReader::new(rd).lines();
+            let _req = lines.next_line().await.unwrap().unwrap();
+            wr.write_all(
+                b"{\"type\":\"projectAdded\",\"project\":{\"path\":\"/p\",\"name\":\"p\",\"kind\":\"git\"}}\n"
+            ).await.unwrap();
+        });
+        let p = add_project_via_control(&sock, "/p").await.unwrap();
+        assert_eq!(p.kind, "git");
+        assert_eq!(p.name, "p");
+    }
+
+    /// A daemon that accepts the connection, reads the request, and then never replies (e.g.
+    /// stuck holding `project_mutation` behind a concurrent spawn) must not hang the CLI forever
+    /// — it should report a timeout instead. `start_paused` lets the 10s timeout resolve in
+    /// virtual time instead of really waiting.
+    #[tokio::test(start_paused = true)]
+    async fn add_project_via_control_times_out_without_a_reply() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("c.sock");
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (rd, wr) = tokio::io::split(stream);
+            let mut lines = tokio::io::BufReader::new(rd).lines();
+            let _req = lines.next_line().await.unwrap().unwrap();
+            let _wr = wr; // keep the write half open so the client blocks on a read, not an EOF
+            std::future::pending::<()>().await;
+        });
+        let err = add_project_via_control(&sock, "/p").await.unwrap_err();
+        assert!(err.to_string().contains("timed out"), "unexpected error: {err}");
     }
 }

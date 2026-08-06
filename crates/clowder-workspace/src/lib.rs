@@ -83,12 +83,39 @@ impl WorkspaceDriver for GitWorktreeDriver {
     }
 
     fn discard(&self, ws: &Workspace) -> Result<()> {
-        let path_str = ws.path.to_string_lossy().to_string();
-        Self::git(&ws.project, &["worktree", "remove", "--force", &path_str])?;
+        // Discard means "throw this away", so an already-absent worktree or branch is the desired
+        // end state, not a failure. Each step is best-effort; the END STATE is what we assert, which
+        // is more robust than matching on git's stderr.
+        if ws.path.exists() {
+            let path_str = ws.path.to_string_lossy().to_string();
+            let _ = Self::git(&ws.project, &["worktree", "remove", "--force", &path_str]);
+        }
         let _ = Command::new("git").arg("-C").arg(&ws.project).args(["worktree", "prune"]).output();
-        Self::git(&ws.project, &["branch", "-D", &ws.branch])?;   // force-delete the unmerged branch
+
+        // A worktree provisioned in a repo with NO COMMITS sits on an UNBORN branch: `worktree add -b`
+        // succeeds (git infers `--orphan`) but no ref exists until the first commit, so there is
+        // nothing to delete. Deleting unconditionally is what made Discard fail on such repos.
+        if branch_exists(&ws.project, &ws.branch) {
+            let _ = Self::git(&ws.project, &["branch", "-D", &ws.branch]);   // unmerged: force
+        }
+
+        if ws.path.exists() {
+            bail!("could not remove worktree {}", ws.path.display());
+        }
         Ok(())
     }
+}
+
+/// Does `refs/heads/<branch>` exist? False for an **unborn** branch — which is what a worktree
+/// provisioned in a repo with no commits is checked out to.
+fn branch_exists(project: &Path, branch: &str) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(project)
+        .args(["show-ref", "--verify", "--quiet", &format!("refs/heads/{branch}")])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// A jujutsu workspace driver: each agent gets its own `jj workspace` (a working copy
@@ -145,28 +172,85 @@ impl WorkspaceDriver for JjDriver {
         let ws_name = format!("clowder-{name}");
         // Drop the working-copy change (best-effort — an empty `@` needn't block cleanup),
         // then detach + remove the workspace. No bookmark was created, so nothing persists.
+        // Every step is best-effort and the END STATE is asserted instead, mirroring the git
+        // driver: an already-forgotten workspace is the desired outcome, not an error.
         let _ = Self::jj(&ws.path, &["abandon", "-r", "@"]);
-        Self::jj(&ws.project, &["workspace", "forget", &ws_name])?;
-        // Best-effort removal: work was abandoned, so transient lock errors must not fail cleanup.
+        let _ = Self::jj(&ws.project, &["workspace", "forget", &ws_name]);
         let _ = std::fs::remove_dir_all(&ws.path);
+        if ws.path.exists() {
+            bail!("could not remove jj workspace {}", ws.path.display());
+        }
         Ok(())
     }
 }
 
-/// Pick a workspace driver for `project`: jj if a `.jj` dir is found at `project` or an
-/// ancestor, else git. `.jj` wins over `.git` (colocated repos), matching jj's own behaviour.
-pub fn driver_for(project: &Path) -> Arc<dyn WorkspaceDriver> {
+/// The workspace kind for `project`, or `None` if it is not a repo at all.
+/// Walks `project` and its ancestors; `.jj` wins over `.git` (colocated repos), matching
+/// jj's own behaviour. Note `.git` is `.exists()` rather than `.is_dir()`: a linked git
+/// worktree records `.git` as a FILE.
+pub fn detect_kind(project: &Path) -> Option<WorkspaceKind> {
     let mut cur = Some(project);
     while let Some(dir) = cur {
         if dir.join(".jj").is_dir() {
-            return Arc::new(JjDriver);
+            return Some(WorkspaceKind::Jj);
         }
         if dir.join(".git").exists() {
-            return Arc::new(GitWorktreeDriver);
+            return Some(WorkspaceKind::Git);
         }
         cur = dir.parent();
     }
-    Arc::new(GitWorktreeDriver)
+    None
+}
+
+/// Validate a worktree/workspace name. The name becomes BOTH a git ref (`clowder/<name>`)
+/// and a path component (`.clowder/worktrees/<name>`), so it must be safe as both.
+/// Messages are user-facing — they surface directly in the app's error banner.
+///
+/// If you add or change a rule here, add a case to `docs/protocol/fixtures/worktree-names.json`
+/// and mirror the rule in Swift's `NewWorktreeForm.nameError` (`macos/Sources/ClowderCore/SheetForms.swift`)
+/// — that fixture is what `agrees_with_the_shared_name_cases` (below) and its Swift counterpart
+/// both check the two implementations against.
+pub fn validate_workspace_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        bail!("worktree name must not be empty");
+    }
+    let len = name.chars().count();
+    if len > 64 {
+        bail!("worktree name must be 64 characters or fewer (got {len})");
+    }
+    if name == "." || name == ".." {
+        bail!("worktree name must not be {name:?}");
+    }
+    // Not redundant with the `contains("..")` check below despite `".."` matching both: this
+    // exact-match check produces a clearer, more specific message for that one case — keep it.
+    if name.contains("..") {
+        bail!("worktree name must not contain '..'");
+    }
+    if name.ends_with(".lock") {
+        bail!("worktree name must not end with '.lock' (git reserves that suffix)");
+    }
+    if name.ends_with('.') {
+        bail!("worktree name must not end with '.' (git rejects it as a ref)");
+    }
+    if let Some(c) = name
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || *c == '.' || *c == '_' || *c == '-'))
+    {
+        bail!("worktree name must contain only letters, digits, '.', '_' or '-' (found {c:?})");
+    }
+    // Checked last so the charset message wins for e.g. "  x": a leading '.' or '-' is legal
+    // in a path but reads as a hidden file or a CLI flag.
+    let first = name.chars().next().unwrap();
+    if first == '.' || first == '-' {
+        bail!("worktree name must not start with {first:?}");
+    }
+    Ok(())
+}
+
+/// Pick a workspace driver for `project`. Falls back to git when `project` is not a repo,
+/// preserving the pre-M10 contract; callers that need to REJECT a non-repo use `detect_kind`.
+pub fn driver_for(project: &Path) -> Arc<dyn WorkspaceDriver> {
+    detect_kind(project).map(driver_for_kind).unwrap_or_else(|| Arc::new(GitWorktreeDriver))
 }
 
 /// The driver matching a provisioned workspace's kind — used to route land/discard.
@@ -250,6 +334,82 @@ mod tests {
         d.discard(&ws).unwrap();
         assert!(!ws.path.exists(), "worktree removed");
         assert!(!branch_exists(repo.path(), "clowder/task-b"), "branch deleted");
+    }
+
+    /// A repo with NO commits: `git init` and nothing else. `HEAD` is an unborn `main`.
+    fn init_empty_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        let run = |args: &[&str]| {
+            assert!(Command::new("git").arg("-C").arg(p).args(args).status().unwrap().success());
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@t.test"]);
+        run(&["config", "user.name", "t"]);
+        dir
+    }
+
+    #[test]
+    fn discard_succeeds_when_the_branch_is_unborn() {
+        // The reported bug: in a repo with no commits, `worktree add -b` succeeds (git infers
+        // `--orphan`) but the branch ref never exists, so `branch -D` used to fail the whole discard.
+        let repo = init_empty_repo();
+        let ws = GitWorktreeDriver.provision(repo.path(), "feat").unwrap();
+        assert!(ws.path.is_dir(), "provision must still create the worktree on an empty repo");
+        assert!(!branch_exists(repo.path(), &ws.branch), "the branch should be unborn");
+
+        GitWorktreeDriver.discard(&ws).unwrap();
+        assert!(!ws.path.exists(), "worktree removed");
+    }
+
+    #[test]
+    fn discard_is_idempotent() {
+        let repo = init_repo();
+        let ws = GitWorktreeDriver.provision(repo.path(), "task-i").unwrap();
+        GitWorktreeDriver.discard(&ws).unwrap();
+        // A second discard must not fail: the end state is already what discard wants.
+        GitWorktreeDriver.discard(&ws).unwrap();
+        assert!(!ws.path.exists());
+    }
+
+    #[test]
+    fn discard_after_land_is_ok_and_removes_the_branch() {
+        let repo = init_repo();
+        let ws = GitWorktreeDriver.provision(repo.path(), "task-al").unwrap();
+        std::fs::write(ws.path.join("work.txt"), b"x").unwrap();
+        GitWorktreeDriver.land(&ws).unwrap();            // removes the worktree, KEEPS the branch
+        assert!(branch_exists(repo.path(), &ws.branch));
+        GitWorktreeDriver.discard(&ws).unwrap();         // worktree already gone
+        assert!(!branch_exists(repo.path(), &ws.branch), "discard still deletes the branch");
+    }
+
+    #[test]
+    fn discard_reports_when_the_worktree_cannot_be_removed() {
+        // A path that exists but is not a registered worktree: `worktree remove` cannot remove it,
+        // so the end-state check must fail rather than silently reporting success.
+        let repo = init_repo();
+        let stray = repo.path().join("not-a-worktree");
+        std::fs::create_dir_all(&stray).unwrap();
+        let ws = Workspace {
+            path: stray.clone(),
+            branch: "clowder/nope".into(),
+            project: repo.path().to_path_buf(),
+            kind: WorkspaceKind::Git,
+        };
+        let e = GitWorktreeDriver.discard(&ws).unwrap_err().to_string();
+        assert!(e.contains("could not remove worktree"), "unhelpful message: {e}");
+        assert!(stray.exists(), "nothing was destroyed");
+    }
+
+    #[test]
+    fn branch_exists_is_false_for_an_unborn_branch() {
+        let repo = init_empty_repo();
+        assert!(!branch_exists(repo.path(), "main"), "an unborn HEAD has no ref");
+        let with_commits = init_repo();
+        let head = Command::new("git").arg("-C").arg(with_commits.path())
+            .args(["symbolic-ref", "--short", "HEAD"]).output().unwrap();
+        let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
+        assert!(branch_exists(with_commits.path(), &head), "a born branch is found");
     }
 
     #[test]
@@ -369,5 +529,99 @@ mod tests {
             assert_eq!(WorkspaceKind::from_str(k.as_str()), Some(k));
         }
         assert_eq!(WorkspaceKind::from_str("nope"), None);
+    }
+
+    #[test]
+    fn detect_kind_none_when_not_a_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(detect_kind(dir.path()), None);
+    }
+
+    #[test]
+    fn detect_kind_git_and_jj_with_jj_winning() {
+        let git = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(git.path().join(".git")).unwrap();
+        assert_eq!(detect_kind(git.path()), Some(WorkspaceKind::Git));
+
+        let jj = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(jj.path().join(".jj")).unwrap();
+        assert_eq!(detect_kind(jj.path()), Some(WorkspaceKind::Jj));
+
+        // Colocated: .jj wins, matching jj's own behaviour.
+        let both = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(both.path().join(".git")).unwrap();
+        std::fs::create_dir_all(both.path().join(".jj")).unwrap();
+        assert_eq!(detect_kind(both.path()), Some(WorkspaceKind::Jj));
+    }
+
+    #[test]
+    fn detect_kind_finds_marker_in_ancestor() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        let nested = dir.path().join("a").join("b");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert_eq!(detect_kind(&nested), Some(WorkspaceKind::Git));
+    }
+
+    #[test]
+    fn detect_kind_treats_git_file_as_git() {
+        // A linked worktree has `.git` as a FILE, not a dir — `.exists()` must accept both.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".git"), b"gitdir: /elsewhere").unwrap();
+        assert_eq!(detect_kind(dir.path()), Some(WorkspaceKind::Git));
+    }
+
+    #[test]
+    fn validate_workspace_name_accepts_reasonable_names() {
+        for ok in ["a", "add-projects", "fix_bug", "v1.2", "M10a", "a-b_c.d"] {
+            assert!(validate_workspace_name(ok).is_ok(), "should accept {ok:?}");
+        }
+    }
+
+    #[test]
+    fn validate_workspace_name_rejects_unsafe_names() {
+        let too_long = "a".repeat(65);
+        let cases: [&str; 12] = [
+            "",              // empty
+            &too_long,       // > 64 chars
+            ".",             // path component
+            "..",            // path component
+            "a..b",          // traversal fragment
+            "x.lock",        // git reserves the .lock suffix
+            "my feature",    // space
+            "feat/x",        // slash would nest the path AND the ref
+            ".hidden",       // leading dot
+            "-dash",         // leading dash reads as a flag
+            "caf\u{e9}",     // non-ASCII
+            "v1.",           // trailing dot — git rejects a ref ending in '.'
+        ];
+        for bad in cases {
+            assert!(validate_workspace_name(bad).is_err(), "should reject {bad:?}");
+        }
+    }
+
+    #[test]
+    fn validate_workspace_name_errors_name_the_problem() {
+        // The message is user-facing (it surfaces in the app's error banner), so it must say
+        // what is wrong, not just that something is.
+        let e = validate_workspace_name("my feature").unwrap_err().to_string();
+        assert!(e.contains("letters"), "unhelpful message: {e}");
+        let e = validate_workspace_name(&"a".repeat(65)).unwrap_err().to_string();
+        assert!(e.contains("64"), "unhelpful message: {e}");
+    }
+
+    #[test]
+    fn agrees_with_the_shared_name_cases() {
+        #[derive(serde::Deserialize)]
+        struct Case { name: String, valid: bool }
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/protocol/fixtures/worktree-names.json");
+        let raw = std::fs::read_to_string(&p)
+            .unwrap_or_else(|e| panic!("missing {}: {e}", p.display()));
+        for c in serde_json::from_str::<Vec<Case>>(&raw).unwrap() {
+            assert_eq!(validate_workspace_name(&c.name).is_ok(), c.valid,
+                       "disagreed on {:?} — if you changed a rule, update the shared cases and the Swift mirror",
+                       c.name);
+        }
     }
 }

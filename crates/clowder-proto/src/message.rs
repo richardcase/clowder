@@ -9,7 +9,7 @@ pub enum ClientToDaemon {
     Input { pane: PaneId, bytes: Vec<u8> },
     Resize { pane: PaneId, cols: u16, rows: u16 },
     Detach,
-    ListAgents,
+    ListWorktrees,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -18,7 +18,7 @@ pub enum DaemonToClient {
     Output { pane: PaneId, bytes: Vec<u8> },
     PaneExited { pane: PaneId, code: Option<i32> },
     AttentionChanged { pane: PaneId, state: AttentionState },
-    AgentList { agents: Vec<AgentInfo> },
+    WorktreeList { worktrees: Vec<WorktreeInfo> },
     AgentRemoved { pane: PaneId },
 }
 
@@ -46,11 +46,18 @@ pub enum AttentionState {
     Exited,
 }
 
+/// One worktree under a project. The agent is a process running inside it: `pane` is that
+/// process's pane, and `state` is its attention. `pane` is durable — `reconcile` re-spawns
+/// each agent under its original id — so it doubles as the worktree's stable identity.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct AgentInfo {
+pub struct WorktreeInfo {
     pub pane: PaneId,
+    /// Full path to the project root (NOT a basename).
     pub project: String,
-    pub task: String,
+    /// The worktree's name — also the suffix of its branch.
+    pub name: String,
+    /// `clowder/<name>`.
+    pub branch: String,
     pub state: AttentionState,
 }
 
@@ -96,19 +103,20 @@ mod tests {
     }
 
     #[test]
-    fn list_agents_roundtrips() {
-        let m = ClientToDaemon::ListAgents;
+    fn list_worktrees_roundtrips() {
+        let m = ClientToDaemon::ListWorktrees;
         let bytes = postcard::to_stdvec(&m).unwrap();
         assert_eq!(m, postcard::from_bytes::<ClientToDaemon>(&bytes).unwrap());
     }
 
     #[test]
-    fn agent_list_roundtrips() {
-        let m = DaemonToClient::AgentList {
-            agents: vec![AgentInfo {
+    fn worktree_list_roundtrips() {
+        let m = DaemonToClient::WorktreeList {
+            worktrees: vec![WorktreeInfo {
                 pane: PaneId(2),
-                project: "clowder".into(),
-                task: "task-a".into(),
+                project: "/Users/x/code/clowder".into(),
+                name: "task-a".into(),
+                branch: "clowder/task-a".into(),
                 state: AttentionState::NeedsInput,
             }],
         };

@@ -11,7 +11,7 @@ struct CommandPaletteView: View {
     private var results: [PaletteItem] {
         paletteResults(query: query,
                        commands: CommandRegistry.all(keymap: keymap),
-                       agents: model.store.orderedAgents)
+                       worktrees: model.store.orderedWorktrees)
     }
 
     var body: some View {
@@ -62,6 +62,16 @@ struct CommandPaletteView: View {
         }
         .padding(.horizontal, 12).padding(.vertical, 7)
         .background(selected ? Color.accentColor.opacity(0.25) : Color.clear)
+        .opacity(isEnabled(item) ? 1 : 0.4)
+    }
+
+    /// Command rows dim when the command doesn't apply to the current selection; agent rows are
+    /// always enabled (picking one always makes sense).
+    private func isEnabled(_ item: PaletteItem) -> Bool {
+        switch item.kind {
+        case let .command(id): return model.isEnabled(id)
+        case .agent: return true
+        }
     }
 
     private func icon(_ kind: PaletteItemKind) -> String {
@@ -80,7 +90,7 @@ struct CommandPaletteView: View {
         guard results.indices.contains(selectedIndex) else { return }
         switch results[selectedIndex].kind {
         case let .command(id): model.run(id)
-        case let .agent(pane): model.selectedPane = pane
+        case let .agent(pane): model.selection = .worktree(pane)
         }
         close()
     }

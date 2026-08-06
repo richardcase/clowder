@@ -29,8 +29,8 @@ impl Daemon {
         }
     }
 
-    /// One JSON-lines control connection: snapshot AgentList, then stream events
-    /// and handle ListAgents/SpawnAgent requests (newline-delimited JSON both ways).
+    /// One JSON-lines control connection: snapshot WorktreeList, then stream events
+    /// and handle ListWorktrees/SpawnAgent requests (newline-delimited JSON both ways).
     pub async fn handle_control_json<S>(self: Arc<Self>, stream: S) -> Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -40,8 +40,9 @@ impl Daemon {
         let mut att_rx = self.subscribe_attention();
         let mut removed_rx = self.subscribe_removed();
         let mut split_rx = self.subscribe_splits();
+        let mut proj_rx = self.subscribe_projects();
 
-        write_event(&mut wr, &ControlEvent::AgentList { agents: self.list_agents() }).await?;
+        write_event(&mut wr, &ControlEvent::WorktreeList { worktrees: self.list_worktrees() }).await?;
 
         loop {
             tokio::select! {
@@ -50,12 +51,12 @@ impl Daemon {
                         Some(l) if l.trim().is_empty() => continue,
                         Some(l) => {
                             let ev = match serde_json::from_str::<ControlRequest>(&l) {
-                                Ok(ControlRequest::ListAgents) =>
-                                    ControlEvent::AgentList { agents: self.list_agents() },
+                                Ok(ControlRequest::ListWorktrees) =>
+                                    ControlEvent::WorktreeList { worktrees: self.list_worktrees() },
                                 Ok(ControlRequest::ListAdapters) =>
                                     ControlEvent::AdapterList { adapters: self.list_adapters() },
-                                Ok(ControlRequest::SpawnAgent { project, task, adapter }) =>
-                                    match self.spawn_from_control(&project, &task, &adapter) {
+                                Ok(ControlRequest::SpawnAgent { project, name, adapter }) =>
+                                    match self.spawn_from_control(&project, &name, &adapter) {
                                         Ok(pane) => ControlEvent::AgentSpawned { pane },
                                         Err(e) => ControlEvent::Error { message: e.to_string() },
                                     },
@@ -69,12 +70,22 @@ impl Daemon {
                                         }
                                         Err(e) => ControlEvent::Error { message: e.to_string() },
                                     },
-                                Ok(ControlRequest::ClosePane { pane }) =>
+                                Ok(ControlRequest::ClosePane { pane }) => {
+                                    // A project terminal's maps are cleared by `close_pane`, so
+                                    // capture its path first — after the call, `project_of_terminal`
+                                    // can no longer answer.
+                                    let terminal_path = self.project_of_terminal(pane);
                                     match self.close_pane(pane) {
                                         Ok(Some(agent)) => self.tree_event(agent),
-                                        Ok(None) => ControlEvent::AgentRemoved { pane },
+                                        Ok(None) => match terminal_path {
+                                            Some(path) => ControlEvent::ProjectTerminalClosed {
+                                                path: path.to_string_lossy().to_string(),
+                                            },
+                                            None => ControlEvent::AgentRemoved { pane },
+                                        },
                                         Err(e) => ControlEvent::Error { message: e.to_string() },
-                                    },
+                                    }
+                                }
                                 Ok(ControlRequest::SetSplitRatio { split, ratio }) =>
                                     match self.set_split_ratio(split, ratio) {
                                         Ok(agent) => self.tree_event(agent),
@@ -89,6 +100,28 @@ impl Daemon {
                                     Ok(()) => ControlEvent::AgentRemoved { pane },
                                     Err(e) => ControlEvent::Error { message: e.to_string() },
                                 },
+                                Ok(ControlRequest::ListProjects) =>
+                                    ControlEvent::ProjectList { projects: self.list_projects() },
+                                Ok(ControlRequest::AddProject { path }) =>
+                                    match self.add_project(Path::new(&path)) {
+                                        Ok(rec) => ControlEvent::ProjectAdded { project: crate::server::project_info(rec) },
+                                        Err(e) => ControlEvent::Error { message: e.to_string() },
+                                    },
+                                Ok(ControlRequest::RemoveProject { path }) =>
+                                    match self.remove_project(Path::new(&path)) {
+                                        Ok(()) => ControlEvent::ProjectRemoved { path },
+                                        Err(e) => ControlEvent::Error { message: e.to_string() },
+                                    },
+                                Ok(ControlRequest::RestartWorktree { pane }) =>
+                                    match self.restart_worktree(pane) {
+                                        Ok(()) => self.tree_event(pane),
+                                        Err(e) => ControlEvent::Error { message: e.to_string() },
+                                    },
+                                Ok(ControlRequest::OpenProjectTerminal { path }) =>
+                                    match self.open_project_terminal(Path::new(&path)) {
+                                        Ok(pane) => ControlEvent::ProjectTerminalOpened { path, pane },
+                                        Err(e) => ControlEvent::Error { message: e.to_string() },
+                                    },
                                 Err(e) => ControlEvent::Error { message: format!("bad request: {e}") },
                             };
                             write_event(&mut wr, &ev).await?;
@@ -119,49 +152,53 @@ impl Daemon {
                         Err(_) => break,
                     }
                 }
+                pc = proj_rx.recv() => {
+                    match pc {
+                        Ok(crate::server::ProjectChange::Added(rec)) =>
+                            write_event(&mut wr, &ControlEvent::ProjectAdded {
+                                project: crate::server::project_info(rec) }).await?,
+                        Ok(crate::server::ProjectChange::Removed(p)) =>
+                            write_event(&mut wr, &ControlEvent::ProjectRemoved {
+                                path: p.to_string_lossy().to_string() }).await?,
+                        Ok(crate::server::ProjectChange::TerminalClosed(p)) =>
+                            write_event(&mut wr, &ControlEvent::ProjectTerminalClosed {
+                                path: p.to_string_lossy().to_string() }).await?,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(_) => break,
+                    }
+                }
             }
         }
         Ok(())
     }
 
-    fn spawn_from_control(self: &Arc<Self>, project: &str, task: &str, adapter: &str) -> Result<PaneId> {
+    fn spawn_from_control(self: &Arc<Self>, project: &str, name: &str, adapter: &str) -> Result<PaneId> {
         let project_path = Path::new(project);
         let a = build_adapter(adapter).ok_or_else(|| anyhow!("unknown adapter: {adapter}"))?;
-        self.spawn_agent(project_path, a.as_ref(), task)
+        self.spawn_agent(project_path, a.as_ref(), name)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::init_repo;
     use crate::FakeNotifier;
     use clowder_proto::AttentionState;
-    use std::process::Command as PCommand;
     use std::time::Duration;
     use tokio::io::AsyncWriteExt;
 
-    fn init_repo() -> tempfile::TempDir {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path();
-        let run = |args: &[&str]| {
-            assert!(PCommand::new("git").arg("-C").arg(p).args(args).status().unwrap().success());
-        };
-        run(&["init", "-q"]);
-        run(&["config", "user.email", "t@t.test"]);
-        run(&["config", "user.name", "t"]);
-        std::fs::write(p.join("README.md"), b"hi").unwrap();
-        run(&["add", "."]);
-        run(&["commit", "-qm", "init"]);
-        dir
-    }
-
     #[tokio::test]
     async fn control_json_lists_spawns_and_streams() {
+        let state = tempfile::tempdir().unwrap();
         let repo = init_repo();
-        let daemon = Arc::new(Daemon::new_with(
+        let daemon = Arc::new(Daemon::new_with_paths(
             Arc::new(FakeNotifier::new()),
             std::path::PathBuf::from("/tmp/unused-cjson.sock"),
+            state.path().join("agents.json"),
+            state.path().join("projects.json"),
         ));
+        daemon.add_project(repo.path()).unwrap();
 
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let d = daemon.clone();
@@ -170,39 +207,49 @@ mod tests {
         let (crd, mut cwr) = tokio::io::split(client_io);
         let mut clines = BufReader::new(crd).lines();
 
-        // Initial snapshot: empty AgentList.
+        // Initial snapshot: empty WorktreeList.
         let first = clines.next_line().await.unwrap().unwrap();
-        assert!(first.contains(r#""type":"agentList""#), "{first}");
+        assert!(first.contains(r#""type":"worktreeList""#), "{first}");
 
         // Spawn a shell agent (build the request via the typed enum to escape the path safely).
         let req = ControlRequest::SpawnAgent {
             project: repo.path().to_string_lossy().to_string(),
-            task: "demo".into(),
+            name: "demo".into(),
             adapter: "shell".into(),
         };
         let mut line = serde_json::to_string(&req).unwrap();
         line.push('\n');
         cwr.write_all(line.as_bytes()).await.unwrap();
 
-        // Read events until AgentSpawned.
-        let pane = loop {
-            let l = clines.next_line().await.unwrap().unwrap();
-            if let Ok(ControlEvent::AgentSpawned { pane }) = serde_json::from_str::<ControlEvent>(&l) {
-                break pane;
+        // Read events until AgentSpawned. Bounded: a regression that makes the daemon reply
+        // with Error instead (e.g. a spawn guard rejecting the request) must fail fast, not
+        // hang the test suite forever.
+        let pane = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let l = clines.next_line().await.unwrap().unwrap();
+                if let Ok(ControlEvent::AgentSpawned { pane }) = serde_json::from_str::<ControlEvent>(&l) {
+                    break pane;
+                }
             }
-        };
+        })
+        .await
+        .expect("no AgentSpawned within 5s");
 
-        // listAgents now includes it.
-        cwr.write_all(b"{\"type\":\"listAgents\"}\n").await.unwrap();
-        let listed = loop {
-            let l = clines.next_line().await.unwrap().unwrap();
-            if let Ok(ControlEvent::AgentList { agents }) = serde_json::from_str::<ControlEvent>(&l) {
-                if !agents.is_empty() { break agents; }
+        // listWorktrees now includes it.
+        cwr.write_all(b"{\"type\":\"listWorktrees\"}\n").await.unwrap();
+        let listed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let l = clines.next_line().await.unwrap().unwrap();
+                if let Ok(ControlEvent::WorktreeList { worktrees }) = serde_json::from_str::<ControlEvent>(&l) {
+                    if !worktrees.is_empty() { break worktrees; }
+                }
             }
-        };
+        })
+        .await
+        .expect("no non-empty WorktreeList within 5s");
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].pane, pane);
-        assert_eq!(listed[0].task, "demo");
+        assert_eq!(listed[0].name, "demo");
 
         // An attention change streams as JSON.
         daemon.set_attention(pane, AttentionState::NeedsInput);
@@ -225,11 +272,15 @@ mod tests {
 
     #[tokio::test]
     async fn split_pane_over_control_stream_yields_split_tree_changed() {
+        let state = tempfile::tempdir().unwrap();
         let repo = init_repo();
-        let daemon = Arc::new(Daemon::new_with(
+        let daemon = Arc::new(Daemon::new_with_paths(
             Arc::new(FakeNotifier::new()),
             std::path::PathBuf::from("/tmp/unused-cjson3.sock"),
+            state.path().join("agents.json"),
+            state.path().join("projects.json"),
         ));
+        daemon.add_project(repo.path()).unwrap();
 
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let d = daemon.clone();
@@ -238,26 +289,32 @@ mod tests {
         let (crd, mut cwr) = tokio::io::split(client_io);
         let mut clines = BufReader::new(crd).lines();
 
-        // Initial snapshot: empty AgentList.
+        // Initial snapshot: empty WorktreeList.
         let first = clines.next_line().await.unwrap().unwrap();
-        assert!(first.contains(r#""type":"agentList""#), "{first}");
+        assert!(first.contains(r#""type":"worktreeList""#), "{first}");
 
         // Spawn a shell agent.
         let req = ControlRequest::SpawnAgent {
             project: repo.path().to_string_lossy().to_string(),
-            task: "demo".into(),
+            name: "demo".into(),
             adapter: "shell".into(),
         };
         let mut line = serde_json::to_string(&req).unwrap();
         line.push('\n');
         cwr.write_all(line.as_bytes()).await.unwrap();
 
-        let agent = loop {
-            let l = clines.next_line().await.unwrap().unwrap();
-            if let Ok(ControlEvent::AgentSpawned { pane }) = serde_json::from_str::<ControlEvent>(&l) {
-                break pane;
+        // Bounded: a spawn-guard regression that turns AgentSpawned into an Error must fail
+        // fast, not hang the test suite forever.
+        let agent = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let l = clines.next_line().await.unwrap().unwrap();
+                if let Ok(ControlEvent::AgentSpawned { pane }) = serde_json::from_str::<ControlEvent>(&l) {
+                    break pane;
+                }
             }
-        };
+        })
+        .await
+        .expect("no AgentSpawned within 5s");
 
         // Send SplitPane and read events until SplitTreeChanged arrives.
         let req = ControlRequest::SplitPane { pane: agent, direction: clowder_proto::SplitDirection::Right };
@@ -265,19 +322,92 @@ mod tests {
         line.push('\n');
         cwr.write_all(line.as_bytes()).await.unwrap();
 
-        let tree = loop {
-            let l = clines.next_line().await.unwrap().unwrap();
-            if let Ok(ControlEvent::SplitTreeChanged { agent: a, tree }) =
-                serde_json::from_str::<ControlEvent>(&l)
-            {
-                if a == agent {
-                    break tree;
+        let tree = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let l = clines.next_line().await.unwrap().unwrap();
+                if let Ok(ControlEvent::SplitTreeChanged { agent: a, tree }) =
+                    serde_json::from_str::<ControlEvent>(&l)
+                {
+                    if a == agent {
+                        break tree;
+                    }
                 }
             }
-        };
+        })
+        .await
+        .expect("no matching SplitTreeChanged within 5s");
         assert_eq!(crate::split_tree::leaves(&tree).len(), 2, "{tree:?}");
 
         daemon.teardown_agent(agent).unwrap();
+    }
+
+    #[tokio::test]
+    async fn close_pane_on_a_project_terminal_replies_project_terminal_closed() {
+        // Regression test: closing a project terminal must reply `projectTerminalClosed`, not
+        // `agentRemoved` — the terminal was never a worktree, so `agentRemoved` is a lie the
+        // client would act on (e.g. by looking for it in a worktree list it was never part of).
+        let state = tempfile::tempdir().unwrap();
+        let repo = init_repo();
+        let daemon = Arc::new(Daemon::new_with_paths(
+            Arc::new(FakeNotifier::new()),
+            std::path::PathBuf::from("/tmp/unused-cjson5.sock"),
+            state.path().join("agents.json"),
+            state.path().join("projects.json"),
+        ));
+        daemon.add_project(repo.path()).unwrap();
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let d = daemon.clone();
+        tokio::spawn(async move { let _ = d.handle_control_json(server_io).await; });
+
+        let (crd, mut cwr) = tokio::io::split(client_io);
+        let mut clines = BufReader::new(crd).lines();
+        let _snapshot = clines.next_line().await.unwrap().unwrap();
+
+        let req = ControlRequest::OpenProjectTerminal {
+            path: repo.path().to_string_lossy().to_string(),
+        };
+        let mut line = serde_json::to_string(&req).unwrap();
+        line.push('\n');
+        cwr.write_all(line.as_bytes()).await.unwrap();
+
+        let pane = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let l = clines.next_line().await.unwrap().unwrap();
+                if let Ok(ControlEvent::ProjectTerminalOpened { pane, .. }) =
+                    serde_json::from_str::<ControlEvent>(&l)
+                {
+                    break pane;
+                }
+            }
+        })
+        .await
+        .expect("no ProjectTerminalOpened within 5s");
+
+        let req = ControlRequest::ClosePane { pane };
+        let mut line = serde_json::to_string(&req).unwrap();
+        line.push('\n');
+        cwr.write_all(line.as_bytes()).await.unwrap();
+
+        let reply = tokio::time::timeout(Duration::from_secs(5), clines.next_line())
+            .await
+            .expect("no reply to closePane within 5s")
+            .unwrap()
+            .unwrap();
+        assert!(
+            reply.contains(r#""type":"projectTerminalClosed""#),
+            "expected projectTerminalClosed, got: {reply}"
+        );
+        assert!(
+            !reply.contains(r#""type":"agentRemoved""#),
+            "must not reply agentRemoved for a project terminal: {reply}"
+        );
+        match serde_json::from_str::<ControlEvent>(&reply).unwrap() {
+            ControlEvent::ProjectTerminalClosed { path } => {
+                assert_eq!(path, repo.path().canonicalize().unwrap().to_string_lossy());
+            }
+            other => panic!("expected ProjectTerminalClosed, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -297,7 +427,7 @@ mod tests {
 
         let req = ControlRequest::SpawnAgent {
             project: repo.path().to_string_lossy().to_string(),
-            task: "x".into(),
+            name: "x".into(),
             adapter: "nope".into(),
         };
         let mut line = serde_json::to_string(&req).unwrap();
@@ -306,7 +436,7 @@ mod tests {
 
         let l = clines.next_line().await.unwrap().unwrap();
         assert!(l.contains(r#""type":"error""#), "expected error event: {l}");
-        assert!(daemon.list_agents().is_empty());
+        assert!(daemon.list_worktrees().is_empty());
     }
 
     #[test]
@@ -318,6 +448,90 @@ mod tests {
         assert!(ids.contains(&"codex".to_string()));
         assert!(ids.contains(&"shell".to_string()));
         assert!(!ids.contains(&"synthetic".to_string()), "must expose descriptor id 'shell', not 'synthetic'");
+    }
+
+    #[tokio::test]
+    async fn control_json_adds_lists_and_streams_projects() {
+        let state = tempfile::tempdir().unwrap();
+        let repo = init_repo();
+        let daemon = Arc::new(Daemon::new_with_paths(
+            Arc::new(FakeNotifier::new()),
+            std::path::PathBuf::from("/tmp/unused-projects.sock"),
+            state.path().join("agents.json"),
+            state.path().join("projects.json"),
+        ));
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let d = daemon.clone();
+        tokio::spawn(async move { let _ = d.handle_control_json(server_io).await; });
+        let (crd, mut cwr) = tokio::io::split(client_io);
+        let mut clines = BufReader::new(crd).lines();
+        let _snapshot = clines.next_line().await.unwrap().unwrap();
+
+        let req = ControlRequest::AddProject { path: repo.path().to_string_lossy().to_string() };
+        let mut line = serde_json::to_string(&req).unwrap();
+        line.push('\n');
+        cwr.write_all(line.as_bytes()).await.unwrap();
+
+        // The reply is ProjectAdded, with the kind detected and the name derived. Bounded: a
+        // regression that stops the daemon sending ProjectAdded must fail fast, not hang CI.
+        let added = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let l = clines.next_line().await.unwrap().unwrap();
+                if let Ok(ControlEvent::ProjectAdded { project }) = serde_json::from_str::<ControlEvent>(&l) {
+                    break project;
+                }
+            }
+        })
+        .await
+        .expect("no ProjectAdded within 5s");
+        assert_eq!(added.kind, "git");
+        assert_eq!(added.path, repo.path().canonicalize().unwrap().to_string_lossy());
+
+        cwr.write_all(b"{\"type\":\"listProjects\"}\n").await.unwrap();
+        let listed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let l = clines.next_line().await.unwrap().unwrap();
+                if let Ok(ControlEvent::ProjectList { projects }) = serde_json::from_str::<ControlEvent>(&l) {
+                    if !projects.is_empty() { break projects; }
+                }
+            }
+        })
+        .await
+        .expect("no non-empty ProjectList within 5s");
+        assert_eq!(listed.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn control_json_add_project_rejects_a_non_repo() {
+        let state = tempfile::tempdir().unwrap();
+        let plain = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(Daemon::new_with_paths(
+            Arc::new(FakeNotifier::new()),
+            std::path::PathBuf::from("/tmp/unused-projects2.sock"),
+            state.path().join("agents.json"),
+            state.path().join("projects.json"),
+        ));
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let d = daemon.clone();
+        tokio::spawn(async move { let _ = d.handle_control_json(server_io).await; });
+        let (crd, mut cwr) = tokio::io::split(client_io);
+        let mut clines = BufReader::new(crd).lines();
+        let _snapshot = clines.next_line().await.unwrap().unwrap();
+
+        let req = ControlRequest::AddProject { path: plain.path().to_string_lossy().to_string() };
+        let mut line = serde_json::to_string(&req).unwrap();
+        line.push('\n');
+        cwr.write_all(line.as_bytes()).await.unwrap();
+
+        // Bounded: a regression that stops the daemon replying must fail fast, not hang CI.
+        let l = tokio::time::timeout(std::time::Duration::from_secs(5), clines.next_line())
+            .await
+            .expect("no reply within 5s")
+            .unwrap()
+            .unwrap();
+        assert!(l.contains("not a git or jj repository"), "expected a helpful error: {l}");
+        assert!(daemon.list_projects().is_empty());
     }
 
     #[tokio::test]
@@ -334,9 +548,9 @@ mod tests {
         let (crd, mut cwr) = tokio::io::split(client_io);
         let mut clines = BufReader::new(crd).lines();
 
-        // Initial snapshot: empty AgentList.
+        // Initial snapshot: empty WorktreeList.
         let first = clines.next_line().await.unwrap().unwrap();
-        assert!(first.contains(r#""type":"agentList""#), "{first}");
+        assert!(first.contains(r#""type":"worktreeList""#), "{first}");
 
         cwr.write_all(b"{\"type\":\"listAdapters\"}\n").await.unwrap();
         let l = clines.next_line().await.unwrap().unwrap();

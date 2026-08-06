@@ -351,6 +351,8 @@ name = "clowder-workspace"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "serde",
+ "serde_json",
  "tempfile",
 ]
 

@@ -29,4 +29,11 @@ final class SurfaceHost {
         views.removeAll()
         self.socketPath = socketPath
     }
+
+    /// Drop a pane's cached surface so the next `view(for:)` runs a fresh `clowder attach`.
+    /// Required for restart, which deliberately reuses the pane id: without this, the cached
+    /// SurfaceView (and its already-dead `clowder attach` child) is returned unchanged, so the
+    /// detail pane keeps showing "Process exited. Press any key to close." even after the daemon
+    /// revives the agent under the same pane.
+    func forget(pane: UInt64) { views[pane] = nil }
 }
