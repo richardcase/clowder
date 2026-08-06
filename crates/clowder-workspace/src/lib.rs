@@ -3,6 +3,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
+mod layout;
+pub use layout::{branch_name, jj_workspace_name, task_from_branch, WorktreeLayout};
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum WorkspaceKind { Git, Jj }
 
@@ -25,8 +28,10 @@ pub struct Workspace {
 
 pub trait WorkspaceDriver: Send + Sync {
     fn kind(&self) -> WorkspaceKind;
-    /// Create an isolated working copy on a fresh branch under `project`'s repo.
-    fn provision(&self, project: &Path, name: &str) -> Result<Workspace>;
+    /// Create an isolated working copy on a fresh branch of `project`'s repo, at the destination
+    /// `layout` picks — which since #65 is OUTSIDE the project. `project` must be canonical
+    /// (see `WorktreeLayout::project_dir`).
+    fn provision(&self, layout: &WorktreeLayout, project: &Path, name: &str) -> Result<Workspace>;
     /// Finalize: commit any uncommitted work, remove the working copy, KEEP the branch.
     fn land(&self, ws: &Workspace) -> Result<()>;
     /// Throw away: remove the working copy and DELETE the branch.
@@ -57,9 +62,11 @@ impl GitWorktreeDriver {
 impl WorkspaceDriver for GitWorktreeDriver {
     fn kind(&self) -> WorkspaceKind { WorkspaceKind::Git }
 
-    fn provision(&self, project: &Path, name: &str) -> Result<Workspace> {
-        let branch = format!("clowder/{name}");
-        let path = project.join(".clowder").join("worktrees").join(name);
+    fn provision(&self, layout: &WorktreeLayout, project: &Path, name: &str) -> Result<Workspace> {
+        let branch = branch_name(name);
+        // `prepare` creates the parent chain (the base may not exist yet) but NOT the leaf, which
+        // `git worktree add` insists on creating itself.
+        let path = layout.prepare(project, name)?;
         let path_str = path.to_string_lossy().to_string();
         // `git worktree add <path> -b <branch>` creates the dir + a new branch off HEAD.
         Self::git(project, &["worktree", "add", &path_str, "-b", &branch])?;
@@ -67,7 +74,7 @@ impl WorkspaceDriver for GitWorktreeDriver {
     }
 
     fn land(&self, ws: &Workspace) -> Result<()> {
-        let task = ws.branch.strip_prefix("clowder/").unwrap_or(&ws.branch);
+        let task = task_from_branch(&ws.branch);
         // Commit any uncommitted work onto the branch (only if dirty).
         let status = Command::new("git").arg("-C").arg(&ws.path).args(["status", "--porcelain"])
             .output().with_context(|| "git status")?;
@@ -142,13 +149,12 @@ impl WorkspaceDriver for JjDriver {
         WorkspaceKind::Jj
     }
 
-    fn provision(&self, project: &Path, name: &str) -> Result<Workspace> {
-        let branch = format!("clowder/{name}");
-        let path = project.join(".clowder").join("worktrees").join(name);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).with_context(|| "create worktrees parent dir")?;
-        }
-        let ws_name = format!("clowder-{name}");
+    fn provision(&self, layout: &WorktreeLayout, project: &Path, name: &str) -> Result<Workspace> {
+        let branch = branch_name(name);
+        // `jj workspace add` will not create leading directories, hence `prepare` — which is now
+        // shared with the git driver rather than being this driver's private step.
+        let path = layout.prepare(project, name)?;
+        let ws_name = jj_workspace_name(name);
         let path_str = path.to_string_lossy().to_string();
         // Create a jj workspace at `path` with a fresh working-copy commit.
         Self::jj(project, &["workspace", "add", "--name", &ws_name, &path_str])?;
@@ -156,8 +162,7 @@ impl WorkspaceDriver for JjDriver {
     }
 
     fn land(&self, ws: &Workspace) -> Result<()> {
-        let name = ws.branch.strip_prefix("clowder/").unwrap_or(&ws.branch);
-        let ws_name = format!("clowder-{name}");
+        let ws_name = jj_workspace_name(task_from_branch(&ws.branch));
         // jj auto-snapshots the working copy into `@` — nothing to add/commit. Pin the
         // work under a bookmark so it survives forgetting the workspace, then detach + remove.
         Self::jj(&ws.path, &["bookmark", "set", &ws.branch, "-r", "@"])?;
@@ -168,8 +173,7 @@ impl WorkspaceDriver for JjDriver {
     }
 
     fn discard(&self, ws: &Workspace) -> Result<()> {
-        let name = ws.branch.strip_prefix("clowder/").unwrap_or(&ws.branch);
-        let ws_name = format!("clowder-{name}");
+        let ws_name = jj_workspace_name(task_from_branch(&ws.branch));
         // Drop the working-copy change (best-effort — an empty `@` needn't block cleanup),
         // then detach + remove the workspace. No bookmark was created, so nothing persists.
         // Every step is best-effort and the END STATE is asserted instead, mirroring the git
@@ -203,7 +207,7 @@ pub fn detect_kind(project: &Path) -> Option<WorkspaceKind> {
 }
 
 /// Validate a worktree/workspace name. The name becomes BOTH a git ref (`clowder/<name>`)
-/// and a path component (`.clowder/worktrees/<name>`), so it must be safe as both.
+/// and the final path component of the worktree (see `WorktreeLayout`), so it must be safe as both.
 /// Messages are user-facing — they surface directly in the app's error banner.
 ///
 /// If you add or change a rule here, add a case to `docs/protocol/fixtures/worktree-names.json`
@@ -282,11 +286,20 @@ mod tests {
         dir
     }
 
+    /// A worktree base OUTSIDE any repo, plus its layout — the post-#65 arrangement.
+    /// Bind both: dropping the `TempDir` deletes every worktree provisioned under it.
+    fn base() -> (tempfile::TempDir, WorktreeLayout) {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = WorktreeLayout::new(dir.path());
+        (dir, layout)
+    }
+
     #[test]
     fn provision_creates_isolated_worktree_on_new_branch() {
         let repo = init_repo();
         let driver = GitWorktreeDriver;
-        let ws = driver.provision(repo.path(), "task-a").unwrap();
+        let (_base, lay) = base();
+        let ws = driver.provision(&lay, repo.path(), "task-a").unwrap();
 
         assert!(ws.path.is_dir(), "worktree dir not created");
         assert_eq!(ws.branch, "clowder/task-a");
@@ -306,7 +319,8 @@ mod tests {
     fn land_commits_dirty_removes_worktree_keeps_branch() {
         let repo = init_repo();
         let d = GitWorktreeDriver;
-        let ws = d.provision(repo.path(), "task-a").unwrap();
+        let (_base, lay) = base();
+        let ws = d.provision(&lay, repo.path(), "task-a").unwrap();
         std::fs::write(ws.path.join("work.txt"), b"agent output").unwrap();   // dirty
         d.land(&ws).unwrap();
         assert!(!ws.path.exists(), "worktree removed");
@@ -319,7 +333,8 @@ mod tests {
     fn land_clean_worktree_makes_no_extra_commit() {
         let repo = init_repo();
         let d = GitWorktreeDriver;
-        let ws = d.provision(repo.path(), "task-c").unwrap();          // no changes
+        let (_base, lay) = base();
+        let ws = d.provision(&lay, repo.path(), "task-c").unwrap();          // no changes
         d.land(&ws).unwrap();
         assert!(branch_exists(repo.path(), "clowder/task-c"));
         let count = Command::new("git").arg("-C").arg(repo.path()).args(["rev-list", "--count", "clowder/task-c"]).output().unwrap();
@@ -330,7 +345,8 @@ mod tests {
     fn discard_removes_worktree_and_deletes_branch() {
         let repo = init_repo();
         let d = GitWorktreeDriver;
-        let ws = d.provision(repo.path(), "task-b").unwrap();
+        let (_base, lay) = base();
+        let ws = d.provision(&lay, repo.path(), "task-b").unwrap();
         d.discard(&ws).unwrap();
         assert!(!ws.path.exists(), "worktree removed");
         assert!(!branch_exists(repo.path(), "clowder/task-b"), "branch deleted");
@@ -354,7 +370,8 @@ mod tests {
         // The reported bug: in a repo with no commits, `worktree add -b` succeeds (git infers
         // `--orphan`) but the branch ref never exists, so `branch -D` used to fail the whole discard.
         let repo = init_empty_repo();
-        let ws = GitWorktreeDriver.provision(repo.path(), "feat").unwrap();
+        let (_base, lay) = base();
+        let ws = GitWorktreeDriver.provision(&lay, repo.path(), "feat").unwrap();
         assert!(ws.path.is_dir(), "provision must still create the worktree on an empty repo");
         assert!(!branch_exists(repo.path(), &ws.branch), "the branch should be unborn");
 
@@ -365,7 +382,8 @@ mod tests {
     #[test]
     fn discard_is_idempotent() {
         let repo = init_repo();
-        let ws = GitWorktreeDriver.provision(repo.path(), "task-i").unwrap();
+        let (_base, lay) = base();
+        let ws = GitWorktreeDriver.provision(&lay, repo.path(), "task-i").unwrap();
         GitWorktreeDriver.discard(&ws).unwrap();
         // A second discard must not fail: the end state is already what discard wants.
         GitWorktreeDriver.discard(&ws).unwrap();
@@ -375,7 +393,8 @@ mod tests {
     #[test]
     fn discard_after_land_is_ok_and_removes_the_branch() {
         let repo = init_repo();
-        let ws = GitWorktreeDriver.provision(repo.path(), "task-al").unwrap();
+        let (_base, lay) = base();
+        let ws = GitWorktreeDriver.provision(&lay, repo.path(), "task-al").unwrap();
         std::fs::write(ws.path.join("work.txt"), b"x").unwrap();
         GitWorktreeDriver.land(&ws).unwrap();            // removes the worktree, KEEPS the branch
         assert!(branch_exists(repo.path(), &ws.branch));
@@ -415,9 +434,56 @@ mod tests {
     #[test]
     fn provision_sets_git_kind() {
         let repo = init_repo();
-        let ws = GitWorktreeDriver.provision(repo.path(), "task-k").unwrap();
+        let (_base, lay) = base();
+        let ws = GitWorktreeDriver.provision(&lay, repo.path(), "task-k").unwrap();
         assert_eq!(ws.kind, WorkspaceKind::Git);
         assert_eq!(GitWorktreeDriver.kind(), WorkspaceKind::Git);
+    }
+
+    #[test]
+    fn git_provision_puts_the_worktree_outside_the_project() {
+        // The point of #65: the project directory is left completely untouched.
+        let repo = init_repo();
+        let (_base, lay) = base();
+        let ws = GitWorktreeDriver.provision(&lay, repo.path(), "feat").unwrap();
+
+        assert!(ws.path.starts_with(lay.base()), "{:?} not under the base", ws.path);
+        assert!(!ws.path.starts_with(repo.path()), "{:?} is inside the project", ws.path);
+        assert!(!repo.path().join(".clowder").exists(), "nothing written into the project");
+        assert_eq!(ws.path, lay.worktree_path(repo.path(), "feat"));
+        // Still a real, populated worktree.
+        assert!(ws.path.join("README.md").is_file());
+    }
+
+    #[test]
+    fn git_land_works_on_a_worktree_outside_the_project() {
+        // land/discard use the STORED ws.path, so crossing out of the project must not affect them.
+        let repo = init_repo();
+        let (_base, lay) = base();
+        let ws = GitWorktreeDriver.provision(&lay, repo.path(), "feat").unwrap();
+        assert!(!ws.path.starts_with(repo.path()));
+        std::fs::write(ws.path.join("work.txt"), b"agent output").unwrap();
+        GitWorktreeDriver.land(&ws).unwrap();
+        assert!(!ws.path.exists());
+        assert!(branch_exists(repo.path(), "clowder/feat"), "work landed on the branch");
+    }
+
+    #[test]
+    fn provision_into_a_base_inside_another_repo_leaves_it_clean() {
+        // The dotfiles hazard: $XDG_DATA_HOME can sit inside a repo someone version-controls.
+        // `prepare`'s `.gitignore` is what stops the agent fleet showing up there (and, for a
+        // colocated jj, being auto-snapshotted into its operation log).
+        let outer = init_repo();
+        let project = init_repo();
+        let lay = WorktreeLayout::new(outer.path().join("data").join("clowder").join("worktrees"));
+
+        let ws = GitWorktreeDriver.provision(&lay, project.path(), "feat").unwrap();
+        assert!(ws.path.starts_with(outer.path()), "test must actually nest inside the outer repo");
+
+        let out = Command::new("git").arg("-C").arg(outer.path())
+            .args(["status", "--porcelain"]).output().unwrap();
+        let status = String::from_utf8_lossy(&out.stdout);
+        assert!(status.is_empty(), "outer repo polluted by the worktree base:\n{status}");
     }
 
     fn jj_available() -> bool {
@@ -462,7 +528,8 @@ mod tests {
     fn jj_provision_creates_workspace_and_sets_jj_kind() {
         if !jj_available() { return; }
         let repo = init_jj_repo();
-        let ws = JjDriver.provision(repo.path(), "task-j").unwrap();
+        let (_base, lay) = base();
+        let ws = JjDriver.provision(&lay, repo.path(), "task-j").unwrap();
         assert!(ws.path.is_dir(), "jj workspace dir not created");
         assert_eq!(ws.branch, "clowder/task-j");
         assert_eq!(ws.kind, WorkspaceKind::Jj);
@@ -473,7 +540,8 @@ mod tests {
     fn jj_land_sets_bookmark_forgets_workspace_removes_dir() {
         if !jj_available() { return; }
         let repo = init_jj_repo();
-        let ws = JjDriver.provision(repo.path(), "task-l").unwrap();
+        let (_base, lay) = base();
+        let ws = JjDriver.provision(&lay, repo.path(), "task-l").unwrap();
         std::fs::write(ws.path.join("work.txt"), b"agent output").unwrap();
         JjDriver.land(&ws).unwrap();
         assert!(!ws.path.exists(), "workspace dir should be removed after land");
@@ -486,11 +554,23 @@ mod tests {
     fn jj_discard_forgets_workspace_and_leaves_no_bookmark() {
         if !jj_available() { return; }
         let repo = init_jj_repo();
-        let ws = JjDriver.provision(repo.path(), "task-d").unwrap();
+        let (_base, lay) = base();
+        let ws = JjDriver.provision(&lay, repo.path(), "task-d").unwrap();
         std::fs::write(ws.path.join("work.txt"), b"throwaway").unwrap();
         JjDriver.discard(&ws).unwrap();
         assert!(!ws.path.exists(), "workspace dir should be removed after discard");
         assert!(!jj_bookmark_exists(repo.path(), "clowder/task-d"), "discard must not leave a bookmark");
+    }
+
+    #[test]
+    fn jj_provision_puts_the_workspace_outside_the_project() {
+        if !jj_available() { return; }
+        let repo = init_jj_repo();
+        let (_base, lay) = base();
+        let ws = JjDriver.provision(&lay, repo.path(), "feat").unwrap();
+        assert!(ws.path.starts_with(lay.base()), "{:?} not under the base", ws.path);
+        assert!(!ws.path.starts_with(repo.path()), "{:?} is inside the project", ws.path);
+        assert!(!repo.path().join(".clowder").exists(), "nothing written into the project");
     }
 
     #[test]

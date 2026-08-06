@@ -1,6 +1,7 @@
 use clowder_daemon::server::Daemon;
 use clowder_daemon::{FakeNotifier, PaneCommand, SyntheticAdapter};
 use clowder_proto::{AttentionState, HookEvent, HookKind, MsgStream, PaneId};
+use clowder_workspace::WorktreeLayout;
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,6 +34,7 @@ async fn provision_spawn_hook_teardown_end_to_end() {
         hook_sock.clone(),
         state.path().join("agents.json"),
         state.path().join("projects.json"),
+        state.path().join("worktrees"),
     ));
     daemon.add_project(repo.path()).unwrap();
 
@@ -53,7 +55,8 @@ async fn provision_spawn_hook_teardown_end_to_end() {
     let pane = daemon.spawn_agent(repo.path(), &adapter, "task-e2e").unwrap();
 
     // Worktree created on a fresh branch, agent's marker + cwd isolation present.
-    let ws_path = repo.path().join(".clowder").join("worktrees").join("task-e2e");
+    let ws_path = WorktreeLayout::new(state.path().join("worktrees"))
+        .worktree_path(&repo.path().canonicalize().unwrap(), "task-e2e");
     assert!(ws_path.is_dir(), "worktree not provisioned");
     assert!(ws_path.join(".clowder-agent").is_file(), "adapter hook-provision marker missing");
     assert_eq!(daemon.attention_of(pane), Some(AttentionState::Working));
@@ -93,6 +96,7 @@ async fn spawn_agent_tears_down_worktree_on_launch_failure() {
         hook_sock.clone(),
         state.path().join("agents.json"),
         state.path().join("projects.json"),
+        state.path().join("worktrees"),
     ));
     daemon.add_project(repo.path()).unwrap();
 
@@ -110,6 +114,7 @@ async fn spawn_agent_tears_down_worktree_on_launch_failure() {
     let result = daemon.spawn_agent(repo.path(), &adapter, "task-fail");
     assert!(result.is_err(), "spawn_agent should fail when the agent binary is missing");
 
-    let ws_path = repo.path().join(".clowder").join("worktrees").join("task-fail");
+    let ws_path = WorktreeLayout::new(state.path().join("worktrees"))
+        .worktree_path(&repo.path().canonicalize().unwrap(), "task-fail");
     assert!(!ws_path.exists(), "worktree should be torn down after spawn_agent failure");
 }

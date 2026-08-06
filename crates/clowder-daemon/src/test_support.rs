@@ -5,7 +5,15 @@ use std::process::Command;
 /// A temp git repo with one commit, so `git worktree add` has a valid HEAD.
 pub(crate) fn init_repo() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
-    let p = dir.path();
+    init_repo_at(dir.path());
+    dir
+}
+
+/// `init_repo`, but at a path you choose — for tests that need control over the repo's *basename*
+/// (e.g. two different projects both called `api`). Creates `p` if absent; the caller owns the
+/// enclosing temp dir. Returns `p` for convenient chaining.
+pub(crate) fn init_repo_at(p: &std::path::Path) -> std::path::PathBuf {
+    std::fs::create_dir_all(p).unwrap();
     let run = |args: &[&str]| {
         assert!(Command::new("git").arg("-C").arg(p).args(args).status().unwrap().success(),
                 "git {args:?} failed");
@@ -16,7 +24,7 @@ pub(crate) fn init_repo() -> tempfile::TempDir {
     std::fs::write(p.join("README.md"), b"hi").unwrap();
     run(&["add", "."]);
     run(&["commit", "-qm", "init"]);
-    dir
+    p.to_path_buf()
 }
 
 /// A temp git repo with **no commits** — `HEAD` is an unborn branch. `git worktree add -b`

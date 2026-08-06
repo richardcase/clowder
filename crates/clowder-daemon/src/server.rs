@@ -74,6 +74,10 @@ pub struct Daemon {
     pub(crate) shell: String,
     registry: Arc<crate::registry::Registry>,
     projects: Arc<crate::projects::ProjectStore>,
+    /// Where worktrees are provisioned. The SAME value the `ProjectStore` holds (both are built
+    /// from one `WorktreeLayout` in `new_with_paths`), so the spawner's collision check and the
+    /// "is this a worktree?" guard can never disagree about the layout.
+    worktrees: clowder_workspace::WorktreeLayout,
     projects_tx: broadcast::Sender<ProjectChange>,
     /// Project root -> its lazily-spawned terminal pane. Not persisted.
     project_terms: Arc<Mutex<HashMap<PathBuf, PaneId>>>,
@@ -106,17 +110,25 @@ impl Daemon {
             hook_sock,
             crate::registry::Registry::default_path(),
             crate::projects::ProjectStore::default_path(),
+            clowder_config::default_worktree_base(),
         )
     }
 
-    /// Like `new_with`, but with both state files given explicitly. Tests use this to point at a
-    /// temp dir without setting process-global env vars (which would force them to serialize).
+    /// Like `new_with`, but with both state files and the worktree base given explicitly. Tests use
+    /// this to point at a temp dir without setting process-global env vars (which would force them
+    /// to serialize).
+    ///
+    /// `worktree_base` is deliberately mandatory rather than defaulted: a test that forgot it would
+    /// otherwise provision into the developer's real `~/.local/share/clowder/worktrees`.
     pub fn new_with_paths(
         notifier: Arc<dyn Notifier>,
         hook_sock: PathBuf,
         registry_path: PathBuf,
         projects_path: PathBuf,
+        worktree_base: PathBuf,
     ) -> Daemon {
+        // ONE layout, shared with the ProjectStore — see the `worktrees` field.
+        let worktrees = clowder_workspace::WorktreeLayout::new(worktree_base);
         let (attention_tx, _) = broadcast::channel(256);
         let (removed_tx, _) = broadcast::channel(256);
         let (split_tx, _) = broadcast::channel(256);
@@ -144,7 +156,8 @@ impl Daemon {
             default_rows: 24,
             shell: std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()),
             registry: Arc::new(crate::registry::Registry::new(registry_path)),
-            projects: Arc::new(crate::projects::ProjectStore::new(projects_path)),
+            projects: Arc::new(crate::projects::ProjectStore::new(projects_path, worktrees.clone())),
+            worktrees,
             projects_tx,
             project_terms: Arc::new(Mutex::new(HashMap::new())),
             term_project: Arc::new(Mutex::new(HashMap::new())),
@@ -157,7 +170,16 @@ impl Daemon {
     /// Build a daemon whose pane defaults (sockets already resolved into `hook_sock`, backlog cap,
     /// shell, pane size) come from `clowder-config`. Uses `OsNotifier` like `new()`.
     pub fn new_from_config(config: clowder_config::Config) -> Daemon {
-        let mut d = Daemon::new_with(Arc::new(OsNotifier), config.hook_sock);
+        // Deliberately NOT via `new_with`: the worktree base has to reach `new_with_paths` so the
+        // ProjectStore is built from it. Patching a field afterwards would leave the already-built
+        // store on the default base — exactly the drift the shared layout exists to prevent.
+        let mut d = Daemon::new_with_paths(
+            Arc::new(OsNotifier),
+            config.hook_sock,
+            crate::registry::Registry::default_path(),
+            crate::projects::ProjectStore::default_path(),
+            config.worktree_base,
+        );
         d.backlog_cap = config.backlog_cap;
         d.default_cols = config.default_cols;
         d.default_rows = config.default_rows;
@@ -506,18 +528,23 @@ impl Daemon {
         // Fail on a collision with a clear message instead of a raw `git worktree add` error.
         // reconcile prunes a registry record when resume fails but leaves the worktree on disk,
         // so an untracked directory here is a real case, not a hypothetical.
-        let wt = project.join(".clowder").join("worktrees").join(name);
+        //
+        // Note this only looks under the CURRENT base, so editing `[worktrees] base` leaves a
+        // name colliding with a worktree under the old base uncaught here. `branch_exists` still
+        // catches it for git; for jj it may not, since `land` sets a jj bookmark while
+        // `branch_exists` shells out to `git show-ref`. Pre-existing weakness, marginally widened.
+        let wt = self.worktrees.worktree_path(&project, name);
         if wt.exists() {
             bail!("a worktree named '{name}' already exists at {} — land/discard it or choose another name", wt.display());
         }
-        if branch_exists(&project, &format!("clowder/{name}")) {
+        if branch_exists(&project, &clowder_workspace::branch_name(name)) {
             bail!("branch clowder/{name} already exists in {} — choose another name", project.display());
         }
 
         let task = name;
         let id = self.alloc_id();
         let driver = driver_for(&project);
-        let ws = driver.provision(&project, task)?;
+        let ws = driver.provision(&self.worktrees, &project, task)?;
 
         // If any post-provision step fails (e.g. the agent binary isn't on PATH), tear down
         // the freshly-provisioned worktree/branch instead of leaking it — otherwise a retry
@@ -715,6 +742,14 @@ impl Daemon {
                     // `restart_worktree` refuses anything that is not Exited.
                     self.set_attention(pane, AttentionState::Exited);
                     return r;
+                }
+                if r.is_ok() {
+                    // The project's worktree dir is ours and is empty once its last worktree goes.
+                    // Non-recursive on purpose: it fails harmlessly while any sibling remains, so
+                    // no emptiness check is needed. Also tidies the pre-#65 in-repo parent.
+                    if let Some(parent) = ws.path.parent() {
+                        let _ = std::fs::remove_dir(parent);
+                    }
                 }
                 r
             }
@@ -1203,7 +1238,7 @@ fn branch_exists(project: &Path, branch: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::init_repo;
+    use crate::test_support::{init_repo, init_repo_at};
     use std::time::Duration;
 
     fn sh(script: &str) -> PaneCommand {
@@ -1484,6 +1519,7 @@ mod tests {
             std::path::PathBuf::from("/tmp/unused-listagents.sock"),
             state.path().join("agents.json"),
             state.path().join("projects.json"),
+            state.path().join("worktrees"),
         ));
         daemon.add_project(repo.path()).unwrap();
         let adapter = SyntheticAdapter {
@@ -1537,6 +1573,7 @@ mod tests {
             std::path::PathBuf::from("/tmp/unused-m9.sock"),
             statedir.path().join("agents.json"),
             statedir.path().join("projects.json"),
+            statedir.path().join("worktrees"),
         ));
         daemon.add_project(repo.path()).unwrap();
         let adapter = SyntheticAdapter {
@@ -1588,6 +1625,7 @@ mod tests {
             std::path::PathBuf::from("/tmp/unused-reconcile1.sock"),
             state_path.clone(),
             projects_path.clone(),
+            statedir.path().join("worktrees"),
         ));
         daemon.add_project(repo.path()).unwrap();
         let adapter = SyntheticAdapter {
@@ -1609,6 +1647,7 @@ mod tests {
             std::path::PathBuf::from("/tmp/unused-reconcile2.sock"),
             state_path.clone(),
             projects_path.clone(),
+            statedir.path().join("worktrees"),
         ));
         d2.reconcile();
         let list = d2.list_worktrees();
@@ -1629,6 +1668,7 @@ mod tests {
             std::path::PathBuf::from("/tmp/unused-reconcile3.sock"),
             state_path.clone(),
             projects_path.clone(),
+            statedir.path().join("worktrees"),
         ));
         d3.reconcile();
         assert!(
@@ -1672,6 +1712,7 @@ mod tests {
             std::path::PathBuf::from("/tmp/unused-restore1.sock"),
             state_path.clone(),
             projects_path.clone(),
+            statedir.path().join("worktrees"),
         ));
         d1.add_project(repo.path()).unwrap();
         let adapter = SyntheticAdapter {
@@ -1693,6 +1734,7 @@ mod tests {
             std::path::PathBuf::from("/tmp/unused-restore2.sock"),
             state_path,
             projects_path,
+            statedir.path().join("worktrees"),
         ));
         d2.reconcile();
 
@@ -1738,6 +1780,7 @@ mod tests {
             std::path::PathBuf::from("/tmp/unused-persist.sock"),
             state_path.clone(),
             statedir.path().join("projects.json"),
+            statedir.path().join("worktrees"),
         ));
         daemon.add_project(repo.path()).unwrap();
         let adapter = SyntheticAdapter {
@@ -1788,6 +1831,7 @@ mod tests {
             std::path::PathBuf::from("/tmp/unused-control.sock"),
             state.path().join("agents.json"),
             state.path().join("projects.json"),
+            state.path().join("worktrees"),
         ));
         daemon.add_project(repo.path()).unwrap();
         let adapter = SyntheticAdapter {
@@ -1857,6 +1901,7 @@ mod tests {
             std::path::PathBuf::from("/tmp/unused-reaper.sock"),
             state.path().join("agents.json"),
             state.path().join("projects.json"),
+            state.path().join("worktrees"),
         ));
         daemon.add_project(repo.path()).unwrap();
         let adapter = SyntheticAdapter {
@@ -1907,6 +1952,7 @@ mod tests {
             std::path::PathBuf::from("/tmp/unused-teardown-race.sock"),
             state.path().join("agents.json"),
             state.path().join("projects.json"),
+            state.path().join("worktrees"),
         ));
         daemon.add_project(repo.path()).unwrap();
         let adapter = SyntheticAdapter {
@@ -1952,6 +1998,7 @@ mod tests {
             std::path::PathBuf::from("/tmp/unused-removed.sock"),
             state.path().join("agents.json"),
             state.path().join("projects.json"),
+            state.path().join("worktrees"),
         ));
         daemon.add_project(repo.path()).unwrap();
         let adapter = SyntheticAdapter {
@@ -2000,6 +2047,7 @@ mod tests {
             std::path::PathBuf::from("/tmp/unused-split-tree.sock"),
             state.path().join("agents.json"),
             state.path().join("projects.json"),
+            state.path().join("worktrees"),
         ));
         daemon.add_project(repo.path()).unwrap();
         (daemon, repo, state)
@@ -2279,6 +2327,7 @@ mod tests {
             std::path::PathBuf::from("/tmp/unused-jj.sock"),
             state.path().join("agents.json"),
             state.path().join("projects.json"),
+            state.path().join("worktrees"),
         ));
         daemon.add_project(repo.path()).unwrap();
         let adapter = SyntheticAdapter {
@@ -2487,6 +2536,7 @@ mod tests {
             std::path::PathBuf::from("/tmp/unused-ratio.sock"),
             state_path.clone(),
             statedir.path().join("projects.json"),
+            statedir.path().join("worktrees"),
         ));
         daemon.add_project(repo.path()).unwrap();
         let adapter = SyntheticAdapter {
@@ -2546,6 +2596,7 @@ mod tests {
             std::path::PathBuf::from("/tmp/unused-collide1.sock"),
             state_path.clone(),
             projects_path.clone(),
+            statedir.path().join("worktrees"),
         ));
         d1.add_project(repo.path()).unwrap();
         let adapter = SyntheticAdapter {
@@ -2566,6 +2617,7 @@ mod tests {
             std::path::PathBuf::from("/tmp/unused-collide2.sock"),
             state_path,
             projects_path,
+            statedir.path().join("worktrees"),
         ));
         d2.reconcile();
 
@@ -2610,6 +2662,7 @@ mod tests {
             std::path::PathBuf::from("/tmp/unused-nolt1.sock"),
             state_path.clone(),
             projects_path.clone(),
+            statedir.path().join("worktrees"),
         ));
         d1.add_project(repo.path()).unwrap();
         let adapter = SyntheticAdapter {
@@ -2626,6 +2679,7 @@ mod tests {
             std::path::PathBuf::from("/tmp/unused-nolt2.sock"),
             state_path,
             projects_path,
+            statedir.path().join("worktrees"),
         ));
         d2.reconcile();
         assert_eq!(d2.split_tree_of(id), Some(clowder_proto::PaneTree::Leaf { pane: id }));
@@ -2745,6 +2799,7 @@ mod tests {
             "/tmp/unused-vt1.sock".into(),
             statedir.path().join("agents.json"),
             statedir.path().join("projects.json"),
+            statedir.path().join("worktrees"),
         );
         d.content_idle = Duration::from_millis(40);
         let daemon = Arc::new(d);
@@ -2799,6 +2854,7 @@ mod tests {
             "/tmp/unused-vt.sock".into(),
             statedir.path().join("agents.json"),
             statedir.path().join("projects.json"),
+            statedir.path().join("worktrees"),
         );
         d.content_idle = Duration::from_millis(40);
         let daemon = Arc::new(d);
@@ -2861,7 +2917,17 @@ mod tests {
             std::path::PathBuf::from("/tmp/unused-m10b.sock"),
             dir.join("agents.json"),
             dir.join("projects.json"),
+            dir.join("worktrees"),
         ))
+    }
+
+    /// Where `d` will provision worktree `name` of `repo`.
+    ///
+    /// Canonicalizes the repo, which is load-bearing: `spawn_agent` canonicalizes before the path
+    /// is hashed, and on macOS a tempdir is `/var/...` while its canonical form is `/private/var/...`
+    /// — those hash to different directories.
+    fn wt_path(d: &Daemon, repo: &tempfile::TempDir, name: &str) -> std::path::PathBuf {
+        d.worktrees.worktree_path(&repo.path().canonicalize().unwrap(), name)
     }
 
     #[tokio::test]
@@ -3088,7 +3154,8 @@ mod tests {
 
         let e = d.spawn_agent(repo.path(), &adapter, "feat").unwrap_err().to_string();
         assert!(e.contains("unknown project"), "unhelpful message: {e}");
-        assert!(!repo.path().join(".clowder/worktrees/feat").exists(), "must not leave a worktree");
+        assert!(!wt_path(&d, &repo, "feat").exists(), "must not leave a worktree");
+        assert!(!repo.path().join(".clowder").exists(), "must not touch the project");
         let branches = std::process::Command::new("git").arg("-C").arg(repo.path())
             .args(["branch", "--list", "clowder/feat"]).output().unwrap();
         assert!(branches.stdout.is_empty(), "must not leave a branch");
@@ -3106,7 +3173,8 @@ mod tests {
             program: "/bin/sh".into(), args: vec!["-c".into(), "sleep 30".into()], cwd: None, env: vec![] } };
         let e = d.spawn_agent(repo.path(), &adapter, "my feature").unwrap_err().to_string();
         assert!(e.contains("letters"), "should be the name-validation message: {e}");
-        assert!(!repo.path().join(".clowder/worktrees").exists());
+        assert!(!d.worktrees.project_dir(&repo.path().canonicalize().unwrap()).exists());
+        assert!(!repo.path().join(".clowder").exists());
     }
 
     #[tokio::test]
@@ -3117,12 +3185,112 @@ mod tests {
         let d = test_daemon_in(state.path());
         d.add_project(repo.path()).unwrap();
         // Simulate reconcile's orphan: a worktree dir on disk that the daemon knows nothing about.
-        std::fs::create_dir_all(repo.path().join(".clowder/worktrees/feat")).unwrap();
+        // `wt_path` canonicalizes the repo, which is load-bearing: `spawn_agent` canonicalizes
+        // before hashing, so seeding at the raw tempdir path (/var/... vs /private/var/... on
+        // macOS) would hash to a DIFFERENT directory, the collision would never be seen, and this
+        // test would silently pass through to `git worktree add` and fail on the message assert.
+        std::fs::create_dir_all(wt_path(&d, &repo, "feat")).unwrap();
         let adapter = SyntheticAdapter { command: crate::PaneCommand {
             program: "/bin/sh".into(), args: vec!["-c".into(), "sleep 30".into()], cwd: None, env: vec![] } };
         let e = d.spawn_agent(repo.path(), &adapter, "feat").unwrap_err().to_string();
         assert!(e.contains("already exists"), "should name the collision, not a raw git error: {e}");
         assert!(!e.contains("fatal:"), "must not surface a raw git error: {e}");
+    }
+
+    #[tokio::test]
+    async fn spawn_puts_the_worktree_under_the_base_and_leaves_the_project_untouched() {
+        use crate::SyntheticAdapter;
+        let state = tempfile::tempdir().unwrap();
+        let repo = init_repo();
+        let d = test_daemon_in(state.path());
+        d.add_project(repo.path()).unwrap();
+        let adapter = SyntheticAdapter { command: crate::PaneCommand {
+            program: "/bin/sh".into(), args: vec!["-c".into(), "sleep 30".into()], cwd: None, env: vec![] } };
+
+        let pane = d.spawn_agent(repo.path(), &adapter, "feat").unwrap();
+        let ws = d.workspace_of(pane).unwrap();
+
+        assert_eq!(ws.path, wt_path(&d, &repo, "feat"));
+        assert!(ws.path.starts_with(d.worktrees.base()), "{:?} not under the base", ws.path);
+        assert!(!ws.path.starts_with(repo.path().canonicalize().unwrap()), "still inside the project");
+        // The whole point of #65.
+        assert!(!repo.path().join(".clowder").exists(), "project directory must be untouched");
+        assert!(ws.path.join("README.md").is_file(), "still a real worktree");
+        d.shutdown();
+    }
+
+    #[tokio::test]
+    async fn two_projects_with_the_same_basename_get_separate_worktrees() {
+        use crate::SyntheticAdapter;
+        let state = tempfile::tempdir().unwrap();
+        // Two DIFFERENT repos that are both called `api` — the case a basename-only layout breaks.
+        let (outer_a, outer_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (a, b) = (init_repo_at(&outer_a.path().join("api")), init_repo_at(&outer_b.path().join("api")));
+        assert_eq!(a.file_name(), b.file_name());
+
+        let d = test_daemon_in(state.path());
+        d.add_project(&a).unwrap();
+        d.add_project(&b).unwrap();
+        let adapter = SyntheticAdapter { command: crate::PaneCommand {
+            program: "/bin/sh".into(), args: vec!["-c".into(), "sleep 30".into()], cwd: None, env: vec![] } };
+
+        let pa = d.spawn_agent(&a, &adapter, "feat").unwrap();
+        let pb = d.spawn_agent(&b, &adapter, "feat").unwrap();      // same task name, other project
+        let (wa, wb) = (d.workspace_of(pa).unwrap().path, d.workspace_of(pb).unwrap().path);
+
+        assert_ne!(wa, wb, "same-named projects must not share a worktree dir");
+        assert!(wa.is_dir() && wb.is_dir(), "both worktrees must exist");
+        // Both stay recognisable as `api` — only the hash differs.
+        for w in [&wa, &wb] {
+            let dir = w.parent().unwrap().file_name().unwrap().to_string_lossy().into_owned();
+            assert!(dir.starts_with("api-"), "{dir}");
+        }
+        d.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_provisioned_worktree_cannot_be_added_as_a_project() {
+        // Guards against the daemon and its ProjectStore drifting onto different bases — the exact
+        // failure `new_from_config` would have had if it patched a field instead of passing the
+        // base to `new_with_paths`.
+        use crate::SyntheticAdapter;
+        let state = tempfile::tempdir().unwrap();
+        let repo = init_repo();
+        let d = test_daemon_in(state.path());
+        d.add_project(repo.path()).unwrap();
+        let adapter = SyntheticAdapter { command: crate::PaneCommand {
+            program: "/bin/sh".into(), args: vec!["-c".into(), "sleep 30".into()], cwd: None, env: vec![] } };
+
+        let pane = d.spawn_agent(repo.path(), &adapter, "feat").unwrap();
+        let ws = d.workspace_of(pane).unwrap();
+        let e = d.add_project(&ws.path).unwrap_err().to_string();
+        assert!(e.contains("worktree"), "unhelpful message: {e}");
+        d.shutdown();
+    }
+
+    #[tokio::test]
+    async fn landing_the_last_worktree_removes_the_empty_project_dir() {
+        use crate::SyntheticAdapter;
+        let state = tempfile::tempdir().unwrap();
+        let repo = init_repo();
+        let d = test_daemon_in(state.path());
+        d.add_project(repo.path()).unwrap();
+        let adapter = SyntheticAdapter { command: crate::PaneCommand {
+            program: "/bin/sh".into(), args: vec!["-c".into(), "sleep 30".into()], cwd: None, env: vec![] } };
+        let canonical = repo.path().canonicalize().unwrap();
+
+        let p1 = d.spawn_agent(repo.path(), &adapter, "one").unwrap();
+        let p2 = d.spawn_agent(repo.path(), &adapter, "two").unwrap();
+        let project_dir = d.worktrees.project_dir(&canonical);
+        assert!(project_dir.is_dir());
+
+        d.land_agent(p1).unwrap();
+        assert!(project_dir.is_dir(), "a sibling worktree remains — dir must survive");
+
+        d.land_agent(p2).unwrap();
+        assert!(!project_dir.exists(), "last worktree gone — empty project dir should be removed");
+        assert!(d.worktrees.base().is_dir(), "the base itself is never removed");
+        d.shutdown();
     }
 
     #[tokio::test]

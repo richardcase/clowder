@@ -74,6 +74,9 @@ mod tests {
     use super::*;
     use std::path::Path;
 
+    /// A PRE-#65 record: `worktree_path` is the old in-repo location. Left that way deliberately —
+    /// worktrees are not migrated, so the registry must keep round-tripping records like this, and
+    /// `resume_agent` must keep resuming from the stored path rather than re-deriving it.
     fn rec(id: u64) -> AgentRecord {
         AgentRecord {
             agent_id: id, project: PathBuf::from("/p"), task: "t".into(),
