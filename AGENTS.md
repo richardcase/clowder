@@ -52,6 +52,7 @@ cd macos && swift build -c release
 | `build-app.sh` | Build release binaries + app, assemble `dist/Clowder.app` (bundles `clowder-daemon`/`clowder`/`clowder-hook`) | `scripts/build-app.sh [out-dir]` |
 | `set-version.sh` | Set the version everywhere from `VERSION` (Cargo `[workspace.package]` + refresh `Cargo.lock`) | `scripts/set-version.sh <X.Y.Z>` |
 | `gen-icon.swift` | Render the placeholder app icon PNG (called by `build-app.sh`) | `swift scripts/gen-icon.swift <out.png> [size]` |
+| `check-commit-messages.sh` | Verify this branch's non-merge commits are Conventional Commits (CI runs it on every PR) | `scripts/check-commit-messages.sh [base] [head]` |
 
 ## Runtime model
 
@@ -103,3 +104,9 @@ An optional remote TCP listener (`[remote] listen`/`host`) can be hardened with 
 - The design/implementation workflow lives in `docs/superpowers/` — **spec → plan → subagent-driven
   execution → PR**, one milestone per cycle. Read the relevant spec/plan before non-trivial changes.
 - Work on feature branches; open a PR into `main`; keep CI green. Don't commit to `main` directly.
+- **Commit messages are Conventional Commits** — `type(scope): subject`, with `type` one of `feat`,
+  `fix`, `docs`, `test`, `refactor`, `perf`, `ci`, `chore`, `build`, `style`, `revert`; scope
+  optional and free-form (`daemon`, `app`, `m10c`, `proto,daemon` are all fine); `!` before the colon
+  for a breaking change. PRs merge with a merge commit, so **every** commit on the branch keeps its
+  subject in `main`'s history — CI checks them individually. Run
+  `scripts/check-commit-messages.sh` before pushing.

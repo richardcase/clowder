@@ -11,6 +11,28 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Cheap, parallel gate: a bad commit subject fails in seconds without burning macOS minutes.
+  # PR-only — commits reaching `main` have already been through this on their PR.
+  commit-lint:
+    name: commit messages (conventional commits)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # merge-base needs real history; the default depth-1 checkout has none.
+          fetch-depth: 0
+
+      # Pass the SHAs explicitly: on `pull_request`, actions/checkout checks out the *merge* ref,
+      # so HEAD is not the branch tip.
+      - name: Check commit messages
+        run: >
+          scripts/check-commit-messages.sh
+          "${{ github.event.pull_request.base.sha }}"
+          "${{ github.event.pull_request.head.sha }}"
+
   build-and-test:
     name: build + test (macOS, unsigned)
     runs-on: macos-15
