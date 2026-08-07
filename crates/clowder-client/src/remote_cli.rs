@@ -140,6 +140,38 @@ pub struct ErrOut {
     pub error: String,
 }
 
+/// One `probe` result as it appears on stdout.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProbeView {
+    pub name: String,
+    pub address: String,
+    pub reachable: bool,
+    pub tls: bool,
+    pub fingerprint: Option<String>,
+    pub pinned_fingerprint: Option<String>,
+    /// `new` | `match` | `changed`, or absent when no certificate was seen.
+    pub fingerprint_match: Option<&'static str>,
+    pub authenticated: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProbeOut {
+    pub probe: ProbeView,
+}
+
+/// How the observed fingerprint relates to the stored pin. `None` when nothing was observed —
+/// a plaintext daemon or a failed handshake is not a "changed" certificate.
+fn fingerprint_match(pinned: Option<&str>, observed: Option<&str>) -> Option<&'static str> {
+    match (pinned, observed) {
+        (_, None) => None,
+        (None, Some(_)) => Some("new"),
+        (Some(p), Some(o)) if p == o => Some("match"),
+        (Some(_), Some(_)) => Some("changed"),
+    }
+}
+
 /// What `run()` prints on failure, and which stream it goes to. A pure value (no I/O, no
 /// `process::exit`) so the mapping from an error to its rendered form is unit-testable directly,
 /// without capturing real stdout/stderr or killing the test process.
@@ -247,6 +279,9 @@ async fn dispatch(flags: &Flags) -> Result<()> {
         Some("add") => cmd_add(flags),
         Some("set") => cmd_set(flags),
         Some("rm") => cmd_rm(flags),
+        Some("probe") => cmd_probe(flags).await,
+        Some("trust") => cmd_trust(flags).await,
+        Some("untrust") => cmd_untrust(flags),
         Some(other) => anyhow::bail!("unknown subcommand {other:?}; usage: clowder remote <list|show|add|set|rm|probe|trust|untrust> …"),
         None => anyhow::bail!("usage: clowder remote <list|show|add|set|rm|probe|trust|untrust> …"),
     }
@@ -379,6 +414,136 @@ fn cmd_rm(flags: &Flags) -> Result<()> {
     Ok(())
 }
 
+/// Reach a daemon and report what it presented. Either a saved host by name, or an as-yet-unsaved
+/// address (`--address`, what the Settings pane's "Test" button needs before the host exists).
+/// Persists NOTHING — that is the whole point of the pairing flow: observing and trusting are
+/// deliberately separate acts, with a human in between.
+async fn cmd_probe(flags: &Flags) -> Result<()> {
+    flags
+        .reject_unknown(&["json", "address", "tls", "no-tls", "token", "token-stdin", "timeout"])
+        .map_err(anyhow::Error::msg)?;
+    let all = merged();
+    let target = match (flags.positional(1), flags.str("address")) {
+        (Some(name), _) => crate::target::resolve_target(Some(name), &all, &Config::load())
+            .map_err(anyhow::Error::msg)?,
+        (None, Some(addr)) => {
+            hosts::validate_address(addr).map_err(anyhow::Error::msg)?;
+            let token = token_from(flags)?;
+            crate::forward::RemoteTarget {
+                label: addr.to_string(),
+                address: addr.to_string(),
+                tls: flags.tristate("tls", "no-tls").map_err(anyhow::Error::msg)?.unwrap_or(token.is_some()),
+                token,
+                fingerprint: None,
+            }
+        }
+        (None, None) => anyhow::bail!("usage: clowder remote probe <name> | --address <host:port>"),
+    };
+    // `probe` bounds the TCP connect, the TLS handshake, and the read-line each by this SAME
+    // timeout value, so one call can take up to ~3x what's passed here — worst case ~9s at the
+    // 3s default. Not a bug in `probe`; just worth knowing before raising this.
+    let secs: u64 = flags
+        .str("timeout")
+        .unwrap_or("3")
+        .parse()
+        .map_err(|_| anyhow::anyhow!("--timeout must be a whole number of seconds"))?;
+    let result = crate::probe::probe(&target, std::time::Duration::from_secs(secs)).await;
+    let pinned = target.fingerprint.clone();
+    let view = ProbeView {
+        name: target.label.clone(),
+        address: target.address.clone(),
+        reachable: result.reachable,
+        tls: target.tls,
+        fingerprint_match: fingerprint_match(pinned.as_deref(), result.fingerprint.as_deref()),
+        fingerprint: result.fingerprint,
+        pinned_fingerprint: pinned,
+        authenticated: result.authenticated,
+        error: result.error,
+    };
+    if flags.bool("json") {
+        println!("{}", serde_json::to_string_pretty(&ProbeOut { probe: view })?);
+    } else {
+        println!("reachable\t{}", view.reachable);
+        println!("tls\t{}", view.tls);
+        println!("fingerprint\t{}", view.fingerprint.as_deref().unwrap_or("-"));
+        println!("match\t{}", view.fingerprint_match.unwrap_or("-"));
+        // A plaintext daemon passes expected_token: None and so accepts ANY token. Saying
+        // "authenticated" there would be a lie.
+        println!(
+            "auth\t{}",
+            if !view.tls {
+                "none (plaintext daemon)"
+            } else if view.authenticated {
+                "token accepted"
+            } else {
+                "token rejected"
+            }
+        );
+        if let Some(e) = &view.error {
+            println!("error\t{e}");
+        }
+    }
+    Ok(())
+}
+
+/// Record the human's pairing decision. Does NOT re-probe unless `--verify` is given — the
+/// probe→trust TOCTOU window is accepted by design: the UI passes back verbatim the fingerprint
+/// it displayed, so a cert swapped in between produces a pin that fails loudly on the very next
+/// connect. `--verify` closes that window at the cost of one more round trip.
+async fn cmd_trust(flags: &Flags) -> Result<()> {
+    flags.reject_unknown(&["json", "fingerprint", "verify"]).map_err(anyhow::Error::msg)?;
+    let name = flags
+        .positional(1)
+        .ok_or_else(|| anyhow::anyhow!("usage: clowder remote trust <name> --fingerprint <hex>"))?
+        .to_string();
+    let fp = flags
+        .str("fingerprint")
+        .ok_or_else(|| anyhow::anyhow!("--fingerprint is required — run `clowder remote probe {name}` first"))?
+        .to_lowercase();
+    let all = merged();
+    find_writable(&all, &name)?;
+    if flags.bool("verify") {
+        let target = crate::target::resolve_target(Some(&name), &all, &Config::load()).map_err(anyhow::Error::msg)?;
+        let r = crate::probe::probe(&target, std::time::Duration::from_secs(3)).await;
+        match r.fingerprint.as_deref() {
+            Some(seen) if seen == fp => {}
+            Some(seen) => anyhow::bail!("--verify failed: the daemon presented {seen}, not {fp}"),
+            None => anyhow::bail!("--verify failed: no certificate was presented ({})", r.error.unwrap_or_default()),
+        }
+    }
+    let record = HostsStore::default_store().try_mutate(|all| {
+        let r = all.iter_mut().find(|r| r.name == name)?;
+        r.fingerprint = Some(fp.clone());
+        Some(r.clone())
+    })?;
+    let record = record.ok_or_else(|| anyhow::anyhow!("unknown host {name:?}"))?;
+    // Also record it the SSH way, so a plain shell `clowder connect <address>` — which has no
+    // registry entry to consult — agrees with the app.
+    record_known_host(&record.address, &fp);
+    report_one(&record, flags.bool("json"))
+}
+
+fn cmd_untrust(flags: &Flags) -> Result<()> {
+    flags.reject_unknown(&["json"]).map_err(anyhow::Error::msg)?;
+    let name = flags.positional(1).ok_or_else(|| anyhow::anyhow!("usage: clowder remote untrust <name>"))?.to_string();
+    find_writable(&merged(), &name)?;
+    let record = HostsStore::default_store().try_mutate(|all| {
+        let r = all.iter_mut().find(|r| r.name == name)?;
+        r.fingerprint = None;
+        Some(r.clone())
+    })?;
+    let record = record.ok_or_else(|| anyhow::anyhow!("unknown host {name:?}"))?;
+    // Same hazard `cmd_rm` guards against: `remote_known_hosts` is keyed on ADDRESS, not name, so
+    // pruning it unconditionally would also un-trust any OTHER entry (registry or the masked
+    // `[remote] host` virtual entry) that dials the same address and still relies on TOFU. Prune
+    // only when no OTHER entry (this one still exists, just unpinned now) still claims the address.
+    let still_used_elsewhere = merged().iter().any(|e| e.record.address == record.address && e.record.name != record.name);
+    if !still_used_elsewhere {
+        prune_known_host(&record.address);
+    }
+    report_one(&record, flags.bool("json"))
+}
+
 fn report_one(record: &HostRecord, json: bool) -> Result<()> {
     let view = HostView::from(&HostEntry { record: record.clone(), source: HostSource::Registry });
     if json {
@@ -401,6 +566,23 @@ fn prune_known_host(address: &str) {
         .map(|l| format!("{l}\n"))
         .collect();
     let _ = std::fs::write(&path, kept);
+}
+
+/// Record `address → fp` in `remote_known_hosts`, replacing any existing line for that address.
+/// Best-effort for the same reason as `prune_known_host`: the registry pin is authoritative.
+fn record_known_host(address: &str, fp: &str) {
+    let path = crate::tofu::known_hosts_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut out: String = existing
+        .lines()
+        .filter(|l| l.split_whitespace().next() != Some(address))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    out.push_str(&format!("{address} {fp}\n"));
+    let _ = std::fs::write(&path, out);
 }
 
 #[cfg(test)]
@@ -608,5 +790,253 @@ mod tests {
         std::env::remove_var("XDG_STATE_HOME");
         std::env::remove_var("CLOWDER_HOSTS_FILE");
         std::env::remove_var("CLOWDER_REMOTE_HOST");
+    }
+
+    #[test]
+    fn fingerprint_match_classifies_against_the_pin() {
+        assert_eq!(fingerprint_match(None, Some("aa11")), Some("new"));
+        assert_eq!(fingerprint_match(Some("aa11"), Some("aa11")), Some("match"));
+        assert_eq!(fingerprint_match(Some("aa11"), Some("bb22")), Some("changed"));
+        // No certificate observed at all (plaintext, or a failed handshake) — not a classification.
+        assert_eq!(fingerprint_match(Some("aa11"), None), None);
+        assert_eq!(fingerprint_match(None, None), None);
+    }
+
+    #[test]
+    fn probe_output_matches_the_golden_fixture() {
+        let out = ProbeOut {
+            probe: ProbeView {
+                name: "studio".into(),
+                address: "studio.tailnet:7777".into(),
+                reachable: true,
+                tls: true,
+                fingerprint: Some("a1b2".into()),
+                pinned_fingerprint: None,
+                fingerprint_match: Some("new"),
+                authenticated: true,
+                error: None,
+            },
+        };
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/protocol/fixtures/remote-probe.json");
+        let want = std::fs::read_to_string(path).expect("fixture readable");
+        assert_eq!(serde_json::to_string_pretty(&out).unwrap().trim(), want.trim());
+    }
+
+    /// Sets up a real TLS `clowder-daemon` on an ephemeral port and returns everything a
+    /// probe/trust test needs to dial it. Mirrors `probe.rs`'s own e2e test setup.
+    async fn spawn_tls_daemon() -> (std::net::SocketAddr, String, String) {
+        use clowder_daemon::{server::Daemon, FakeNotifier};
+        use std::sync::Arc;
+        use tokio::net::TcpListener;
+
+        let creds = clowder_daemon::remote_tls::load_or_generate().unwrap();
+        let token = creds.token.clone();
+        let fp = clowder_daemon::remote_tls::fingerprint(&creds);
+        let tls = clowder_daemon::remote::build_remote_tls(&creds).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let daemon = Arc::new(Daemon::new_with(
+            Arc::new(FakeNotifier::new()),
+            std::path::PathBuf::from("/tmp/unused-m11a-remotecli.sock"),
+        ));
+        tokio::spawn(daemon.serve_remote(listener, Some(tls)));
+        (addr, token, fp)
+    }
+
+    #[tokio::test]
+    async fn cmd_probe_persists_nothing() {
+        // The whole point of the pairing flow: probing must never write the registry or
+        // known_hosts, even against a real TLS daemon that authenticates successfully.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_STATE_HOME", dir.path());
+        std::env::set_var("CLOWDER_HOSTS_FILE", dir.path().join("hosts.json"));
+
+        let (addr, token, _fp) = spawn_tls_daemon().await;
+        HostsStore::default_store()
+            .try_mutate(|all| {
+                all.push(HostRecord {
+                    name: "studio".into(),
+                    address: addr.to_string(),
+                    tls: true,
+                    token: Some(token),
+                    fingerprint: None,
+                })
+            })
+            .unwrap();
+
+        let kh = crate::tofu::known_hosts_path();
+        std::fs::create_dir_all(kh.parent().unwrap()).unwrap();
+        let sentinel = "sentinel-host aa11\n";
+        std::fs::write(&kh, sentinel).unwrap();
+        let before = HostsStore::default_store().load();
+
+        let flags = parse_flags(&args(&["probe", "studio", "--json"])).unwrap();
+        cmd_probe(&flags).await.unwrap();
+
+        assert_eq!(HostsStore::default_store().load(), before, "probe must not touch the registry");
+        assert_eq!(
+            std::fs::read_to_string(&kh).unwrap(),
+            sentinel,
+            "probe must not touch known_hosts"
+        );
+
+        std::env::remove_var("XDG_STATE_HOME");
+        std::env::remove_var("CLOWDER_HOSTS_FILE");
+    }
+
+    #[tokio::test]
+    async fn cmd_trust_records_the_pin_and_the_known_hosts_line() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_STATE_HOME", dir.path());
+        std::env::set_var("CLOWDER_HOSTS_FILE", dir.path().join("hosts.json"));
+
+        HostsStore::default_store()
+            .try_mutate(|all| {
+                all.push(HostRecord {
+                    name: "studio".into(),
+                    address: "10.0.0.5:7777".into(),
+                    tls: true,
+                    token: None,
+                    fingerprint: None,
+                })
+            })
+            .unwrap();
+
+        let flags = parse_flags(&args(&["trust", "studio", "--fingerprint", "AA11BB22"])).unwrap();
+        cmd_trust(&flags).await.unwrap();
+
+        let loaded = HostsStore::default_store().load();
+        assert_eq!(loaded[0].fingerprint.as_deref(), Some("aa11bb22"), "must lowercase the fingerprint");
+
+        // `remote_known_hosts` must agree with the registry pin, so a bare `clowder connect
+        // 10.0.0.5:7777` (which has no registry entry to consult) trusts the same fingerprint.
+        let kh = std::fs::read_to_string(crate::tofu::known_hosts_path()).unwrap();
+        assert!(kh.contains("10.0.0.5:7777 aa11bb22"), "known_hosts line missing: {kh:?}");
+
+        std::env::remove_var("XDG_STATE_HOME");
+        std::env::remove_var("CLOWDER_HOSTS_FILE");
+    }
+
+    #[tokio::test]
+    async fn cmd_trust_verify_on_a_mismatch_refuses_and_writes_nothing() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_STATE_HOME", dir.path());
+        std::env::set_var("CLOWDER_HOSTS_FILE", dir.path().join("hosts.json"));
+
+        let (addr, token, _real_fp) = spawn_tls_daemon().await;
+        HostsStore::default_store()
+            .try_mutate(|all| {
+                all.push(HostRecord {
+                    name: "studio".into(),
+                    address: addr.to_string(),
+                    tls: true,
+                    token: Some(token),
+                    fingerprint: None,
+                })
+            })
+            .unwrap();
+        let before = HostsStore::default_store().load();
+        let kh = crate::tofu::known_hosts_path();
+        std::fs::create_dir_all(kh.parent().unwrap()).unwrap();
+        let sentinel = "sentinel-host aa11\n";
+        std::fs::write(&kh, sentinel).unwrap();
+
+        // A fingerprint that does not match what the daemon actually presents.
+        let flags = parse_flags(&args(&["trust", "studio", "--fingerprint", "deadbeef", "--verify"])).unwrap();
+        let err = cmd_trust(&flags).await.unwrap_err();
+        assert!(err.to_string().contains("--verify failed"), "unexpected error: {err}");
+
+        assert_eq!(HostsStore::default_store().load(), before, "a failed --verify must write nothing to the registry");
+        assert_eq!(
+            std::fs::read_to_string(&kh).unwrap(),
+            sentinel,
+            "a failed --verify must write nothing to known_hosts"
+        );
+
+        std::env::remove_var("XDG_STATE_HOME");
+        std::env::remove_var("CLOWDER_HOSTS_FILE");
+    }
+
+    #[test]
+    fn cmd_untrust_clears_the_pin_and_prunes_the_known_hosts_line() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_STATE_HOME", dir.path());
+        std::env::set_var("CLOWDER_HOSTS_FILE", dir.path().join("hosts.json"));
+
+        HostsStore::default_store()
+            .try_mutate(|all| {
+                all.push(HostRecord {
+                    name: "studio".into(),
+                    address: "10.0.0.5:7777".into(),
+                    tls: true,
+                    token: None,
+                    fingerprint: Some("aa11bb22".into()),
+                })
+            })
+            .unwrap();
+        let kh = crate::tofu::known_hosts_path();
+        std::fs::create_dir_all(kh.parent().unwrap()).unwrap();
+        std::fs::write(&kh, "10.0.0.5:7777 aa11bb22\nother:1 cc33\n").unwrap();
+
+        let flags = parse_flags(&args(&["untrust", "studio"])).unwrap();
+        cmd_untrust(&flags).unwrap();
+
+        let loaded = HostsStore::default_store().load();
+        assert_eq!(loaded[0].fingerprint, None, "the registry pin must be cleared");
+        let kept = std::fs::read_to_string(&kh).unwrap();
+        assert!(!kept.contains("10.0.0.5:7777"), "the known_hosts line for this address must be pruned: {kept:?}");
+        assert!(kept.contains("other:1 cc33"), "unrelated lines must survive: {kept:?}");
+
+        std::env::remove_var("XDG_STATE_HOME");
+        std::env::remove_var("CLOWDER_HOSTS_FILE");
+    }
+
+    #[test]
+    fn cmd_untrust_does_not_prune_a_known_hosts_line_still_used_by_another_entry_at_the_same_address() {
+        // Same hazard `cmd_rm` guards against: `remote_known_hosts` is keyed on ADDRESS, not
+        // name. Two registry nicknames can share one address; untrusting one must not silently
+        // un-trust the other, which may still be relying on that TOFU line.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_STATE_HOME", dir.path());
+        std::env::set_var("CLOWDER_HOSTS_FILE", dir.path().join("hosts.json"));
+
+        HostsStore::default_store()
+            .try_mutate(|all| {
+                all.push(HostRecord {
+                    name: "studio".into(),
+                    address: "10.0.0.5:7777".into(),
+                    tls: true,
+                    token: None,
+                    fingerprint: Some("aa11bb22".into()),
+                });
+                all.push(HostRecord {
+                    name: "studio-alt".into(),
+                    address: "10.0.0.5:7777".into(),
+                    tls: true,
+                    token: None,
+                    fingerprint: None, // relies on the shared TOFU line
+                });
+            })
+            .unwrap();
+        let kh = crate::tofu::known_hosts_path();
+        std::fs::create_dir_all(kh.parent().unwrap()).unwrap();
+        std::fs::write(&kh, "10.0.0.5:7777 aa11bb22\n").unwrap();
+
+        let flags = parse_flags(&args(&["untrust", "studio"])).unwrap();
+        cmd_untrust(&flags).unwrap();
+
+        let kept = std::fs::read_to_string(&kh).unwrap();
+        assert!(
+            kept.contains("10.0.0.5:7777"),
+            "untrusting 'studio' must not un-trust 'studio-alt', which still dials the same address: {kept:?}"
+        );
+
+        std::env::remove_var("XDG_STATE_HOME");
+        std::env::remove_var("CLOWDER_HOSTS_FILE");
     }
 }
