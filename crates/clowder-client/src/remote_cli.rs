@@ -32,7 +32,8 @@ pub fn parse_flags(args: &[String]) -> Result<Flags, String> {
                 return Err(format!("malformed flag {a:?}"));
             }
             let value = match inline {
-                Some(v) => Some(v),
+                Some(v) if VALUE_FLAGS.contains(&key.as_str()) => Some(v),
+                Some(_) => return Err(format!("--{key} does not take a value")),
                 None if VALUE_FLAGS.contains(&key.as_str()) => {
                     i += 1;
                     Some(
@@ -62,6 +63,7 @@ impl Flags {
     }
 
     /// True when the flag is present at all, regardless of whether it carried a value.
+    /// Note: if a flag is repeated (e.g., `--token t1 --token t2`), the last value wins.
     pub fn bool(&self, key: &str) -> bool {
         self.flags.contains_key(key)
     }
@@ -144,5 +146,16 @@ mod tests {
     fn a_bare_double_dash_flag_with_an_empty_name_is_an_error() {
         assert!(parse_flags(&args(&["--"])).is_err());
         assert!(parse_flags(&args(&["--=x"])).is_err());
+    }
+
+    #[test]
+    fn a_boolean_flag_with_an_inline_value_is_an_error() {
+        // `--tls=false` must be an error because `tls` is not in VALUE_FLAGS.
+        // Users must use `--tls` (enable) or `--no-tls` (disable), never an `=` value.
+        let err = parse_flags(&args(&["--tls=false"])).unwrap_err();
+        assert!(err.contains("does not take a value"), "must reject --tls=false: {err}");
+        // Verify that `--tls` alone still works and yields true
+        let f = parse_flags(&args(&["--tls"])).unwrap();
+        assert!(f.bool("tls"));
     }
 }
