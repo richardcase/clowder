@@ -205,7 +205,7 @@ mod tests {
         std::env::remove_var("XDG_STATE_HOME");
     }
 
-    use std::sync::{Arc, Mutex};
+    use std::sync::Mutex;
 
     /// Build a real self-signed cert so the verifier sees a genuine DER, not a fabricated one.
     fn a_cert() -> (Vec<u8>, String) {
@@ -243,23 +243,59 @@ mod tests {
     #[test]
     fn pinned_never_touches_known_hosts() {
         // This is the whole point of pairing: a pinned entry must not consult, and must not
-        // silently record into, the TOFU file.
+        // silently record into, the TOFU file. `Trust::Pinned` carries no path field, so a
+        // "does some made-up path exist" assertion can never fail — it wouldn't catch a
+        // regression that mistakenly called `check(&known_hosts_path(), ...)` from the Pinned
+        // arm. Route `known_hosts_path()` itself into a scratch dir via `XDG_STATE_HOME`,
+        // pre-populate it with known content, and assert that content survives byte-for-byte.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
-        let kh = dir.path().join("known_hosts");
+        std::env::set_var("XDG_STATE_HOME", dir.path());
+
+        // The pre-populated path and the resolved `known_hosts_path()` are the same path under
+        // this XDG_STATE_HOME setup, so one write-target and one assertion cover both.
+        let kh = known_hosts_path();
+        std::fs::create_dir_all(kh.parent().unwrap()).unwrap();
+        let sentinel = "sentinel-host aa11\n";
+        std::fs::write(&kh, sentinel).unwrap();
+
         let (der, fp) = a_cert();
         assert!(verify(Trust::Pinned(fp), &der).is_ok());
-        assert!(!kh.exists(), "Pinned must not write known_hosts");
+
+        assert_eq!(
+            std::fs::read_to_string(&kh).unwrap(),
+            sentinel,
+            "Pinned must not write known_hosts"
+        );
+        std::env::remove_var("XDG_STATE_HOME");
     }
 
     #[test]
     fn capture_accepts_anything_and_publishes_the_fingerprint_without_persisting() {
+        // Same rationale as `pinned_never_touches_known_hosts`: `Trust::Capture` carries no path
+        // field either, so route `known_hosts_path()` into a scratch dir and prove pre-existing
+        // content survives untouched, rather than asserting a made-up path stays absent.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
-        let kh = dir.path().join("known_hosts");
+        std::env::set_var("XDG_STATE_HOME", dir.path());
+
+        // Same path as `known_hosts_path()` under this XDG_STATE_HOME setup — see comment above.
+        let kh = known_hosts_path();
+        std::fs::create_dir_all(kh.parent().unwrap()).unwrap();
+        let sentinel = "sentinel-host aa11\n";
+        std::fs::write(&kh, sentinel).unwrap();
+
         let (der, fp) = a_cert();
         let sink: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         assert!(verify(Trust::Capture(sink.clone()), &der).is_ok());
         assert_eq!(sink.lock().unwrap().as_deref(), Some(fp.as_str()));
-        assert!(!kh.exists(), "a probe must persist nothing");
+
+        assert_eq!(
+            std::fs::read_to_string(&kh).unwrap(),
+            sentinel,
+            "a probe must persist nothing"
+        );
+        std::env::remove_var("XDG_STATE_HOME");
     }
 
     #[test]
