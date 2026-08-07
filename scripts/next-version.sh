@@ -230,26 +230,30 @@ total=0
 releasable=0
 unparsed=0
 detail=''
-while IFS= read -r subject; do
-  [ -n "$subject" ] || continue
+while IFS= read -r sha; do
+  [ -n "$sha" ] || continue
+  subject="$(git log -1 --format=%s "$sha")"
   total=$((total + 1))
   if ! cc_parse "$subject"; then
     unparsed=$((unparsed + 1))
     detail="${detail}$(printf '  %-6s  %s' '--' "$subject")"$'\n'
     continue
   fi
-  kind="$(bump_for_type "$CC_TYPE" "$CC_BREAKING")"
+  # A `BREAKING CHANGE:` / `BREAKING-CHANGE:` footer is equivalent to `!`. This repo has none in
+  # 300+ commits, but the spec allows it and ignoring it would silently under-bump.
+  #
+  # Checked PER COMMIT rather than once across the range: a range-wide grep cannot tell which commit
+  # carried the footer, so it could only add to `releasable` blindly — double-counting a commit that
+  # was already releasable, and reporting more releasable commits than there are commits.
+  breaking="$CC_BREAKING"
+  if [ "$breaking" = 0 ] && git log -1 --format=%b "$sha" | grep -Eq '^BREAKING[ -]CHANGE:'; then
+    breaking=1
+  fi
+  kind="$(bump_for_type "$CC_TYPE" "$breaking")"
   [ "$kind" = none ] || releasable=$((releasable + 1))
   if [ "$(rank "$kind")" -gt "$(rank "$best")" ]; then best="$kind"; fi
   detail="${detail}$(printf '  %-6s  %s' "$kind" "$subject")"$'\n'
-done < <(git log --no-merges --format='%s' "$RANGE")
-
-# A `BREAKING CHANGE:` / `BREAKING-CHANGE:` footer is equivalent to `!`. This repo has none in 300+
-# commits, but the spec allows it and ignoring it would silently under-bump.
-if git log --no-merges --format='%b' "$RANGE" | grep -Eq '^BREAKING[ -]CHANGE:'; then
-  best=major
-  releasable=$((releasable + 1))
-fi
+done < <(git rev-list --no-merges "$RANGE")
 
 if [ -n "$OVERRIDE" ]; then
   [[ $OVERRIDE =~ $SEMVER_RE ]] || die "--override '$OVERRIDE' is not semver X.Y.Z[-id]"

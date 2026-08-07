@@ -144,6 +144,10 @@ jobs:
       contents: write
       pull-requests: write
       actions: write      # to dispatch ci.yml on the release branch (see below)
+      # Required by the two wait steps: `/commits/{sha}/check-runs` and `gh pr checks` both read
+      # check runs. Workflow-level `permissions: {}` makes every unlisted scope `none`, so omitting
+      # this 403s at exactly the point where the release is waiting to merge.
+      checks: read
     outputs:
       merge_sha: ${{ steps.merge.outputs.sha }}
     env:
@@ -230,7 +234,12 @@ jobs:
           the workflow merges it automatically once the required checks pass."
           n="$(gh api -X POST "repos/$GITHUB_REPOSITORY/pulls" \
                  -f title="chore: v$VERSION" -f head="$BRANCH" -f base=main -f body="$body" --jq .number)"
-          gh api -X POST "repos/$GITHUB_REPOSITORY/issues/$n/labels" -f 'labels[]=release' >/dev/null
+          # `gh pr edit` labels via GraphQL addLabelsToLabelable on a PullRequest node, which is
+          # unambiguously covered by `pull-requests: write`. The REST /issues/{n}/labels endpoint
+          # documents itself as needing `issues: write`, which this job does not have.
+          # The label is load-bearing, not decorative: the `plan` guard rail finds an already-open
+          # release PR by it, and .github/release.yml excludes it from the notes by it.
+          gh pr edit "$n" --add-label release
           echo "number=$n" >> "$GITHUB_OUTPUT"
 
       # GITHUB_TOKEN-pushed refs do NOT start workflow runs, so the PR's required checks would never
