@@ -1,7 +1,12 @@
 //! The remote host registry: a nicknamed list of remote daemons, owned by the CLI (not the daemon)
 //! so it stays readable and writable when nothing is reachable.
 
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// One remote daemon. `name` is the identity (unique, user-chosen); `address` is editable
 /// underneath it, so "same box, new DNS name" keeps its pin.
@@ -75,9 +80,154 @@ fn split_host_port(s: &str) -> Option<(&str, &str)> {
     }
 }
 
+/// `$CLOWDER_HOSTS_FILE` › `<remote_state_dir()>/hosts.json` — the directory that already holds
+/// `remote_known_hosts`, the remote TLS creds, and the daemon's `agents.json`/`projects.json`.
+pub fn remote_hosts_path() -> PathBuf {
+    match std::env::var("CLOWDER_HOSTS_FILE") {
+        Ok(v) if !v.is_empty() => PathBuf::from(v),
+        _ => crate::remote_state_dir().join("hosts.json"),
+    }
+}
+
+/// The durable host list. Shaped like `clowder-daemon`'s `JsonStore` — `load` never panics, and
+/// `try_mutate` surfaces write errors because these operations answer a user request — with two
+/// differences that matter here:
+///
+/// 1. **0600, created private.** The file holds bearer tokens, and the temp file is opened with
+///    `mode(0o600)` BEFORE the rename rather than chmod'd after (which would leave a window in
+///    which the token is world-readable).
+/// 2. **A cross-process advisory lock.** The daemon gets mutual exclusion from its single-instance
+///    flock; the CLI has none, and both a shell (`clowder remote add`) and the app's Settings pane
+///    write this file interactively. Without the lock, one writer's load-modify-write silently
+///    discards the other's.
+pub struct HostsStore {
+    path: PathBuf,
+}
+
+impl HostsStore {
+    pub fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    /// The store at `remote_hosts_path()`.
+    pub fn default_store() -> Self {
+        Self::new(remote_hosts_path())
+    }
+
+    /// Current contents. Missing = empty; corrupt = empty + a warning. Never panics: a corrupt
+    /// registry must not stop the app from reaching its local daemon.
+    pub fn load(&self) -> Vec<HostRecord> {
+        match std::fs::read(&self.path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+                eprintln!(
+                    "clowder-config: host registry {} is unreadable ({e}); starting empty",
+                    self.path.display()
+                );
+                Vec::new()
+            }),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Load, apply `f`, write back — the whole cycle under an exclusive advisory lock held on a
+    /// SEPARATE `.lock` file. It has to be separate: the data file is replaced by `rename`, so a
+    /// lock held on its inode would not be seen by the next writer.
+    pub fn try_mutate<R>(&self, f: impl FnOnce(&mut Vec<HostRecord>) -> R) -> Result<R> {
+        if let Some(dir) = self.path.parent() {
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("create {}", dir.display()))?;
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        }
+        let _guard = FileLock::acquire(&lock_path(&self.path))?;
+        let mut all = self.load();
+        let out = f(&mut all);
+        let bytes = serde_json::to_vec_pretty(&all)?;
+        write_atomic_0600(&self.path, &bytes)?;
+        Ok(out)
+    }
+}
+
+fn lock_path(path: &Path) -> PathBuf {
+    let mut s = path.as_os_str().to_os_string();
+    s.push(".lock");
+    PathBuf::from(s)
+}
+
+/// An exclusive advisory `flock`, released when dropped (or when the process dies) — the same
+/// primitive and crate the daemon's `InstanceLock` uses, but BLOCKING: two interactive writers
+/// should serialize, not fail.
+struct FileLock {
+    // Held only for its lifetime — dropping it closes the fd, which releases the flock. Named
+    // `_file` (matching `InstanceLock`'s convention) so the compiler doesn't flag it as dead code.
+    _file: std::fs::File,
+}
+
+impl FileLock {
+    fn acquire(path: &Path) -> Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("open lock {}", path.display()))?;
+        rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive)
+            .with_context(|| format!("lock {}", path.display()))?;
+        Ok(Self { _file: file })
+    }
+}
+
+/// Create `path` for writing, failing if it already exists, with 0600 from the moment it exists.
+fn create_private(path: &Path) -> Result<std::fs::File> {
+    Ok(std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("create {}", path.display()))?)
+}
+
+/// Write `bytes` to `path` atomically, never widening permissions and never leaving a temp file.
+fn write_atomic_0600(path: &Path, bytes: &[u8]) -> Result<()> {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let mut tmp = path.as_os_str().to_os_string();
+    tmp.push(format!(
+        ".{}.{}.tmp",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let tmp = PathBuf::from(tmp);
+
+    let mut f = create_private(&tmp)?;
+    if let Err(e) = f.write_all(bytes).and_then(|_| f.sync_all()) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).context("write host registry");
+    }
+    drop(f);
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("replace {}", path.display()));
+    }
+    // A pre-existing file keeps ITS mode through a rename on some filesystems; make sure.
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn rec(name: &str, address: &str) -> HostRecord {
+        HostRecord {
+            name: name.into(),
+            address: address.into(),
+            tls: false,
+            token: None,
+            fingerprint: None,
+        }
+    }
 
     #[test]
     fn valid_names_are_accepted_and_invalid_ones_rejected() {
@@ -135,5 +285,125 @@ mod tests {
             let want = c["valid"].as_bool().unwrap();
             assert_eq!(validate_name(name).is_ok(), want, "fixture case {name:?}");
         }
+    }
+
+    use std::os::unix::fs::PermissionsExt;
+
+    fn mode_of(p: &std::path::Path) -> u32 {
+        std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn missing_file_loads_empty_and_try_mutate_creates_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("nested").join("hosts.json");
+        let store = HostsStore::new(p.clone());
+        assert!(store.load().is_empty());
+        store.try_mutate(|all| all.push(rec("studio", "h:7777"))).unwrap();
+        assert!(p.exists(), "try_mutate must create the file and its parent dir");
+        assert_eq!(store.load(), vec![rec("studio", "h:7777")]);
+    }
+
+    #[test]
+    fn corrupt_file_loads_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("hosts.json");
+        std::fs::write(&p, b"not json").unwrap();
+        assert!(HostsStore::new(p).load().is_empty(), "must never panic on a corrupt file");
+    }
+
+    #[test]
+    fn written_file_is_0600_and_its_dir_0700() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("private").join("hosts.json");
+        let store = HostsStore::new(p.clone());
+        store.try_mutate(|all| all.push(rec("studio", "h:7777"))).unwrap();
+        assert_eq!(mode_of(&p), 0o600, "the file holds bearer tokens");
+        assert_eq!(mode_of(p.parent().unwrap()), 0o700);
+    }
+
+    #[test]
+    fn rewriting_a_too_wide_file_tightens_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("hosts.json");
+        std::fs::write(&p, b"[]").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let store = HostsStore::new(p.clone());
+        store.try_mutate(|all| all.push(rec("studio", "h:7777"))).unwrap();
+        assert_eq!(mode_of(&p), 0o600);
+    }
+
+    #[test]
+    fn the_temp_file_is_created_private_not_chmodded_after() {
+        // The window between create-then-chmod is exactly when a token would be world-readable,
+        // so assert the primitive itself, not just the end state.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("t");
+        let f = create_private(&p).unwrap();
+        drop(f);
+        assert_eq!(mode_of(&p), 0o600);
+        // create_private must refuse an existing path, so it can never adopt another writer's temp.
+        assert!(create_private(&p).is_err());
+    }
+
+    #[test]
+    fn no_temp_files_are_left_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("hosts.json");
+        let store = HostsStore::new(p);
+        store.try_mutate(|all| all.push(rec("studio", "h:7777"))).unwrap();
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "leftover temp files: {leftovers:?}");
+    }
+
+    #[test]
+    fn concurrent_try_mutate_does_not_lose_records() {
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("hosts.json");
+        let handles: Vec<_> = (0..16u32)
+            .map(|i| {
+                // A store PER THREAD, sharing only the path: this exercises the cross-process
+                // flock, not an in-process mutex. That is the case the CLI + app actually hit.
+                let p = p.clone();
+                std::thread::spawn(move || {
+                    let s = Arc::new(HostsStore::new(p));
+                    s.try_mutate(|all| all.push(rec(&format!("h{i}"), "h:7777"))).unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let mut names: Vec<String> = HostsStore::new(p).load().into_iter().map(|r| r.name).collect();
+        names.sort();
+        let mut want: Vec<String> = (0..16).map(|i| format!("h{i}")).collect();
+        want.sort();
+        assert_eq!(names, want);
+    }
+
+    #[test]
+    fn try_mutate_surfaces_write_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"i am a file").unwrap();
+        let store = HostsStore::new(blocker.join("hosts.json"));
+        assert!(store.try_mutate(|all| all.push(rec("a", "h:1"))).is_err());
+    }
+
+    #[test]
+    fn default_path_honors_the_env_override() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("CLOWDER_HOSTS_FILE", "/custom/hosts.json");
+        assert_eq!(remote_hosts_path(), std::path::PathBuf::from("/custom/hosts.json"));
+        std::env::remove_var("CLOWDER_HOSTS_FILE");
+        std::env::set_var("XDG_STATE_HOME", "/xdg/state");
+        assert_eq!(remote_hosts_path(), std::path::PathBuf::from("/xdg/state/clowder/hosts.json"));
+        std::env::remove_var("XDG_STATE_HOME");
     }
 }

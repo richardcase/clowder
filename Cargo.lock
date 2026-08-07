@@ -280,6 +280,7 @@ dependencies = [
 name = "clowder-config"
 version = "0.5.1"
 dependencies = [
+ "anyhow",
  "rustix 0.38.44",
  "serde",
  "serde_json",
