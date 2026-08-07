@@ -53,7 +53,17 @@ async fn main() -> Result<()> {
             let dir = cfg.control_sock.parent()
                 .ok_or_else(|| anyhow!("cannot derive forwarder socket dir"))?
                 .join("remote");
-            clowder_client::forward::forward(host, dir, cfg.remote_token).await
+            clowder_client::forward::forward(
+                clowder_client::forward::RemoteTarget {
+                    label: host.clone(),
+                    address: host,
+                    tls: cfg.remote_tls || cfg.remote_token.is_some(),
+                    token: cfg.remote_token,
+                    fingerprint: None,
+                },
+                dir,
+            )
+            .await
         }
         Some("remote-host") => {
             // Print the resolved [remote] host (or an empty line) so the macOS app can decide

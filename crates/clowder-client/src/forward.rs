@@ -28,34 +28,56 @@ pub async fn dial_with_backoff(host: &str) -> Result<TcpStream> {
     ))
 }
 
-/// Forward one local connection to the remote daemon: dial, send the channel hello, then
-/// pipe bytes both ways until either side closes. Dials TLS (with TOFU cert verification) when
-/// `token` is `Some` — a token implies the operator configured `[remote] tls=true` on the daemon
-/// side — and sends the token in the hello; dials plaintext with no token otherwise.
-pub async fn forward_stream<L>(
-    mut local: L,
-    host: &str,
-    channel: Channel,
-    token: Option<&str>,
-) -> Result<()>
+/// Everything needed to reach one remote daemon: where it is, how to authenticate, and how to
+/// decide the certificate is really its.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteTarget {
+    /// The host nickname. Used for logging and (in M11b) the per-host forwarder socket directory.
+    pub label: String,
+    /// `host:port` — what we actually dial, and the `known_hosts` key on the un-pinned path.
+    pub address: String,
+    pub token: Option<String>,
+    /// Whether to wrap the connection in TLS. Deliberately INDEPENDENT of `token`: the old
+    /// `token.is_some() ⇒ TLS` coupling made it impossible to have an authenticated plaintext
+    /// tunnel or a TLS host without a token.
+    pub tls: bool,
+    /// The pinned server-cert fingerprint, when this host has been paired.
+    pub fingerprint: Option<String>,
+}
+
+impl RemoteTarget {
+    /// The trust policy for one dial. A pin wins; otherwise fall back to TOFU against the
+    /// shared `remote_known_hosts`, keyed on the dial address so pre-M11 entries keep matching.
+    pub fn trust(&self) -> crate::tofu::Trust {
+        match &self.fingerprint {
+            Some(fp) => crate::tofu::Trust::Pinned(fp.clone()),
+            None => crate::tofu::Trust::Tofu {
+                host: self.address.clone(),
+                known_hosts: crate::tofu::known_hosts_path(),
+            },
+        }
+    }
+}
+
+/// Forward one local connection to the remote daemon: dial, send the channel hello, then pipe
+/// bytes both ways until either side closes.
+pub async fn forward_stream<L>(mut local: L, target: &RemoteTarget, channel: Channel) -> Result<()>
 where
     L: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let tcp = dial_with_backoff(host).await?;
-    let mut remote: Box<dyn RemoteStream> = match token {
-        Some(_) => {
-            let connector = tokio_rustls::TlsConnector::from(crate::tofu::connector(
-                crate::tofu::Trust::Tofu {
-                    host: host.to_string(),
-                    known_hosts: crate::tofu::known_hosts_path(),
-                },
-            ));
-            let name = tokio_rustls::rustls::pki_types::ServerName::try_from("clowder")
-                .map_err(|e| anyhow::anyhow!("server name: {e}"))?;
-            Box::new(connector.connect(name, tcp).await?)
-        }
-        None => Box::new(tcp),
+    let tcp = dial_with_backoff(&target.address).await?;
+    let mut remote: Box<dyn RemoteStream> = if target.tls {
+        let connector = tokio_rustls::TlsConnector::from(crate::tofu::connector(target.trust()));
+        let name = tokio_rustls::rustls::pki_types::ServerName::try_from("clowder")
+            .map_err(|e| anyhow::anyhow!("server name: {e}"))?;
+        Box::new(connector.connect(name, tcp).await?)
+    } else {
+        Box::new(tcp)
     };
+    // A bearer token in cleartext is worse than no token at all, and the daemon ignores it on a
+    // plaintext listener anyway (`serve_remote` passes `expected_token: None`). `resolve_target`
+    // refuses this combination up front; this is the belt to that pair of braces.
+    let token = if target.tls { target.token.as_deref() } else { None };
     write_hello(&mut remote, channel, token).await?;
     tokio::io::copy_bidirectional(&mut local, &mut remote).await?;
     Ok(())
@@ -66,9 +88,9 @@ trait RemoteStream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> RemoteStream for T {}
 
 /// Bind the local render + control Unix sockets under `dir` and forward every connection to the
-/// remote daemon at `host` (render → Channel::Render, control → Channel::Control). Prints the two
-/// paths so callers can point CLOWDER_SOCK / CLOWDER_CONTROL_SOCK at them.
-pub async fn forward(host: String, dir: PathBuf, token: Option<String>) -> Result<()> {
+/// remote daemon (render → `Channel::Render`, control → `Channel::Control`). Prints the two paths
+/// so callers can point CLOWDER_SOCK / CLOWDER_CONTROL_SOCK at them.
+pub async fn forward(target: RemoteTarget, dir: PathBuf) -> Result<()> {
     std::fs::create_dir_all(&dir)?;
     let render_path = dir.join("clowder.sock");
     let control_path = dir.join("clowder-control.sock");
@@ -77,11 +99,11 @@ pub async fn forward(host: String, dir: PathBuf, token: Option<String>) -> Resul
 
     let render = UnixListener::bind(&render_path)?;
     let control = UnixListener::bind(&control_path)?;
-    println!("clowder connect: forwarding to {host}");
+    println!("clowder connect: forwarding to {} ({})", target.label, target.address);
     println!("  export CLOWDER_SOCK={}", render_path.display());
     println!("  export CLOWDER_CONTROL_SOCK={}", control_path.display());
 
-    let accept = |listener: UnixListener, host: String, channel: Channel, token: Option<String>| async move {
+    let accept = |listener: UnixListener, target: RemoteTarget, channel: Channel| async move {
         loop {
             let (stream, _) = match listener.accept().await {
                 Ok(v) => v,
@@ -91,10 +113,9 @@ pub async fn forward(host: String, dir: PathBuf, token: Option<String>) -> Resul
                     continue;
                 }
             };
-            let host = host.clone();
-            let token = token.clone();
+            let target = target.clone();
             tokio::spawn(async move {
-                if let Err(e) = forward_stream(stream, &host, channel, token.as_deref()).await {
+                if let Err(e) = forward_stream(stream, &target, channel).await {
                     eprintln!("clowder connect: {channel:?} connection ended: {e}");
                 }
             });
@@ -102,8 +123,8 @@ pub async fn forward(host: String, dir: PathBuf, token: Option<String>) -> Resul
     };
 
     tokio::select! {
-        _ = accept(render, host.clone(), Channel::Render, token.clone()) => Ok(()),
-        _ = accept(control, host, Channel::Control, token) => Ok(()),
+        _ = accept(render, target.clone(), Channel::Render) => Ok(()),
+        _ = accept(control, target, Channel::Control) => Ok(()),
     }
 }
 
@@ -113,21 +134,69 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
+    fn plain_target(addr: &str) -> RemoteTarget {
+        RemoteTarget {
+            label: "test".into(),
+            address: addr.into(),
+            token: None,
+            tls: false,
+            fingerprint: None,
+        }
+    }
+
+    #[test]
+    fn trust_is_pinned_when_the_entry_has_a_fingerprint() {
+        let mut t = plain_target("h:1");
+        t.fingerprint = Some("aa11".into());
+        assert!(matches!(t.trust(), crate::tofu::Trust::Pinned(fp) if fp == "aa11"));
+    }
+
+    #[test]
+    fn trust_falls_back_to_tofu_keyed_on_the_dial_address() {
+        // Keyed on the ADDRESS, not the nickname: entries recorded by earlier versions of
+        // clowder were written with the dial address, and must keep matching.
+        let t = plain_target("studio.tail:7777");
+        match t.trust() {
+            crate::tofu::Trust::Tofu { host, .. } => assert_eq!(host, "studio.tail:7777"),
+            other => panic!("expected Tofu, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_token_is_never_sent_over_plaintext() {
+        // Defense in depth: resolve_target refuses this combination (Task 6), but if one ever
+        // reaches the wire, the token must not leak in cleartext.
+        let (addr, hello_rx) = echo_remote_recording_hello_returning_token().await;
+        let (mut client, server) = tokio::io::duplex(4096);
+        let mut target = plain_target(&addr.to_string());
+        target.token = Some("s3cr3t".into()); // tls stays false
+        let fwd = tokio::spawn(async move { forward_stream(server, &target, Channel::Control).await });
+
+        client.write_all(b"ping").await.unwrap();
+        let mut got = [0u8; 4];
+        client.read_exact(&mut got).await.unwrap();
+        let (_channel, token) = hello_rx.await.unwrap();
+        assert_eq!(token, None, "the token must not be sent without TLS");
+
+        drop(client);
+        let _ = fwd.await;
+    }
+
     // A fake remote: reads the full channel hello (channel byte + length-prefixed optional
-    // token), records the channel byte, then echoes the rest back.
-    async fn echo_remote_recording_hello(
-    ) -> (std::net::SocketAddr, tokio::sync::oneshot::Receiver<u8>) {
+    // token), records both, then echoes the rest back.
+    async fn echo_remote_recording_hello_returning_token(
+    ) -> (std::net::SocketAddr, tokio::sync::oneshot::Receiver<(u8, Option<String>)>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (tx, rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let (mut sock, _) = listener.accept().await.unwrap();
-            let (channel, _token) = clowder_proto::read_hello(&mut sock).await.unwrap();
-            let hello = match channel {
+            let (channel, token) = clowder_proto::read_hello(&mut sock).await.unwrap();
+            let byte = match channel {
                 Channel::Control => 1u8,
                 Channel::Render => 2u8,
             };
-            let _ = tx.send(hello);
+            let _ = tx.send((byte, token));
             let mut buf = [0u8; 64];
             loop {
                 match sock.read(&mut buf).await {
@@ -145,17 +214,16 @@ mod tests {
 
     #[tokio::test]
     async fn forwards_hello_then_pipes_bytes() {
-        let (addr, hello_rx) = echo_remote_recording_hello().await;
+        let (addr, hello_rx) = echo_remote_recording_hello_returning_token().await;
         let (mut client, server) = tokio::io::duplex(4096); // client = test side, server = forwarder's local side
-        let fwd = tokio::spawn(async move {
-            forward_stream(server, &addr.to_string(), Channel::Control, None).await
-        });
+        let target = plain_target(&addr.to_string());
+        let fwd = tokio::spawn(async move { forward_stream(server, &target, Channel::Control).await });
 
         client.write_all(b"ping").await.unwrap();
         let mut got = [0u8; 4];
         client.read_exact(&mut got).await.unwrap();
         assert_eq!(&got, b"ping"); // bytes round-tripped through the remote echo
-        assert_eq!(hello_rx.await.unwrap(), 1); // Control hello byte (Control == 1) reached the remote
+        assert_eq!(hello_rx.await.unwrap().0, 1); // Control hello byte (Control == 1) reached the remote
 
         drop(client);
         let _ = fwd.await;
@@ -172,12 +240,12 @@ mod tests {
     async fn control_socket_forwards_with_control_hello() {
         use tokio::net::UnixStream;
 
-        let (addr, hello_rx) = echo_remote_recording_hello().await;
+        let (addr, hello_rx) = echo_remote_recording_hello_returning_token().await;
         let dir = tempfile::tempdir().unwrap();
         let dirpath = dir.path().to_path_buf();
         let host = addr.to_string();
 
-        let srv = tokio::spawn(async move { forward(host, dirpath, None).await });
+        let srv = tokio::spawn(async move { forward(plain_target(&host), dirpath).await });
         // wait for the control socket to exist
         let ctl = dir.path().join("clowder-control.sock");
         for _ in 0..50 { if ctl.exists() { break; } tokio::time::sleep(Duration::from_millis(20)).await; }
@@ -187,7 +255,7 @@ mod tests {
         let mut got = [0u8; 2];
         c.read_exact(&mut got).await.unwrap();
         assert_eq!(&got, b"hi");                   // round-tripped through the remote echo
-        assert_eq!(hello_rx.await.unwrap(), 1);    // the control socket sent a Control hello (== 1)
+        assert_eq!(hello_rx.await.unwrap().0, 1);    // the control socket sent a Control hello (== 1)
 
         srv.abort();
     }
