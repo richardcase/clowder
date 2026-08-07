@@ -44,7 +44,12 @@ where
     let tcp = dial_with_backoff(host).await?;
     let mut remote: Box<dyn RemoteStream> = match token {
         Some(_) => {
-            let connector = tokio_rustls::TlsConnector::from(crate::tofu::connector(host));
+            let connector = tokio_rustls::TlsConnector::from(crate::tofu::connector(
+                crate::tofu::Trust::Tofu {
+                    host: host.to_string(),
+                    known_hosts: crate::tofu::known_hosts_path(),
+                },
+            ));
             let name = tokio_rustls::rustls::pki_types::ServerName::try_from("clowder")
                 .map_err(|e| anyhow::anyhow!("server name: {e}"))?;
             Box::new(connector.connect(name, tcp).await?)

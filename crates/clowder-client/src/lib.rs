@@ -23,7 +23,7 @@ async fn next_control_line<R: AsyncRead + Unpin>(
 }
 
 pub mod forward;
-mod tofu;
+pub mod tofu;
 
 /// RAII guard that restores the terminal from raw mode when dropped, even on
 /// error paths or panics/unwinds — so a crash in `pump` never leaves the

@@ -43,19 +43,47 @@ pub fn check(path: &Path, host: &str, fp: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// How to decide whether a presented server certificate is the daemon we meant to reach.
+#[derive(Debug, Clone)]
+pub enum Trust {
+    /// The host entry carries a pinned fingerprint: strict compare, no recording, and
+    /// `remote_known_hosts` is never consulted. This is what pairing produces.
+    Pinned(String),
+    /// No pin yet (or a legacy config-only host): today's record-on-first-sight behavior.
+    /// `host` is the key written into `known_hosts` — it must be the DIAL ADDRESS, so entries
+    /// recorded by earlier versions keep matching.
+    Tofu { host: String, known_hosts: PathBuf },
+    /// Probe only: accept whatever is presented, publish its fingerprint, persist nothing.
+    Capture(Arc<std::sync::Mutex<Option<String>>>),
+}
+
 #[derive(Debug)]
-pub struct TofuVerifier {
-    pub host: String,
-    pub known_hosts_path: PathBuf,
+pub struct RemoteVerifier {
+    pub trust: Trust,
     pub provider: Arc<tokio_rustls::rustls::crypto::CryptoProvider>,
 }
 
-impl ServerCertVerifier for TofuVerifier {
+impl ServerCertVerifier for RemoteVerifier {
     fn verify_server_cert(&self, end_entity: &CertificateDer, _i: &[CertificateDer], _n: &ServerName, _o: &[u8], _t: UnixTime) -> Result<ServerCertVerified, Error> {
         let fp = clowder_proto::cert_fingerprint_hex(end_entity);
-        check(&self.known_hosts_path, &self.host, &fp)
-            .map(|_| ServerCertVerified::assertion())
-            .map_err(|msg| Error::General(msg))
+        let result = match &self.trust {
+            Trust::Pinned(expected) => {
+                if fp == *expected {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "REMOTE DAEMON IDENTIFICATION HAS CHANGED: pinned {expected}, got {fp}. \
+                         If you rotated the daemon cert, re-pair this host; otherwise this may be a MITM."
+                    ))
+                }
+            }
+            Trust::Tofu { host, known_hosts } => check(known_hosts, host, &fp),
+            Trust::Capture(sink) => {
+                *sink.lock().unwrap_or_else(|e| e.into_inner()) = Some(fp);
+                Ok(())
+            }
+        };
+        result.map(|_| ServerCertVerified::assertion()).map_err(Error::General)
     }
     // Fingerprint pinning above proves identity (the peer presented the expected cert), but
     // that alone isn't enough — an active MITM can also hold a copy of that (public) cert. These
@@ -72,14 +100,10 @@ impl ServerCertVerifier for TofuVerifier {
     }
 }
 
-/// Build a TLS connector that verifies `host` via TOFU.
-pub fn connector(host: &str) -> Arc<tokio_rustls::rustls::ClientConfig> {
+/// Build a TLS connector that verifies the daemon under `trust`.
+pub fn connector(trust: Trust) -> Arc<tokio_rustls::rustls::ClientConfig> {
     let provider = Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
-    let verifier = TofuVerifier {
-        host: host.to_string(),
-        known_hosts_path: known_hosts_path(),
-        provider: provider.clone(),
-    };
+    let verifier = RemoteVerifier { trust, provider: provider.clone() };
     Arc::new(
         tokio_rustls::rustls::ClientConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions().unwrap()
@@ -144,7 +168,10 @@ mod tests {
         tokio::spawn(test_daemon().serve_remote(listener, Some(tls)));
 
         // Client connects with the REAL TOFU connector → first sight records the fingerprint + succeeds.
-        let tls_connector = tokio_rustls::TlsConnector::from(connector(TOFU_HOST_LABEL));
+        let tls_connector = tokio_rustls::TlsConnector::from(connector(Trust::Tofu {
+            host: TOFU_HOST_LABEL.to_string(),
+            known_hosts: known_hosts_path(),
+        }));
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
         let name = tokio_rustls::rustls::pki_types::ServerName::try_from("clowder").unwrap();
         let mut s = tls_connector.connect(name, tcp).await.expect("first connect (TOFU record) ok");
@@ -162,7 +189,10 @@ mod tests {
 
         // Client re-connects under the SAME TOFU host label → the recorded fingerprint no longer
         // matches the (rotated) cert presented by daemon #2 → handshake refused.
-        let tls_connector2 = tokio_rustls::TlsConnector::from(connector(TOFU_HOST_LABEL));
+        let tls_connector2 = tokio_rustls::TlsConnector::from(connector(Trust::Tofu {
+            host: TOFU_HOST_LABEL.to_string(),
+            known_hosts: known_hosts_path(),
+        }));
         let tcp2 = tokio::net::TcpStream::connect(addr2).await.unwrap();
         let name2 = tokio_rustls::rustls::pki_types::ServerName::try_from("clowder").unwrap();
         let err = tls_connector2.connect(name2, tcp2).await.expect_err("changed cert must be refused");
@@ -173,5 +203,74 @@ mod tests {
         );
 
         std::env::remove_var("XDG_STATE_HOME");
+    }
+
+    use std::sync::{Arc, Mutex};
+
+    /// Build a real self-signed cert so the verifier sees a genuine DER, not a fabricated one.
+    fn a_cert() -> (Vec<u8>, String) {
+        let c = rcgen::generate_simple_self_signed(vec!["clowder".to_string()]).unwrap();
+        let der = c.cert.der().to_vec();
+        let fp = clowder_proto::cert_fingerprint_hex(&der);
+        (der, fp)
+    }
+
+    fn verify(trust: Trust, der: &[u8]) -> Result<(), String> {
+        use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+        let v = RemoteVerifier {
+            trust,
+            provider: Arc::new(tokio_rustls::rustls::crypto::ring::default_provider()),
+        };
+        v.verify_server_cert(
+            &CertificateDer::from(der.to_vec()),
+            &[],
+            &ServerName::try_from("clowder").unwrap(),
+            &[],
+            UnixTime::now(),
+        )
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn pinned_accepts_the_matching_fingerprint_and_refuses_any_other() {
+        let (der, fp) = a_cert();
+        assert!(verify(Trust::Pinned(fp.clone()), &der).is_ok());
+        let err = verify(Trust::Pinned("deadbeef".into()), &der).unwrap_err();
+        assert!(err.to_lowercase().contains("changed"), "loud refuse: {err}");
+    }
+
+    #[test]
+    fn pinned_never_touches_known_hosts() {
+        // This is the whole point of pairing: a pinned entry must not consult, and must not
+        // silently record into, the TOFU file.
+        let dir = tempfile::tempdir().unwrap();
+        let kh = dir.path().join("known_hosts");
+        let (der, fp) = a_cert();
+        assert!(verify(Trust::Pinned(fp), &der).is_ok());
+        assert!(!kh.exists(), "Pinned must not write known_hosts");
+    }
+
+    #[test]
+    fn capture_accepts_anything_and_publishes_the_fingerprint_without_persisting() {
+        let dir = tempfile::tempdir().unwrap();
+        let kh = dir.path().join("known_hosts");
+        let (der, fp) = a_cert();
+        let sink: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        assert!(verify(Trust::Capture(sink.clone()), &der).is_ok());
+        assert_eq!(sink.lock().unwrap().as_deref(), Some(fp.as_str()));
+        assert!(!kh.exists(), "a probe must persist nothing");
+    }
+
+    #[test]
+    fn tofu_arm_still_records_then_refuses_on_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let kh = dir.path().join("known_hosts");
+        let (der, _) = a_cert();
+        let t = || Trust::Tofu { host: "h:7777".into(), known_hosts: kh.clone() };
+        assert!(verify(t(), &der).is_ok(), "first sight records");
+        assert!(verify(t(), &der).is_ok(), "same cert accepts");
+        let (other_der, _) = a_cert();
+        assert!(verify(t(), &other_der).is_err(), "changed cert refuses");
     }
 }

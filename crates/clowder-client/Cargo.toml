@@ -22,6 +22,7 @@ clowder-daemon = { path = "../clowder-daemon" }
 clowder-workspace = { path = "../clowder-workspace" }
 tempfile = "3"
 tokio = { workspace = true, features = ["test-util"] }
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 
 [[bin]]
 name = "clowder"
