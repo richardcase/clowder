@@ -54,6 +54,7 @@ cd macos && swift build -c release
 | `gen-icon.swift` | Render the placeholder app icon PNG (called by `build-app.sh`) | `swift scripts/gen-icon.swift <out.png> [size]` |
 | `check-commit-messages.sh` | Verify this branch's non-merge commits are Conventional Commits (CI runs it on every PR) | `scripts/check-commit-messages.sh [base] [head]` |
 | `next-version.sh` | Derive the next release version from the commits since the last tag (used by `release.yml`) | `scripts/next-version.sh [--notes\|--self-test]` |
+| `check-runs-state.sh` | Classify a commit's check runs against the ruleset's required set (the release workflow's merge gate) | `scripts/check-runs-state.sh --sha <sha>\|--self-test` |
 | `lib/conventional.sh` | The Conventional Commits grammar, sourced by both of the above so they can't drift | (sourced, not run) |
 
 ## Runtime model
