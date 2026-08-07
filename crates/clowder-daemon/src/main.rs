@@ -15,23 +15,31 @@ async fn main() -> Result<()> {
     let daemon = Arc::new(Daemon::new_from_config(config));
     let hook_path = daemon.hook_sock().to_path_buf();
 
-    // Sockets may live in a per-user dir that doesn't exist yet; create each parent.
+    // Sockets may live in a per-user dir that doesn't exist yet; create each parent. A failure here
+    // is not fatal by itself (the dir may already exist and be fine) but it IS the cause of the
+    // otherwise-opaque bind error below, so say so rather than discarding it.
     for p in [&sock_path, &hook_path, &control_path] {
         if let Some(dir) = p.parent() {
-            let _ = std::fs::create_dir_all(dir);
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                tracing::warn!("could not create socket dir {}: {e}", dir.display());
+            }
         }
     }
 
     // Single-instance guard: refuse to start if another daemon already holds the lock.
     let lock_path = InstanceLock::default_path();
     let lock = match InstanceLock::acquire(&lock_path) {
-        Ok(l) => l,
-        Err(e) => {
-            tracing::error!("{e}");
-            // Distinct code so a supervising parent can tell "another instance already owns the daemon"
-            // (yield) apart from a generic startup error / `main` Err (which exits 1 → relaunch).
+        Ok(Some(l)) => l,
+        // ONLY a genuine second instance yields. Exit 3 is the distinct code that tells the
+        // supervising app "another daemon already owns this" — and the app treats it as permanent,
+        // never relaunching. Anything else must NOT land here: a mkdir/permissions failure that
+        // exited 3 left the app with no daemon, silently, for ever.
+        Ok(None) => {
+            tracing::error!("another clowder-daemon is already running (lock held at {})", lock_path.display());
             std::process::exit(3);
         }
+        // A real failure: propagate so `main` exits 1, which the supervisor retries with backoff.
+        Err(e) => return Err(e.context("could not acquire the single-instance lock")),
     };
 
     // We own the instance: clear any stale sockets, then bind.

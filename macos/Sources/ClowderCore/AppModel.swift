@@ -106,15 +106,23 @@ public final class AppModel: ObservableObject {
         }
     }
 
-    /// Build the transport + session and hydrate. Initial failure lands in `.closed`; a later DROP
-    /// of a live connection enters the reconnect loop (see `handleClose`).
+    /// Build the transport + session and hydrate.
+    ///
+    /// On first launch the app spawns the daemon and connects immediately, so the socket routinely
+    /// does not exist yet (`connect(2)` → ENOENT) — `Process.run()` returns at fork/exec, long before
+    /// the daemon has bound anything. Giving up here left a terminal red banner with no Retry, cured
+    /// only by relaunching the app (which then found the *first* launch's daemon already listening).
+    ///
+    /// So retry, exactly as `reconnect()` does. The first `graceAttempts` are held in `.connecting` —
+    /// which renders no banner — so an ordinary cold start is invisible; only a genuinely slow or
+    /// broken daemon escalates to the orange `.reconnecting` state.
     public func connect() {
         isShuttingDown = false
         connectionState = .connecting
         do {
             try attemptConnect()
         } catch {
-            connectionState = .closed(reason: "Could not connect: \(error)")
+            scheduleReconnect(graceAttempts: Self.startupGraceAttempts)
         }
     }
 
@@ -163,28 +171,47 @@ public final class AppModel: ObservableObject {
         scheduleReconnect()
     }
 
+    /// Retries spent in `.connecting` before showing the user anything. 5 attempts on the fast ramp
+    /// below is ~1.5s — comfortably longer than a daemon takes to bind, short enough that a real
+    /// failure still surfaces promptly.
+    private static let startupGraceAttempts = 5
+
     private func backoffDelay(_ attempt: Int) -> TimeInterval {
         min(10.0, 0.5 * pow(2.0, Double(attempt)))
     }
 
-    /// Start the bounded exponential-backoff reconnect loop (idempotent while one is running).
-    private func scheduleReconnect() {
-        guard !isShuttingDown, reconnectTask == nil else { return }
-        connectionState = .reconnecting
-        reconnectTask = Task { [weak self] in await self?.reconnectLoop() }
+    /// Delay for an attempt inside the startup grace period: 50/100/200/400/800ms. Deliberately
+    /// separate from `backoffDelay` — the live-drop cadence is established behaviour, and a dropped
+    /// connection has no reason to be probed this eagerly.
+    private func graceDelay(_ attempt: Int) -> TimeInterval {
+        0.05 * pow(2.0, Double(attempt))
     }
 
-    private func reconnectLoop() async {
+    /// Start the exponential-backoff reconnect loop (idempotent while one is running).
+    ///
+    /// `graceAttempts` > 0 keeps the first N attempts in `.connecting` on a fast ramp, so a
+    /// cold start that resolves quickly never shows a banner. Past that, or when 0 (a live
+    /// connection dropping), it behaves exactly as before: `.reconnecting` + `backoffDelay`.
+    private func scheduleReconnect(graceAttempts: Int = 0) {
+        guard !isShuttingDown, reconnectTask == nil else { return }
+        connectionState = graceAttempts > 0 ? .connecting : .reconnecting
+        reconnectTask = Task { [weak self] in await self?.reconnectLoop(graceAttempts: graceAttempts) }
+    }
+
+    private func reconnectLoop(graceAttempts: Int = 0) async {
         var attempt = 0
         while !Task.isCancelled && !isShuttingDown {
-            await sleepFn(backoffDelay(attempt))
+            let inGrace = attempt < graceAttempts
+            await sleepFn(inGrace ? graceDelay(attempt) : backoffDelay(attempt - graceAttempts))
             if Task.isCancelled || isShuttingDown { break }
             do {
                 try attemptConnect()          // sets .live + re-hydrates on success
                 reconnectTask = nil
                 return
             } catch {
-                connectionState = .reconnecting   // a mid-hydration failure may have flipped us to .live
+                // A mid-hydration failure may have flipped us to .live; put the state back. Stay
+                // silent (`.connecting`) while still inside the grace period.
+                connectionState = attempt + 1 < graceAttempts ? .connecting : .reconnecting
                 attempt += 1
             }
         }
