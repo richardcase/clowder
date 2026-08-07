@@ -140,24 +140,64 @@ pub struct ErrOut {
     pub error: String,
 }
 
-/// Dispatch `clowder remote <sub> …`.
-///
-/// Every failure below is returned rather than printed, so `run` can render it as `{"error": …}`
-/// under `--json` and as a plain stderr line otherwise — one place, one contract.
-pub async fn run(args: &[String]) -> Result<()> {
-    let flags = parse_flags(args).map_err(anyhow::Error::msg)?;
-    let json = flags.bool("json");
-    match dispatch(&flags).await {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            if json {
-                println!("{}", serde_json::to_string(&ErrOut { error: e.to_string() })?);
-            } else {
-                eprintln!("clowder remote: {e}");
-            }
-            std::process::exit(1);
-        }
+/// What `run()` prints on failure, and which stream it goes to. A pure value (no I/O, no
+/// `process::exit`) so the mapping from an error to its rendered form is unit-testable directly,
+/// without capturing real stdout/stderr or killing the test process.
+struct Rendered {
+    json: bool,
+    body: String,
+}
+
+impl Rendered {
+    fn new(msg: &str, json: bool) -> Self {
+        let body = if json {
+            serde_json::to_string(&ErrOut { error: msg.to_string() })
+                // `ErrOut` is a plain `{error: String}` — serialization cannot fail — but a
+                // hand-built fallback is cheaper than an `.unwrap()` that could theoretically
+                // panic on the error-reporting path itself.
+                .unwrap_or_else(|_| format!(r#"{{"error":{msg:?}}}"#))
+        } else {
+            format!("clowder remote: {msg}")
+        };
+        Self { json, body }
     }
+
+    fn print_and_exit(&self) -> ! {
+        if self.json {
+            println!("{}", self.body);
+        } else {
+            eprintln!("{}", self.body);
+        }
+        std::process::exit(1);
+    }
+}
+
+/// Parse + dispatch `clowder remote <sub> …`, converging EVERY failure — a malformed flag
+/// included — onto one `Rendered` value.
+///
+/// `json` is recovered from the raw args (a literal `--json` token) BEFORE `parse_flags` runs,
+/// because a `parse_flags` failure (e.g. `--tls=false`, which Task 8's fix rejects since `tls`
+/// takes no inline value) must still honor `--json` — waiting on a `Flags` that may not exist
+/// yet would defeat the purpose and silently fall back to a bare stderr line, breaking the
+/// contract the app's later milestone depends on (it decodes stdout first, stderr never).
+///
+/// Split out from `run()` (rather than inlined together with `process::exit`) so a test can
+/// drive this exact path without terminating the test binary.
+async fn try_run(args: &[String]) -> std::result::Result<(), Rendered> {
+    let json = args.iter().any(|a| a == "--json");
+    let flags = parse_flags(args).map_err(|e| Rendered::new(&e, json))?;
+    dispatch(&flags)
+        .await
+        .map_err(|e| Rendered::new(&e.to_string(), flags.bool("json")))
+}
+
+/// Dispatch `clowder remote <sub> …`. Thin by design: `try_run` is where the error-rendering
+/// contract lives, so this has nothing left to get wrong.
+pub async fn run(args: &[String]) -> Result<()> {
+    if let Err(rendered) = try_run(args).await {
+        rendered.print_and_exit();
+    }
+    Ok(())
 }
 
 fn merged() -> Vec<HostEntry> {
@@ -198,132 +238,145 @@ fn find_writable(all: &[HostEntry], name: &str) -> Result<()> {
     }
 }
 
+/// Thin by design: each subcommand's logic lives in its own `cmd_*` function so this can stay a
+/// one-line-per-arm match even as Task 10 appends `probe`/`trust`/`untrust`.
 async fn dispatch(flags: &Flags) -> Result<()> {
-    let json = flags.bool("json");
     match flags.positional(0) {
-        Some("list") => {
-            flags.reject_unknown(&["json"]).map_err(anyhow::Error::msg)?;
-            let all = merged();
-            if json {
-                let out = ListOut { hosts: all.iter().map(HostView::from).collect() };
-                println!("{}", serde_json::to_string_pretty(&out)?);
-            } else {
-                for e in &all {
-                    let v = HostView::from(e);
-                    println!(
-                        "{}\t{}\t{}\t{}\t{}",
-                        v.name,
-                        v.address,
-                        if v.tls { "tls" } else { "plain" },
-                        if v.trusted { "paired" } else { "unpaired" },
-                        v.source
-                    );
-                }
-            }
-            Ok(())
-        }
-        Some("show") => {
-            flags.reject_unknown(&["json"]).map_err(anyhow::Error::msg)?;
-            let name = flags.positional(1).ok_or_else(|| anyhow::anyhow!("usage: clowder remote show <name>"))?;
-            let all = merged();
-            let e = all
-                .iter()
-                .find(|e| e.record.name == name)
-                .ok_or_else(|| anyhow::anyhow!("unknown host {name:?}; try `clowder remote list`"))?;
-            let v = HostView::from(e);
-            if json {
-                println!("{}", serde_json::to_string_pretty(&v)?);
-            } else {
-                println!("name\t{}", v.name);
-                println!("address\t{}", v.address);
-                println!("tls\t{}", v.tls);
-                println!("token\t{}", if v.has_token { "set" } else { "unset" });
-                println!("fingerprint\t{}", v.fingerprint.as_deref().unwrap_or("-"));
-                println!("source\t{}", v.source);
-            }
-            Ok(())
-        }
-        Some("add") => {
-            flags.reject_unknown(&["json", "tls", "no-tls", "token", "token-stdin"]).map_err(anyhow::Error::msg)?;
-            let name = flags.positional(1).ok_or_else(|| anyhow::anyhow!("usage: clowder remote add <name> <host:port>"))?.to_string();
-            let address = flags.positional(2).ok_or_else(|| anyhow::anyhow!("usage: clowder remote add <name> <host:port>"))?.to_string();
-            hosts::validate_name(&name).map_err(anyhow::Error::msg)?;
-            hosts::validate_address(&address).map_err(anyhow::Error::msg)?;
-            if merged().iter().any(|e| e.record.name == name) {
-                anyhow::bail!("a host named {name:?} already exists");
-            }
-            let token = token_from(flags)?;
-            // A token is only usable over TLS, so default TLS on when one is given rather than
-            // silently creating a combination `resolve_target` will refuse.
-            let tls = flags.tristate("tls", "no-tls").map_err(anyhow::Error::msg)?.unwrap_or(token.is_some());
-            let record = HostRecord { name, address, tls, token, fingerprint: None };
-            HostsStore::default_store().try_mutate(|all| all.push(record.clone()))?;
-            report_one(&record, json)
-        }
-        Some("set") => {
-            flags.reject_unknown(&["json", "tls", "no-tls", "token", "token-stdin", "no-token", "rename", "address"]).map_err(anyhow::Error::msg)?;
-            let name = flags.positional(1).ok_or_else(|| anyhow::anyhow!("usage: clowder remote set <name> [--address …] [--rename …] …"))?.to_string();
-            find_writable(&merged(), &name)?;
-            if let Some(new) = flags.str("rename") {
-                hosts::validate_name(new).map_err(anyhow::Error::msg)?;
-                if new != name && merged().iter().any(|e| e.record.name == new) {
-                    anyhow::bail!("a host named {new:?} already exists");
-                }
-            }
-            if let Some(addr) = flags.str("address") {
-                hosts::validate_address(addr).map_err(anyhow::Error::msg)?;
-            }
-            let tls = flags.tristate("tls", "no-tls").map_err(anyhow::Error::msg)?;
-            let token = token_from(flags)?;
-            if token.is_some() && flags.bool("no-token") {
-                anyhow::bail!("--token/--token-stdin and --no-token contradict each other");
-            }
-            let clear_token = flags.bool("no-token");
-            let rename = flags.str("rename").map(String::from);
-            let address = flags.str("address").map(String::from);
-
-            let updated = HostsStore::default_store().try_mutate(|all| {
-                let Some(r) = all.iter_mut().find(|r| r.name == name) else {
-                    return None;
-                };
-                if let Some(n) = rename { r.name = n; }
-                if let Some(a) = address { r.address = a; }
-                if let Some(t) = tls { r.tls = t; }
-                if clear_token { r.token = None; }
-                if let Some(t) = token { r.token = Some(t); }
-                Some(r.clone())
-            })?;
-            let updated = updated.ok_or_else(|| anyhow::anyhow!("unknown host {name:?}"))?;
-            report_one(&updated, json)
-        }
-        Some("rm") => {
-            flags.reject_unknown(&["json"]).map_err(anyhow::Error::msg)?;
-            let name = flags.positional(1).ok_or_else(|| anyhow::anyhow!("usage: clowder remote rm <name>"))?.to_string();
-            find_writable(&merged(), &name)?;
-            let removed = HostsStore::default_store().try_mutate(|all| {
-                let idx = all.iter().position(|r| r.name == name)?;
-                Some(all.remove(idx))
-            })?;
-            let removed = removed.ok_or_else(|| anyhow::anyhow!("unknown host {name:?}"))?;
-            // Prune the legacy TOFU line only when no OTHER entry still dials that address —
-            // otherwise removing one nickname would silently un-trust another.
-            let still_used = HostsStore::default_store()
-                .load()
-                .iter()
-                .any(|r| r.address == removed.address);
-            if !still_used {
-                prune_known_host(&removed.address);
-            }
-            if json {
-                println!("{}", serde_json::to_string(&serde_json::json!({ "removed": removed.name }))?);
-            } else {
-                println!("removed {}", removed.name);
-            }
-            Ok(())
-        }
+        Some("list") => cmd_list(flags),
+        Some("show") => cmd_show(flags),
+        Some("add") => cmd_add(flags),
+        Some("set") => cmd_set(flags),
+        Some("rm") => cmd_rm(flags),
         Some(other) => anyhow::bail!("unknown subcommand {other:?}; usage: clowder remote <list|show|add|set|rm|probe|trust|untrust> …"),
         None => anyhow::bail!("usage: clowder remote <list|show|add|set|rm|probe|trust|untrust> …"),
     }
+}
+
+fn cmd_list(flags: &Flags) -> Result<()> {
+    flags.reject_unknown(&["json"]).map_err(anyhow::Error::msg)?;
+    let all = merged();
+    if flags.bool("json") {
+        let out = ListOut { hosts: all.iter().map(HostView::from).collect() };
+        println!("{}", serde_json::to_string_pretty(&out)?);
+    } else {
+        for e in &all {
+            let v = HostView::from(e);
+            println!(
+                "{}\t{}\t{}\t{}\t{}",
+                v.name,
+                v.address,
+                if v.tls { "tls" } else { "plain" },
+                if v.trusted { "paired" } else { "unpaired" },
+                v.source
+            );
+        }
+    }
+    Ok(())
+}
+
+fn cmd_show(flags: &Flags) -> Result<()> {
+    flags.reject_unknown(&["json"]).map_err(anyhow::Error::msg)?;
+    let name = flags.positional(1).ok_or_else(|| anyhow::anyhow!("usage: clowder remote show <name>"))?;
+    let all = merged();
+    let e = all
+        .iter()
+        .find(|e| e.record.name == name)
+        .ok_or_else(|| anyhow::anyhow!("unknown host {name:?}; try `clowder remote list`"))?;
+    let v = HostView::from(e);
+    if flags.bool("json") {
+        println!("{}", serde_json::to_string_pretty(&v)?);
+    } else {
+        println!("name\t{}", v.name);
+        println!("address\t{}", v.address);
+        println!("tls\t{}", v.tls);
+        println!("token\t{}", if v.has_token { "set" } else { "unset" });
+        println!("fingerprint\t{}", v.fingerprint.as_deref().unwrap_or("-"));
+        println!("source\t{}", v.source);
+    }
+    Ok(())
+}
+
+fn cmd_add(flags: &Flags) -> Result<()> {
+    flags.reject_unknown(&["json", "tls", "no-tls", "token", "token-stdin"]).map_err(anyhow::Error::msg)?;
+    let name = flags.positional(1).ok_or_else(|| anyhow::anyhow!("usage: clowder remote add <name> <host:port>"))?.to_string();
+    let address = flags.positional(2).ok_or_else(|| anyhow::anyhow!("usage: clowder remote add <name> <host:port>"))?.to_string();
+    hosts::validate_name(&name).map_err(anyhow::Error::msg)?;
+    hosts::validate_address(&address).map_err(anyhow::Error::msg)?;
+    if merged().iter().any(|e| e.record.name == name) {
+        anyhow::bail!("a host named {name:?} already exists");
+    }
+    let token = token_from(flags)?;
+    // A token is only usable over TLS, so default TLS on when one is given rather than
+    // silently creating a combination `resolve_target` will refuse.
+    let tls = flags.tristate("tls", "no-tls").map_err(anyhow::Error::msg)?.unwrap_or(token.is_some());
+    let record = HostRecord { name, address, tls, token, fingerprint: None };
+    HostsStore::default_store().try_mutate(|all| all.push(record.clone()))?;
+    report_one(&record, flags.bool("json"))
+}
+
+fn cmd_set(flags: &Flags) -> Result<()> {
+    flags.reject_unknown(&["json", "tls", "no-tls", "token", "token-stdin", "no-token", "rename", "address"]).map_err(anyhow::Error::msg)?;
+    let name = flags.positional(1).ok_or_else(|| anyhow::anyhow!("usage: clowder remote set <name> [--address …] [--rename …] …"))?.to_string();
+    find_writable(&merged(), &name)?;
+    if let Some(new) = flags.str("rename") {
+        hosts::validate_name(new).map_err(anyhow::Error::msg)?;
+        if new != name && merged().iter().any(|e| e.record.name == new) {
+            anyhow::bail!("a host named {new:?} already exists");
+        }
+    }
+    if let Some(addr) = flags.str("address") {
+        hosts::validate_address(addr).map_err(anyhow::Error::msg)?;
+    }
+    let tls = flags.tristate("tls", "no-tls").map_err(anyhow::Error::msg)?;
+    let token = token_from(flags)?;
+    if token.is_some() && flags.bool("no-token") {
+        anyhow::bail!("--token/--token-stdin and --no-token contradict each other");
+    }
+    let clear_token = flags.bool("no-token");
+    let rename = flags.str("rename").map(String::from);
+    let address = flags.str("address").map(String::from);
+
+    let updated = HostsStore::default_store().try_mutate(|all| {
+        let Some(r) = all.iter_mut().find(|r| r.name == name) else {
+            return None;
+        };
+        if let Some(n) = rename { r.name = n; }
+        if let Some(a) = address { r.address = a; }
+        if let Some(t) = tls { r.tls = t; }
+        if clear_token { r.token = None; }
+        if let Some(t) = token { r.token = Some(t); }
+        Some(r.clone())
+    })?;
+    let updated = updated.ok_or_else(|| anyhow::anyhow!("unknown host {name:?}"))?;
+    report_one(&updated, flags.bool("json"))
+}
+
+fn cmd_rm(flags: &Flags) -> Result<()> {
+    flags.reject_unknown(&["json"]).map_err(anyhow::Error::msg)?;
+    let name = flags.positional(1).ok_or_else(|| anyhow::anyhow!("usage: clowder remote rm <name>"))?.to_string();
+    find_writable(&merged(), &name)?;
+    let removed = HostsStore::default_store().try_mutate(|all| {
+        let idx = all.iter().position(|r| r.name == name)?;
+        Some(all.remove(idx))
+    })?;
+    let removed = removed.ok_or_else(|| anyhow::anyhow!("unknown host {name:?}"))?;
+    // Prune the legacy TOFU line only when no OTHER entry still dials that address —
+    // otherwise removing one nickname would silently un-trust another. This must check the
+    // MERGED view (registry + the `[remote] host` virtual entry), not just the raw registry:
+    // `merged_hosts` masks the virtual config entry whenever a registry record already claims
+    // its address, so removing that registry record can make the (always-unpinned) config entry
+    // visible again — and its trust rests entirely on this TOFU line. Checking the bare registry
+    // alone would miss that and prune out from under it.
+    let still_used = merged().iter().any(|e| e.record.address == removed.address);
+    if !still_used {
+        prune_known_host(&removed.address);
+    }
+    if flags.bool("json") {
+        println!("{}", serde_json::to_string(&serde_json::json!({ "removed": removed.name }))?);
+    } else {
+        println!("removed {}", removed.name);
+    }
+    Ok(())
 }
 
 fn report_one(record: &HostRecord, json: bool) -> Result<()> {
@@ -470,5 +523,90 @@ mod tests {
     fn error_output_is_a_json_object() {
         let s = serde_json::to_string(&ErrOut { error: "no such host: studi".into() }).unwrap();
         assert_eq!(s, r#"{"error":"no such host: studi"}"#);
+    }
+
+    // Guards the process-global env vars (`XDG_STATE_HOME`, `CLOWDER_HOSTS_FILE`,
+    // `CLOWDER_REMOTE_HOST`) that `rm_does_not_prune_a_known_hosts_line_still_used_by_the_masked_config_entry`
+    // sets against races with any other env-mutating test in this crate's test binary — same
+    // rationale, same crate-wide lock, as `tofu`'s and `probe`'s use of it.
+    use crate::ENV_LOCK;
+
+    #[tokio::test]
+    async fn a_malformed_flag_still_honors_the_json_error_contract() {
+        // Regression for a real bug: `parse_flags` failures (e.g. `--tls=false`, rejected
+        // because `tls` isn't in VALUE_FLAGS and so takes no inline value) used to bypass the
+        // `--json` contract entirely: `run()`'s old `parse_flags(args).map_err(...)?` returned
+        // before `json` was even read, so the error propagated out of `run()` to `main()` and
+        // Rust's default `Termination` impl printed a bare `Error: ...` to STDERR — meaning the
+        // app, which decodes stdout first per the documented contract, would see nothing.
+        //
+        // `try_run` is exercised directly (not `run()`) because `run()`'s failure path ends in
+        // `process::exit(1)`, which would kill the test process.
+        let err = try_run(&args(&["list", "--tls=false", "--json"])).await.unwrap_err();
+        assert!(err.json, "must honor --json even though flag parsing itself failed: body={}", err.body);
+        let parsed: serde_json::Value = serde_json::from_str(&err.body).expect("body must be valid JSON");
+        assert!(
+            parsed["error"].as_str().unwrap().contains("does not take a value"),
+            "unexpected error body: {}",
+            err.body
+        );
+    }
+
+    #[tokio::test]
+    async fn rm_does_not_prune_a_known_hosts_line_still_used_by_the_masked_config_entry() {
+        // Regression for a real bug: `cmd_rm`'s "is this address still used by another entry?"
+        // check read the bare registry file. But `merged_hosts` MASKS the `[remote] host`
+        // virtual entry whenever a registry record already claims its address — so removing
+        // that one registry record un-masks the (always-unpinned, `fingerprint: None` by
+        // construction) config entry, which depends entirely on this known_hosts line for
+        // trust. Checking the bare registry missed that the config entry was about to become
+        // the sole remaining user of the address, and pruned the line out from under it.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_STATE_HOME", dir.path());
+        std::env::set_var("CLOWDER_HOSTS_FILE", dir.path().join("hosts.json"));
+        std::env::set_var("CLOWDER_REMOTE_HOST", "10.0.0.5:7777");
+
+        // Seed the registry with one entry at the SAME address [remote] host resolves to — this
+        // is exactly what masks the virtual config entry while the registry entry exists.
+        HostsStore::default_store()
+            .try_mutate(|all| {
+                all.push(HostRecord {
+                    name: "studio".into(),
+                    address: "10.0.0.5:7777".into(),
+                    tls: false,
+                    token: None,
+                    fingerprint: None,
+                })
+            })
+            .unwrap();
+
+        // Seed a known_hosts line for that address, as an earlier TOFU connection would have.
+        let kh = crate::tofu::known_hosts_path();
+        std::fs::create_dir_all(kh.parent().unwrap()).unwrap();
+        std::fs::write(&kh, "10.0.0.5:7777 aa11bb22\n").unwrap();
+
+        // Sanity: before removal, the config entry is masked — only the registry entry shows.
+        let before = merged();
+        assert_eq!(before.len(), 1, "config entry should start masked: {before:?}");
+
+        let flags = parse_flags(&args(&["rm", "studio"])).unwrap();
+        cmd_rm(&flags).unwrap();
+
+        // After removal, the virtual config entry becomes visible again at the same address...
+        let after = merged();
+        assert_eq!(after.len(), 1, "the config entry should now be visible: {after:?}");
+        assert_eq!(after[0].source, HostSource::Config);
+
+        // ...and it must still be able to connect without a fresh TOFU prompt: the line survives.
+        let kept = std::fs::read_to_string(&kh).unwrap();
+        assert!(
+            kept.contains("10.0.0.5:7777"),
+            "removing one nickname must not un-trust a host the config entry still dials: {kept:?}"
+        );
+
+        std::env::remove_var("XDG_STATE_HOME");
+        std::env::remove_var("CLOWDER_HOSTS_FILE");
+        std::env::remove_var("CLOWDER_REMOTE_HOST");
     }
 }
