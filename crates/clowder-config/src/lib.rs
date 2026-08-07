@@ -1,6 +1,8 @@
 use serde::Deserialize;
 use std::path::PathBuf;
 
+pub mod hosts;
+
 const DEFAULT_BACKLOG_CAP: usize = 256 * 1024;
 const DEFAULT_COLS: u16 = 80;
 const DEFAULT_ROWS: u16 = 24;
