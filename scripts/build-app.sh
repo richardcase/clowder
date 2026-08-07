@@ -7,6 +7,9 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT_DIR="${1:-$ROOT/dist}"
 APP="$OUT_DIR/Clowder.app"
 VERSION="$(tr -d '[:space:]' < "$ROOT/VERSION")"
+# CFBundleShortVersionString/CFBundleVersion must be dot-separated integers, so a pre-release
+# identifier (0.5.0-rc1) is trimmed for the plist. The tag, DMG name and cask keep the full string.
+SHORT_VERSION="${VERSION%%-*}"
 
 echo "==> Building Rust binaries (release)"
 ( cd "$ROOT" && cargo build --release -p clowder-daemon -p clowder-client -p clowder-hook )
@@ -49,8 +52,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleIdentifier</key>      <string>com.github.richardcase.clowder</string>
     <key>CFBundleExecutable</key>      <string>clowder-app</string>
     <key>CFBundlePackageType</key>     <string>APPL</string>
-    <key>CFBundleShortVersionString</key> <string>$VERSION</string>
-    <key>CFBundleVersion</key>         <string>$VERSION</string>
+    <key>CFBundleShortVersionString</key> <string>$SHORT_VERSION</string>
+    <key>CFBundleVersion</key>         <string>$SHORT_VERSION</string>
     <key>CFBundleIconFile</key>        <string>Clowder</string>
     <key>LSMinimumSystemVersion</key>  <string>14.0</string>
     <key>NSHighResolutionCapable</key> <true/>

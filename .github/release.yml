@@ -1,0 +1,8 @@
+# Config for GitHub's `generate_release_notes` (used by .github/workflows/release.yml).
+#
+# The release PR is the `chore: vX.Y.Z` version bump that release.yml opens and merges as part of
+# cutting the release. Listing it in its own release notes is pure noise.
+changelog:
+  exclude:
+    labels:
+      - release

@@ -4,10 +4,15 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Dispatchable so release.yml can start the required checks on its bump branch: refs pushed with
+  # GITHUB_TOKEN do not start workflow runs, but workflow_dispatch is the documented exception, and
+  # the resulting check runs attach to the head SHA — which is what main's ruleset evaluates.
+  workflow_dispatch:
 
-# Cancel superseded runs on the same ref.
+# Cancel superseded runs on the same ref. The event is part of the group so a manual dispatch and a
+# PR's own run never cancel each other.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -15,7 +20,9 @@ jobs:
   # PR-only — commits reaching `main` have already been through this on their PR.
   commit-lint:
     name: commit messages (conventional commits)
-    if: github.event_name == 'pull_request'
+    # Runs for `pull_request` AND `workflow_dispatch` (release.yml's bump branch), but not for a
+    # push to main — those commits were already checked on their PR.
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -26,12 +33,18 @@ jobs:
           fetch-depth: 0
 
       # Pass the SHAs explicitly: on `pull_request`, actions/checkout checks out the *merge* ref,
-      # so HEAD is not the branch tip.
+      # so HEAD is not the branch tip. On a dispatch there is no PR context, so fall back to
+      # comparing the dispatched ref against main.
       - name: Check commit messages
-        run: >
-          scripts/check-commit-messages.sh
-          "${{ github.event.pull_request.base.sha }}"
-          "${{ github.event.pull_request.head.sha }}"
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || 'origin/main' }}
+          HEAD_REF: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: scripts/check-commit-messages.sh "$BASE" "$HEAD_REF"
+
+      # Lives here so the semver rules become a required check for free, without adding a new
+      # context to main's ruleset. No dependencies, runs in under a second.
+      - name: next-version.sh self-tests
+        run: scripts/next-version.sh --self-test
 
   build-and-test:
     name: build + test (macOS, unsigned)

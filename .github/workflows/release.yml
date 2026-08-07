@@ -1,25 +1,338 @@
 name: Release
 
+# Manually dispatched, NOT tag-triggered. The version is derived from the Conventional Commit types
+# since the last release tag (see scripts/next-version.sh and docs/versioning.md); a dispatch that
+# finds nothing releasable ends green having done nothing.
 on:
-  push:
-    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Compute and report the next version, then stop. Changes nothing.'
+        type: boolean
+        default: false
+      version_override:
+        description: 'Explicit version (e.g. 1.0.0) instead of the computed one. The escape hatch for cutting 1.0.0.'
+        type: string
+        default: ''
+      prerelease:
+        description: 'Pre-release identifier to append (e.g. rc1). Skips the Homebrew cask bump.'
+        type: string
+        default: ''
 
-permissions:
-  contents: write   # create the GitHub Release
+# Never cancel a release in flight: a cancelled `bump` orphans a branch and an open PR, and a
+# cancelled `release` can leave a signed-but-unpublished build. Concurrent dispatches queue, then
+# trip the guard rails in `plan`.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+# default_workflow_permissions is `read` on this repo; every job grants only what it needs.
+permissions: {}
 
 jobs:
-  release:
-    name: build + publish (macOS)
-    runs-on: macos-15
+  # ---------------------------------------------------------------- plan (cheap, ubuntu)
+  plan:
+    name: plan the release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      proceed:    ${{ steps.guards.outputs.proceed }}
+      needs_bump: ${{ steps.compute.outputs.needs_bump }}
+      version:    ${{ steps.compute.outputs.version }}
+      tag:        ${{ steps.compute.outputs.tag }}
+      bump:       ${{ steps.compute.outputs.bump }}
+      prev_tag:   ${{ steps.compute.outputs.prev_tag }}
+      prerelease: ${{ steps.compute.outputs.prerelease }}
+      base_sha:   ${{ steps.compute.outputs.base_sha }}
+    steps:
+      # fetch-depth: 0 is mandatory — `git describe` on a depth-1 checkout finds no tag and would
+      # silently take next-version.sh's bootstrap path.
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      # A release must be cut from main. dry_run is exempt so the plan job can be rehearsed from the
+      # branch that introduces it, before it exists on main.
+      - name: Refuse to release from a non-default branch
+        if: ${{ github.ref_name != 'main' && inputs.dry_run != true }}
+        run: |
+          echo "::error::releases must be dispatched from main (got '${{ github.ref_name }}'); use dry_run to rehearse from a branch"
+          exit 1
+
+      - name: Compute the next version
+        id: compute
+        env:
+          OVERRIDE: ${{ inputs.version_override }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          # Explicit `if` rather than `[ -n … ] && args+=(…)`: under `bash -e` (GitHub's default
+          # shell) such a line exits the step when the test is false and it happens to be last.
+          args=()
+          if [ -n "$OVERRIDE" ]; then args+=(--override "$OVERRIDE"); fi
+          if [ -n "$PRERELEASE" ]; then args+=(--prerelease "$PRERELEASE"); fi
+          scripts/next-version.sh "${args[@]}" >> "$GITHUB_OUTPUT"
+          echo "base_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Guard rails
+        id: guards
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE: ${{ steps.compute.outputs.release }}
+          TAG: ${{ steps.compute.outputs.tag }}
+          VERSION: ${{ steps.compute.outputs.version }}
+          BUMP: ${{ steps.compute.outputs.bump }}
+          BUMP_RAW: ${{ steps.compute.outputs.bump_raw }}
+          PREV_TAG: ${{ steps.compute.outputs.prev_tag }}
+          COMMITS: ${{ steps.compute.outputs.commits }}
+          RELEASABLE: ${{ steps.compute.outputs.releasable }}
+          NEEDS_BUMP: ${{ steps.compute.outputs.needs_bump }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          {
+            echo "## Release plan"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| previous release | \`${PREV_TAG:-<none>}\` |"
+            echo "| commits since | $COMMITS ($RELEASABLE releasable) |"
+            echo "| bump | \`$BUMP\`$([ "$BUMP" != "$BUMP_RAW" ] && echo " (asked for \`$BUMP_RAW\`, folded by the 0.x rule)")|"
+            echo "| next version | \`${VERSION:-nothing to release}\` |"
+            echo "| version bump needed | $NEEDS_BUMP |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$RELEASE" != true ]; then
+            echo "::notice::No releasable commits since ${PREV_TAG:-the start of history} — nothing to do."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+
+          # An existing tag means that version already shipped. Bumping onto it would attach a second
+          # release to the same name; recomputing around it would skip a version silently.
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" >/dev/null 2>&1; then
+            echo "::error::$TAG already exists. Delete it (gh release delete $TAG --cleanup-tag) or pass version_override."
+            exit 1
+          fi
+
+          open_pr="$(gh pr list --state open --label release --json number --jq '.[0].number // empty')"
+          if [ -n "$open_pr" ]; then
+            echo "::error::release PR #$open_pr is already open — merge or close it before dispatching again."
+            exit 1
+          fi
+
+          # A leftover branch from a failed run: refuse rather than force-update someone's work.
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/release/$TAG" >/dev/null 2>&1; then
+            echo "::error::branch release/$TAG already exists — delete it before dispatching again."
+            exit 1
+          fi
+
+          if [ "$DRY_RUN" = true ]; then
+            echo "::notice::dry run — would release $TAG. Nothing committed, tagged, or published."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          echo "proceed=true" >> "$GITHUB_OUTPUT"
+
+  # ------------------------------------------------------- bump (PR to main, ubuntu, mostly idle)
+  # main's ruleset requires a PR, signed commits and green checks, with no bypass actors — so the
+  # version bump cannot be pushed directly. See docs/versioning.md.
+  bump:
+    name: bump VERSION via a PR
+    needs: plan
+    if: needs.plan.outputs.proceed == 'true' && needs.plan.outputs.needs_bump == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write      # to dispatch ci.yml on the release branch (see below)
+      # Required by the two wait steps: `/commits/{sha}/check-runs` and `gh pr checks` both read
+      # check runs. Workflow-level `permissions: {}` makes every unlisted scope `none`, so omitting
+      # this 403s at exactly the point where the release is waiting to merge.
+      checks: read
+    outputs:
+      merge_sha: ${{ steps.merge.outputs.sha }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      BRANCH: release/${{ needs.plan.outputs.tag }}
+      VERSION: ${{ needs.plan.outputs.version }}
+      BASE_SHA: ${{ needs.plan.outputs.base_sha }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.base_sha }}
+          fetch-depth: 0
 
-      - name: Verify the tag matches VERSION
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Set the version
+        run: scripts/set-version.sh "$VERSION"
+
+      # set-version.sh runs `cargo update --workspace`, which only re-resolves the lockfile (never
+      # compiles, and Cargo.lock is target-independent, so ubuntu is fine). If it touched anything
+      # else, a stale lockfile is being silently repaired inside a release — stop and look.
+      - name: Assert the bump touched exactly three files
         run: |
-          tag="${GITHUB_REF_NAME#v}"
-          file="$(tr -d '[:space:]' < VERSION)"
-          echo "tag=$tag VERSION=$file"
-          [ "$tag" = "$file" ] || { echo "::error::tag v$tag does not match VERSION $file"; exit 1; }
+          changed="$(git diff --name-only | sort | tr '\n' ' ')"
+          if [ "$changed" != "Cargo.lock Cargo.toml VERSION " ]; then
+            echo "::error::unexpected files changed: $changed"
+            git diff --stat
+            exit 1
+          fi
+
+      - name: Create the release branch
+        run: |
+          gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" \
+            -f ref="refs/heads/$BRANCH" -f sha="$BASE_SHA" >/dev/null
+          echo "created $BRANCH at $BASE_SHA"
+
+      # createCommitOnBranch is used rather than `git commit` or the REST git-data API because
+      # GitHub SIGNS commits made by this mutation, and main's ruleset requires signed commits.
+      # (The REST API's `signature` field is caller-supplied — it does not sign for you.)
+      - name: Commit the bump
+        id: commit
+        run: |
+          jq -n \
+            --arg repo "$GITHUB_REPOSITORY" \
+            --arg branch "$BRANCH" \
+            --arg oid "$BASE_SHA" \
+            --arg headline "chore: v$VERSION" \
+            --arg v  "$(base64 -w0 VERSION)" \
+            --arg ct "$(base64 -w0 Cargo.toml)" \
+            --arg cl "$(base64 -w0 Cargo.lock)" \
+            '{
+              query: "mutation($input: CreateCommitOnBranchInput!) { createCommitOnBranch(input: $input) { commit { oid } } }",
+              variables: { input: {
+                branch: { repositoryNameWithOwner: $repo, branchName: $branch },
+                expectedHeadOid: $oid,
+                message: { headline: $headline },
+                fileChanges: { additions: [
+                  { path: "VERSION",    contents: $v  },
+                  { path: "Cargo.toml", contents: $ct },
+                  { path: "Cargo.lock", contents: $cl }
+                ]}
+              }}
+            }' > "$RUNNER_TEMP/commit.json"
+          sha="$(gh api graphql --input "$RUNNER_TEMP/commit.json" --jq .data.createCommitOnBranch.commit.oid)"
+          echo "head_sha=$sha" >> "$GITHUB_OUTPUT"
+
+      # Cheaper to fail here than at the merge, where the message is far less obvious.
+      - name: Verify GitHub signed the commit
+        env: { HEAD_SHA: '${{ steps.commit.outputs.head_sha }}' }
+        run: |
+          v="$(gh api "repos/$GITHUB_REPOSITORY/commits/$HEAD_SHA" --jq .commit.verification.verified)"
+          [ "$v" = true ] || { echo "::error::bump commit is unsigned — main's ruleset will reject the merge"; exit 1; }
+
+      - name: Open the release PR
+        id: pr
+        env:
+          BUMP: ${{ needs.plan.outputs.bump }}
+          PREV_TAG: ${{ needs.plan.outputs.prev_tag }}
+          TAG: ${{ needs.plan.outputs.tag }}
+        run: |
+          body="Automated release bump to \`$TAG\` (\`$BUMP\` from \`${PREV_TAG:-the start of history}\`).
+
+          Opened by \`.github/workflows/release.yml\`. Merging this is what triggers tag + build + publish;
+          the workflow merges it automatically once the required checks pass."
+          n="$(gh api -X POST "repos/$GITHUB_REPOSITORY/pulls" \
+                 -f title="chore: v$VERSION" -f head="$BRANCH" -f base=main -f body="$body" --jq .number)"
+          # `gh pr edit` labels via GraphQL addLabelsToLabelable on a PullRequest node, which is
+          # unambiguously covered by `pull-requests: write`. The REST /issues/{n}/labels endpoint
+          # documents itself as needing `issues: write`, which this job does not have.
+          # The label is load-bearing, not decorative: the `plan` guard rail finds an already-open
+          # release PR by it, and .github/release.yml excludes it from the notes by it.
+          gh pr edit "$n" --add-label release
+          echo "number=$n" >> "$GITHUB_OUTPUT"
+
+      # GITHUB_TOKEN-pushed refs do NOT start workflow runs, so the PR's required checks would never
+      # report and it could never merge. workflow_dispatch is the documented exception, and the
+      # resulting check runs attach to the head SHA — which is what the ruleset actually evaluates.
+      - name: Start CI on the release branch
+        run: gh workflow run ci.yml --ref "$BRANCH"
+
+      - name: Wait for the required checks to appear
+        env: { HEAD_SHA: '${{ steps.commit.outputs.head_sha }}' }
+        run: |
+          for _ in $(seq 1 60); do
+            n="$(gh api "repos/$GITHUB_REPOSITORY/commits/$HEAD_SHA/check-runs" \
+                   --jq '[.check_runs[].name | select(. == "build + test (macOS, unsigned)" or . == "commit messages (conventional commits)")] | length')"
+            if [ "$n" -ge 2 ]; then echo "both checks reported"; exit 0; fi
+            sleep 10
+          done
+          echo "::error::CI never started on $BRANCH — see the GITHUB_TOKEN note in docs/versioning.md"
+          exit 1
+
+      - name: Wait for the required checks to pass
+        env: { PR: '${{ steps.pr.outputs.number }}' }
+        run: gh pr checks "$PR" --required --watch --fail-fast --interval 30
+
+      - name: Merge the release PR
+        id: merge
+        env:
+          PR: ${{ steps.pr.outputs.number }}
+          HEAD_SHA: ${{ steps.commit.outputs.head_sha }}
+        run: |
+          # -f sha= makes the merge conditional on the branch tip: a 409 beats merging something
+          # unexpected if anything raced us.
+          sha="$(gh api -X PUT "repos/$GITHUB_REPOSITORY/pulls/$PR/merge" \
+                   -f merge_method=merge -f sha="$HEAD_SHA" \
+                   -f commit_title="Merge pull request #$PR from $BRANCH" \
+                   -f commit_message="chore: v$VERSION" --jq .sha)"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "merged as $sha"
+
+      # Leave the PR and branch alone on failure — they are the recovery material.
+      - name: Explain the failure
+        if: failure()
+        env: { PR: '${{ steps.pr.outputs.number }}' }
+        run: |
+          {
+            echo "## Release bump failed"
+            echo
+            if [ -n "${PR:-}" ]; then
+              echo "PR: $(gh pr view "$PR" --json url --jq .url)"
+              gh pr view "$PR" --json mergeStateStatus,statusCheckRollup \
+                --jq '"mergeStateStatus: \(.mergeStateStatus)"' || true
+              echo
+              echo 'The release PR is left OPEN on purpose. Merge it by hand, then re-dispatch:'
+              echo 'the workflow will see VERSION already bumped, skip this job, and go straight to'
+              echo 'build + tag + publish.'
+            else
+              echo 'Failed before the PR was opened; nothing to clean up beyond a possible stale'
+              echo "\`$BRANCH\` branch."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ------------------------------------------------------------ release (build + publish, macOS)
+  release:
+    name: build + publish (macOS)
+    needs: [plan, bump]
+    # `bump` is skipped on the recovery path (VERSION already carries the target version), and a
+    # skipped dependency must not skip this job.
+    if: |
+      always() && needs.plan.outputs.proceed == 'true'
+      && (needs.bump.result == 'success' || needs.bump.result == 'skipped')
+    runs-on: macos-15
+    timeout-minutes: 90
+    permissions:
+      contents: write   # create the tag and the GitHub Release
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+      TAG: ${{ needs.plan.outputs.tag }}
+      IS_PRERELEASE: ${{ needs.plan.outputs.prerelease }}
+    steps:
+      # The merge commit when `bump` ran, else main's tip (recovery path).
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.bump.outputs.merge_sha || 'main' }}
+          fetch-depth: 0
+
+      # Replaces the old tag-vs-VERSION check: same intent (never ship an artifact labelled with a
+      # version we did not plan), now anchored to the plan rather than to a pushed ref.
+      - name: Verify the checkout carries the planned version
+        run: |
+          have="$(tr -d '[:space:]' < VERSION)"
+          [ "$have" = "$VERSION" ] || { echo "::error::VERSION is $have, expected $VERSION"; exit 1; }
+          cargo_v="$(awk '/^\[workspace\.package\]/{f=1} f&&/^version/{gsub(/[" ]/,"");sub(/^version=/,"");print;exit}' Cargo.toml)"
+          [ "$cargo_v" = "$VERSION" ] || { echo "::error::Cargo.toml workspace version is $cargo_v, expected $VERSION"; exit 1; }
 
       - name: Select Xcode (Metal shader compiler needs full Xcode)
         uses: maxim-lobanov/setup-xcode@v1
@@ -59,7 +372,6 @@ jobs:
       # Doppler SERVICE TOKEN (the only credential in GitHub — no Apple signing secret is stored here).
       # Gate on the token's presence; secrets aren't reliably usable in `if:`, so surface a boolean
       # output. Forks / a repo without the token publish an unsigned build. See docs/code-signing.md.
-      # (OIDC — no stored token — needs a Doppler Service Account, a Team/Enterprise feature.)
       - name: Detect Doppler token
         id: signing
         env:
@@ -119,22 +431,58 @@ jobs:
           scripts/package-dmg.sh
           rm -f "$RUNNER_TEMP/notary.p8"
 
+      # ---------- unsigned fallback (no DOPPLER_TOKEN: forks / unconfigured repo) ----------
+      - name: Zip the unsigned app bundle
+        if: steps.signing.outputs.enabled != 'true'
+        run: ditto -c -k --keepParent dist/Clowder.app "dist/Clowder-$VERSION-macos.zip"
+
+      # ---------- tag LAST, once there is something to publish ----------
+      # Deliberately after the build: a tag is the input to the NEXT version computation, so one left
+      # behind by a failed build would make the next run measure from it and silently skip a version
+      # that never shipped. A bumped VERSION with no tag is benign — a re-dispatch recomputes the
+      # same version, sees needs_bump=false, skips `bump`, and lands here again.
+      - name: Tag the released commit
+        run: |
+          git config user.name  "clowder-release-bot"
+          git config user.email "clowder-release-bot@users.noreply.github.com"
+          # -a is mandatory: unlike a dev machine, CI has no tag.gpgsign, so a bare `git tag` would
+          # quietly create a LIGHTWEIGHT tag. Not signed — no ruleset targets tags, and shipping the
+          # signing key to Actions would be a worse trade.
+          git tag -a "$TAG" -m "$TAG" HEAD
+          git push origin "refs/tags/$TAG"
+
       - name: Publish GitHub Release (signed)
         if: steps.signing.outputs.enabled == 'true'
         uses: softprops/action-gh-release@v2
         with:
+          # tag_name is required now that no tag triggered this run — without it the action would
+          # create a release named after the branch.
+          tag_name: ${{ needs.plan.outputs.tag }}
           files: dist/Clowder-*-macos.dmg
           generate_release_notes: true
-          # A tag with a '-' (e.g. v0.3.0-rc1) is a pre-release: keeps it out of GitHub "Latest"
-          # (and thus the Homebrew cask livecheck), and the cask-bump step below skips it too.
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          prerelease: ${{ needs.plan.outputs.prerelease == 'true' }}
           body: |
-            Signed & notarized macOS build of Clowder (`${{ github.ref_name }}`).
+            Signed & notarized macOS build of Clowder (`${{ needs.plan.outputs.tag }}`).
 
             Open the `.dmg` and drag **Clowder** to **Applications**. No Gatekeeper workaround needed.
 
+      - name: Publish GitHub Release (unsigned)
+        if: steps.signing.outputs.enabled != 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.plan.outputs.tag }}
+          files: dist/Clowder-*-macos.zip
+          generate_release_notes: true
+          prerelease: ${{ needs.plan.outputs.prerelease == 'true' }}
+          body: |
+            Unsigned macOS build of Clowder (`${{ needs.plan.outputs.tag }}`).
+
+            > This build is **not code-signed or notarized** (Doppler signing not configured). On first
+            > launch macOS Gatekeeper will quarantine it — right-click the app → **Open**, or run
+            > `xattr -dr com.apple.quarantine Clowder.app`.
+
       - name: Update Homebrew tap (publish DMG + cask bump)
-        if: ${{ steps.signing.outputs.enabled == 'true' && !contains(github.ref_name, '-') }}
+        if: ${{ steps.signing.outputs.enabled == 'true' && needs.plan.outputs.prerelease != 'true' }}
         env:
           HOMEBREW_TAP_TOKEN: ${{ steps.doppler.outputs.HOMEBREW_TAP_TOKEN }}
         run: |
@@ -143,25 +491,6 @@ jobs:
             exit 0
           fi
           scripts/update-homebrew-tap.sh
-
-      # ---------- unsigned fallback (no DOPPLER_TOKEN: forks / unconfigured repo) ----------
-      - name: Zip the unsigned app bundle
-        if: steps.signing.outputs.enabled != 'true'
-        run: ditto -c -k --keepParent dist/Clowder.app "dist/Clowder-${GITHUB_REF_NAME}-macos.zip"
-
-      - name: Publish GitHub Release (unsigned)
-        if: steps.signing.outputs.enabled != 'true'
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/Clowder-*-macos.zip
-          generate_release_notes: true
-          prerelease: ${{ contains(github.ref_name, '-') }}
-          body: |
-            Unsigned macOS build of Clowder (`${{ github.ref_name }}`).
-
-            > This build is **not code-signed or notarized** (Doppler signing not configured). On first
-            > launch macOS Gatekeeper will quarantine it — right-click the app → **Open**, or run
-            > `xattr -dr com.apple.quarantine Clowder.app`.
 
       - name: Remove temp signing keychain
         if: ${{ always() && steps.signing.outputs.enabled == 'true' }}

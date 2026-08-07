@@ -15,11 +15,13 @@ else
   VERSION="$(tr -d '[:space:]' < VERSION)"
 fi
 
-# Validate semver X.Y.Z (optionally a -prerelease suffix).
-case "$VERSION" in
-  [0-9]*.[0-9]*.[0-9]*) : ;;
-  *) echo "error: version '$VERSION' is not X.Y.Z" >&2; exit 1 ;;
-esac
+# Validate semver X.Y.Z (optionally a -prerelease suffix). Stricter than the old glob, which
+# accepted '1.2.3junk' and '01.2.3' — release.yml now feeds this computed values, so a malformed
+# version must fail here rather than reaching a tag.
+if ! [[ $VERSION =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$ ]]; then
+  echo "error: version '$VERSION' is not X.Y.Z[-prerelease]" >&2
+  exit 1
+fi
 
 echo "==> Setting version $VERSION"
 printf '%s\n' "$VERSION" > VERSION
