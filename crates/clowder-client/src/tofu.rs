@@ -137,9 +137,10 @@ mod tests {
     /// accept loop, so the full-stack e2e round-trip lives here rather than in clowder-daemon
     /// (which would need a new dev-dependency on this crate purely for its private `tofu`
     /// module — see task-5 report for the cross-crate direction rationale). Guards the process-
-    /// global `XDG_STATE_HOME` env var against races with any other env-mutating test that might
-    /// later land in this crate's test binary.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// global `XDG_STATE_HOME` env var against races with any other env-mutating test — including
+    /// `probe`'s — that might touch it in this crate's test binary; see `crate::ENV_LOCK` for why
+    /// this must be one lock shared crate-wide rather than a lock per module.
+    use crate::ENV_LOCK;
 
     #[tokio::test]
     async fn e2e_tls_tofu_records_then_refuses_on_cert_change() {

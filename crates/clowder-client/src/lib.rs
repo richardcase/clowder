@@ -28,6 +28,16 @@ pub mod remote_cli;
 pub mod target;
 pub mod tofu;
 
+/// `XDG_STATE_HOME` is process-global, and both `tofu` and `probe` resolve their state-dir paths
+/// (`remote_known_hosts`, `remote_creds`, ...) from it. Every test in either module that points
+/// `XDG_STATE_HOME` at a scratch dir must hold this lock for its full env-var-dependent span, or
+/// it races another such test's `set_var`/`remove_var` against a path read elsewhere in the
+/// process — a per-module lock (one in `tofu`, a separate one in `probe`) excludes nothing,
+/// because `cargo test` runs test fns from different modules in parallel by default. This must be
+/// reachable crate-wide, mirroring `clowder_daemon::STATE_FILE_ENV_LOCK`.
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// RAII guard that restores the terminal from raw mode when dropped, even on
 /// error paths or panics/unwinds — so a crash in `pump` never leaves the
 /// user's terminal wrecked.

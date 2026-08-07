@@ -122,8 +122,10 @@ mod tests {
     use crate::forward::RemoteTarget;
 
     /// Guards the process-global `XDG_STATE_HOME` these tests set, against other env-mutating
-    /// tests in this crate's binary (see the same pattern in `tofu.rs`).
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// tests in this crate's binary — including `tofu`'s e2e test, which resolves the same env
+    /// var. Shared crate-wide rather than a lock private to this module: a per-module lock would
+    /// exclude nothing against `tofu`'s own lock. See `crate::ENV_LOCK` for the full rationale.
+    use crate::ENV_LOCK;
 
     fn target(addr: &str, tls: bool, token: Option<&str>) -> RemoteTarget {
         RemoteTarget {
