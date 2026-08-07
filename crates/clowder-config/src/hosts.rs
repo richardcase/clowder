@@ -247,13 +247,14 @@ pub fn merged_hosts(file: Vec<HostRecord>, cfg: &crate::Config) -> Vec<HostEntry
     if out.iter().any(|e| e.record.address == address) {
         return out; // the file record wins entirely
     }
-    // "config" is the friendly default name; fall back to the address if a registry entry
-    // already took it, so the list never contains two entries with the same name.
-    let name = if out.iter().any(|e| e.record.name == "config") {
-        address.clone()
-    } else {
-        "config".to_string()
-    };
+
+    // The returned list never contains two entries with the same name. The validators'
+    // disjoint character sets (validate_name forbids ':', validate_address requires ':')
+    // make a name-address collision unreachable for validated data. However, HostsStore::load
+    // does not re-validate on load, and the registry is meant to be hand-editable, so a
+    // hand-edited file can reach this case. We guarantee uniqueness by trying preferred
+    // names in order, then suffixing with -2, -3, etc. until one is available.
+    let name = find_unique_name(&out, "config", &address);
     out.push(HostEntry {
         record: HostRecord {
             name,
@@ -268,6 +269,25 @@ pub fn merged_hosts(file: Vec<HostRecord>, cfg: &crate::Config) -> Vec<HostEntry
         source: HostSource::Config,
     });
     out
+}
+
+/// Find a unique name by preferring the primary choice, then falling back to the secondary,
+/// then suffixing the secondary with -2, -3, etc. until a name is found that does not
+/// appear in the existing entries.
+fn find_unique_name(entries: &[HostEntry], primary: &str, secondary: &str) -> String {
+    if !entries.iter().any(|e| e.record.name == primary) {
+        return primary.to_string();
+    }
+    if !entries.iter().any(|e| e.record.name == secondary) {
+        return secondary.to_string();
+    }
+    for i in 2.. {
+        let candidate = format!("{secondary}-{i}");
+        if !entries.iter().any(|e| e.record.name == candidate) {
+            return candidate;
+        }
+    }
+    unreachable!("must find a unique name before running out of suffix space")
 }
 
 #[cfg(test)]
@@ -527,5 +547,50 @@ mod tests {
         let out = merged_hosts(vec![rec("a", "h:1")], &cfg_with_host(None, false, None));
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].source, HostSource::Registry);
+    }
+
+    #[test]
+    fn chained_collision_remains_unique() {
+        // Regression test: a hand-edited registry with both an entry named "config" and
+        // an entry whose name equals the config host's address. The uniqueness guarantee
+        // must still hold even though the primary and secondary names are both taken.
+        let file = vec![
+            rec("config", "other:1"),          // primary name taken
+            rec("10.0.0.5:7777", "other:2"),   // secondary name (address) taken
+        ];
+        let out = merged_hosts(file, &cfg_with_host(Some("10.0.0.5:7777"), false, None));
+        assert_eq!(out.len(), 3, "both file records plus the config virtual entry");
+
+        let names: Vec<&str> = out.iter().map(|e| e.record.name.as_str()).collect();
+        // Check all names are distinct (no duplicates).
+        let mut names_sorted = names.clone();
+        names_sorted.sort();
+        names_sorted.dedup();
+        assert_eq!(names_sorted.len(), names.len(), "all names must be unique, got: {names:?}");
+        // Verify the virtual entry got a suffixed fallback name.
+        assert_eq!(out[2].source, HostSource::Config);
+        assert_eq!(out[2].record.name, "10.0.0.5:7777-2", "should suffix when primary and secondary are taken");
+    }
+
+    #[test]
+    fn merged_hosts_is_idempotent() {
+        // Feeding merged_hosts output back in as the file argument must not duplicate
+        // the config entry. This is the property claimed in the function's doc comment.
+        let orig_file = vec![rec("studio", "s:7777")];
+        let cfg = cfg_with_host(Some("h:2"), false, None);
+
+        let first = merged_hosts(orig_file.clone(), &cfg);
+        assert_eq!(first.len(), 2, "original file record + config virtual");
+
+        // Convert back to HostRecords (simulating a second load).
+        let second_input: Vec<HostRecord> = first.iter().map(|e| e.record.clone()).collect();
+        let second = merged_hosts(second_input, &cfg);
+
+        assert_eq!(second.len(), first.len(), "merging the output should produce the same length");
+        assert_eq!(
+            second.iter().map(|e| &e.record).collect::<Vec<_>>(),
+            first.iter().map(|e| &e.record).collect::<Vec<_>>(),
+            "all records must be identical on re-merge"
+        );
     }
 }
