@@ -213,6 +213,63 @@ fn write_atomic_0600(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Where an entry came from. `Config` entries are read-only: they live in `config.toml`, which
+/// this code never rewrites.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostSource {
+    Registry,
+    Config,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostEntry {
+    pub record: HostRecord,
+    pub source: HostSource,
+}
+
+/// The user-visible host list: the registry file, plus `[remote] host` as a **virtual** entry.
+///
+/// Pure — no I/O — so it is table-testable, exactly like `Config::resolve`.
+///
+/// The config entry is never written back to the registry. A one-time migration was rejected
+/// because it would make a later hand-edit of `config.toml` silently stop taking effect, and the
+/// migration itself could clobber. This way `config.toml` stays authoritative forever and the
+/// merge is idempotent.
+pub fn merged_hosts(file: Vec<HostRecord>, cfg: &crate::Config) -> Vec<HostEntry> {
+    let mut out: Vec<HostEntry> = file
+        .into_iter()
+        .map(|record| HostEntry { record, source: HostSource::Registry })
+        .collect();
+
+    let Some(address) = cfg.remote_host.clone() else {
+        return out;
+    };
+    if out.iter().any(|e| e.record.address == address) {
+        return out; // the file record wins entirely
+    }
+    // "config" is the friendly default name; fall back to the address if a registry entry
+    // already took it, so the list never contains two entries with the same name.
+    let name = if out.iter().any(|e| e.record.name == "config") {
+        address.clone()
+    } else {
+        "config".to_string()
+    };
+    out.push(HostEntry {
+        record: HostRecord {
+            name,
+            address,
+            // A configured token is only ever useful over TLS, and `docs/remote-tls.md` documents
+            // `tls` as a DAEMON key — so every existing client with a token has `remote_tls == false`
+            // and would be silently downgraded to plaintext without this `||`.
+            tls: cfg.remote_tls || cfg.remote_token.is_some(),
+            token: cfg.remote_token.clone(),
+            fingerprint: None,
+        },
+        source: HostSource::Config,
+    });
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,6 +283,15 @@ mod tests {
             tls: false,
             token: None,
             fingerprint: None,
+        }
+    }
+
+    fn cfg_with_host(host: Option<&str>, tls: bool, token: Option<&str>) -> crate::Config {
+        crate::Config {
+            remote_host: host.map(String::from),
+            remote_tls: tls,
+            remote_token: token.map(String::from),
+            ..crate::Config::default()
         }
     }
 
@@ -405,5 +471,61 @@ mod tests {
         std::env::set_var("XDG_STATE_HOME", "/xdg/state");
         assert_eq!(remote_hosts_path(), std::path::PathBuf::from("/xdg/state/clowder/hosts.json"));
         std::env::remove_var("XDG_STATE_HOME");
+    }
+
+    #[test]
+    fn file_records_come_first_in_file_order() {
+        let file = vec![rec("b", "hb:1"), rec("a", "ha:1")];
+        let out = merged_hosts(file, &cfg_with_host(None, false, None));
+        assert_eq!(out.iter().map(|e| e.record.name.as_str()).collect::<Vec<_>>(), ["b", "a"]);
+        assert!(out.iter().all(|e| e.source == HostSource::Registry));
+    }
+
+    #[test]
+    fn config_host_appears_as_a_virtual_entry() {
+        let out = merged_hosts(vec![], &cfg_with_host(Some("10.0.0.5:7777"), false, Some("tok")));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].source, HostSource::Config);
+        assert_eq!(out[0].record.name, "config");
+        assert_eq!(out[0].record.address, "10.0.0.5:7777");
+        assert_eq!(out[0].record.token.as_deref(), Some("tok"));
+        // A configured token implies TLS even when [remote] tls is unset — docs/remote-tls.md
+        // tells clients to set only host + token, so every existing TLS user lands here.
+        assert!(out[0].record.tls);
+    }
+
+    #[test]
+    fn config_host_without_a_token_is_plaintext_unless_tls_is_set() {
+        let out = merged_hosts(vec![], &cfg_with_host(Some("h:1"), false, None));
+        assert!(!out[0].record.tls);
+        let out = merged_hosts(vec![], &cfg_with_host(Some("h:1"), true, None));
+        assert!(out[0].record.tls);
+    }
+
+    #[test]
+    fn a_file_record_with_the_same_address_wins_entirely() {
+        // No per-field merging: nobody can debug "why is my config token overriding my registry token".
+        let mut r = rec("studio", "10.0.0.5:7777");
+        r.token = Some("registry-token".into());
+        let out = merged_hosts(vec![r], &cfg_with_host(Some("10.0.0.5:7777"), false, Some("config-token")));
+        assert_eq!(out.len(), 1, "the config host must not be added twice");
+        assert_eq!(out[0].source, HostSource::Registry);
+        assert_eq!(out[0].record.token.as_deref(), Some("registry-token"));
+    }
+
+    #[test]
+    fn a_taken_config_name_falls_back_to_the_address() {
+        // A registry entry already NAMED "config", at a different address.
+        let out = merged_hosts(vec![rec("config", "other:1")], &cfg_with_host(Some("h:2"), false, None));
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1].record.name, "h:2");
+        assert_eq!(out[1].source, HostSource::Config);
+    }
+
+    #[test]
+    fn no_config_host_means_no_virtual_entry() {
+        let out = merged_hosts(vec![rec("a", "h:1")], &cfg_with_host(None, false, None));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].source, HostSource::Registry);
     }
 }
