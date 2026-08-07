@@ -8,7 +8,8 @@ use clowder_config::Config;
 ///
 /// Pure — no I/O — so every rule below is table-tested. Rules, in order:
 ///
-/// 1. No selector → the entry matching `[remote] host`, if any.
+/// 1. No selector → the entry matching `[remote] host`, if any; **falls back to ad-hoc TOFU** if
+///    the configured host is not in the registry.
 /// 2. An exact **name** match.
 /// 3. An exact **address** match (keeps the entry's identity, pin, and token).
 /// 4. A selector that looks like an address but matches nothing → an **ad-hoc TOFU target** using
@@ -47,6 +48,8 @@ pub fn resolve_target(
         }
     };
 
+    // Structurally unreachable for targets built by `adhoc()` — its `||` rule guarantees
+    // `tls == true` whenever a token is present. Still applied after every branch for clarity.
     if target.token.is_some() && !target.tls {
         return Err(format!(
             "host {:?} has a token but TLS is off — a bearer token must never cross the network in \
@@ -109,9 +112,14 @@ mod tests {
 
     #[test]
     fn no_selector_uses_the_only_configured_host() {
-        let hosts = vec![entry("config", "h:1", false, None, None)];
+        // Entry has tls=true, token=Some("entok") to discriminate from cfg (tls=false, token=None).
+        // If the registry lookup were skipped, adhoc() would return tls=false, revealing the bug.
+        let hosts = vec![entry("config", "h:1", true, Some("entok"), None)];
         let t = resolve_target(None, &hosts, &cfg(Some("h:1"), false, None)).unwrap();
+        assert_eq!(t.label, "config", "must consult the registry, not fall straight to adhoc");
         assert_eq!(t.address, "h:1");
+        assert_eq!(t.token.as_deref(), Some("entok"), "entry's token must be used");
+        assert!(t.tls, "entry's tls must be used");
     }
 
     #[test]
@@ -140,6 +148,22 @@ mod tests {
         let t = resolve_target(Some("s:7777"), &hosts, &cfg(None, false, None)).unwrap();
         assert_eq!(t.label, "studio", "an address match must still use the entry's identity");
         assert_eq!(t.fingerprint.as_deref(), Some("aa11"));
+    }
+
+    #[test]
+    fn a_name_match_takes_precedence_over_an_address_match() {
+        // Entry A: name="studio", address="s:7777", tls=false, fp="aa11"
+        // Entry B: name="s:7777", address="b:2", tls=true, fp="bb22"
+        // Selecting "s:7777" must resolve to B (name match), not A (address match).
+        let hosts = vec![
+            entry("studio", "s:7777", false, None, Some("aa11")),
+            entry("s:7777", "b:2", true, None, Some("bb22")),
+        ];
+        let t = resolve_target(Some("s:7777"), &hosts, &cfg(None, false, None)).unwrap();
+        assert_eq!(t.label, "s:7777", "must resolve to the name match (entry B), not the address match (entry A)");
+        assert_eq!(t.address, "b:2", "entry B's address confirms the name match was chosen");
+        assert_eq!(t.fingerprint.as_deref(), Some("bb22"), "entry B's fingerprint confirms the name match was chosen");
+        assert!(t.tls, "entry B's tls=true confirms the name match was chosen");
     }
 
     #[test]
