@@ -98,7 +98,12 @@ An optional remote TCP listener (`[remote] listen`/`host`) can be hardened with 
 - **Versioning:** `VERSION` is canonical; bump via `scripts/set-version.sh` and commit the regenerated
   `Cargo.lock` (CI runs `cargo test --workspace --locked`).
 - **Known behavior:** agents do **not** survive a daemon restart (PTYs are daemon children); the daemon
-  holds a single-instance advisory `flock` and exits **code 3** if another instance already owns it.
+  holds a single-instance advisory `flock` and exits **code 3** *only* when another instance already
+  owns it (any other startup failure exits 1, which the app retries — code 3 makes it yield for good).
+- **Daemon logs:** the app redirects the daemon's stdout/stderr to
+  `$XDG_STATE_HOME/clowder/daemon.log` › `~/.local/state/clowder/daemon.log`. A GUI-launched `.app`
+  has no terminal, so this is the *only* place startup failures are visible — check it first when the
+  app can't reach the daemon. Appends across relaunches; truncated past 4 MB.
 
 ## CI
 

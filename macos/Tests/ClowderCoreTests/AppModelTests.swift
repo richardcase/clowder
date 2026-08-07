@@ -52,13 +52,80 @@ final class AppModelTests: XCTestCase {
         XCTAssertTrue(fake.sentLines.contains { $0.contains("\"type\":\"listProjects\"") }, "\(fake.sentLines)")
     }
 
-    func testConnectFailureBecomesClosed() {
-        struct BoomError: Error {}
-        let model = AppModel(makeTransport: { throw BoomError() })
+    /// THE fresh-machine bug: on first launch the app spawns the daemon and connects immediately, so
+    /// `connect(2)` hits ENOENT until the daemon binds. This used to land in `.closed` — a terminal
+    /// red banner with no Retry — and the only cure was relaunching the app, which then found the
+    /// first launch's daemon already listening ("starting a second time it works").
+    ///
+    /// Now it retries, and the whole grace period is spent in `.connecting`, which renders no banner.
+    /// So the assertion that matters is the NEGATIVE one: the user is never shown anything.
+    func testFirstConnectRetriesSilentlyWhileTheDaemonIsStillBinding() async {
+        let controller = SleepController()
+        var call = 0
+        struct NotYet: Error {}     // stands in for POSIXError(.ENOENT)
+        var observed: [AppModel.ConnectionState] = []
+        let model = AppModel(
+            makeTransport: {
+                call += 1
+                if call <= 3 { throw NotYet() }     // daemon still binding
+                return FakeControlTransport()
+            },
+            sleep: { await controller.sleep($0) }
+        )
+
         model.connect()
-        guard case .closed = model.connectionState else {
-            return XCTFail("expected .closed, got \(model.connectionState)")
+        observed.append(model.connectionState)
+        for _ in 0..<3 {
+            _ = await eventually { controller.parkedCount == 1 }
+            observed.append(model.connectionState)
+            controller.advance()
         }
+        let wentLive = await eventually { model.connectionState == .live }
+        XCTAssertTrue(wentLive, "should connect once the daemon is up, got \(model.connectionState)")
+
+        // Never surfaced anything to the user on the way: no red banner, no orange one either.
+        XCTAssertFalse(observed.contains { if case .closed = $0 { return true } else { return false } },
+                       "must not go .closed on a cold start: \(observed)")
+        XCTAssertFalse(observed.contains(.reconnecting),
+                       "must stay silent within the grace period: \(observed)")
+        model.shutdown()
+    }
+
+    /// The grace period is silent but not infinite: a daemon that never comes up must eventually
+    /// tell the user something, rather than looking like a healthy app that does nothing.
+    func testFirstConnectEscalatesToReconnectingOnceGraceIsExhausted() async {
+        let controller = SleepController()
+        struct Down: Error {}
+        let model = AppModel(makeTransport: { throw Down() }, sleep: { await controller.sleep($0) })
+
+        model.connect()
+        XCTAssertEqual(model.connectionState, .connecting)
+
+        // Burn through the grace attempts; the state must stay silent for all of them.
+        for i in 0..<5 {
+            _ = await eventually { controller.parkedCount == 1 }
+            XCTAssertEqual(model.connectionState, .connecting, "attempt \(i) should still be silent")
+            controller.advance()
+        }
+        let escalated = await eventually { model.connectionState == .reconnecting }
+        XCTAssertTrue(escalated, "expected .reconnecting once grace ran out, got \(model.connectionState)")
+
+        // The fast ramp is what keeps the grace period short enough to be invisible.
+        XCTAssertEqual(controller.delays.prefix(5).map { ($0 * 1000).rounded() },
+                       [50, 100, 200, 400, 800])
+        model.shutdown()
+    }
+
+    /// The happy path must not regress into sleeping: a daemon that is already listening (the
+    /// second-launch case, and every launch after this fix) connects on the first attempt.
+    func testFirstConnectWhenDaemonIsAlreadyUpDoesNotSleepAtAll() {
+        let controller = SleepController()
+        let fake = FakeControlTransport()
+        let model = AppModel(makeTransport: { fake }, sleep: { await controller.sleep($0) })
+        model.connect()
+        XCTAssertEqual(model.connectionState, .live)
+        XCTAssertEqual(controller.delays, [], "no retry loop should start when the first attempt works")
+        model.shutdown()
     }
 
     func testOnCloseEntersReconnecting() {

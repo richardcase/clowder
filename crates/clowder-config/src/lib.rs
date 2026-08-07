@@ -143,6 +143,24 @@ fn read_file(path: PathBuf) -> Option<FileConfig> {
     }
 }
 
+/// The per-user runtime dir holding the sockets and the daemon's PID lock:
+/// `$XDG_RUNTIME_DIR` › `$TMPDIR` › `/tmp`, then `/clowder`.
+///
+/// The single definition of this chain. `resolve` derives the default socket paths from the same
+/// rule (via its injected `get_env`), and `InstanceLock::default_path` calls this — they must agree,
+/// or the lock and the sockets land in different directories and the daemon fails to start in a way
+/// that looks nothing like its cause.
+///
+/// Empty values count as unset, matching every other env lookup here: `TMPDIR=""` must fall through
+/// to `/tmp`, not resolve to `/clowder`.
+pub fn runtime_dir() -> PathBuf {
+    let nonempty = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    let base = nonempty("XDG_RUNTIME_DIR")
+        .or_else(|| nonempty("TMPDIR"))
+        .unwrap_or_else(|| "/tmp".to_string());
+    PathBuf::from(base).join("clowder")
+}
+
 /// The durable per-user dir holding remote TLS creds: `$XDG_STATE_HOME/clowder` › `$HOME/.local/state/clowder` › `/tmp/clowder`.
 pub fn remote_state_dir() -> PathBuf {
     let base = std::env::var("XDG_STATE_HOME").ok().filter(|s| !s.is_empty())
