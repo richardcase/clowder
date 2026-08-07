@@ -109,7 +109,11 @@ jobs:
           # An existing tag means that version already shipped. Bumping onto it would attach a second
           # release to the same name; recomputing around it would skip a version silently.
           if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" >/dev/null 2>&1; then
-            echo "::error::$TAG already exists. Delete it (gh release delete $TAG --cleanup-tag) or pass version_override."
+            # A tag can exist with NO release: the tag push succeeds and the publish step then fails.
+            # `gh release delete --cleanup-tag` errors in that state, so name the raw ref delete too.
+            echo "::error::$TAG already exists. Delete it — 'gh release delete $TAG --cleanup-tag', or"
+            echo "::error::'gh api -X DELETE repos/$GITHUB_REPOSITORY/git/refs/tags/$TAG' if no release"
+            echo "::error::was published — or pass version_override."
             exit 1
           fi
 
@@ -144,9 +148,9 @@ jobs:
       contents: write
       pull-requests: write
       actions: write      # to dispatch ci.yml on the release branch (see below)
-      # Required by the two wait steps: `/commits/{sha}/check-runs` and `gh pr checks` both read
-      # check runs. Workflow-level `permissions: {}` makes every unlisted scope `none`, so omitting
-      # this 403s at exactly the point where the release is waiting to merge.
+      # Required by the check wait: `/commits/{sha}/check-runs` reads check runs. Workflow-level
+      # `permissions: {}` makes every unlisted scope `none`, so omitting this 403s at exactly the
+      # point where the release is waiting to merge.
       checks: read
     outputs:
       merge_sha: ${{ steps.merge.outputs.sha }}
@@ -242,27 +246,88 @@ jobs:
           gh pr edit "$n" --add-label release
           echo "number=$n" >> "$GITHUB_OUTPUT"
 
-      # GITHUB_TOKEN-pushed refs do NOT start workflow runs, so the PR's required checks would never
-      # report and it could never merge. workflow_dispatch is the documented exception, and the
-      # resulting check runs attach to the head SHA — which is what the ruleset actually evaluates.
+      # Documented behaviour is that GITHUB_TOKEN-pushed refs do not start workflow runs, which would
+      # leave the PR's required checks unreported for ever; workflow_dispatch is the exception.
+      # In practice a `pull_request` run ALSO fires here (observed on the v0.5.0 bump PR: 4 check
+      # runs, 2 names across 2 suites). Keep the dispatch anyway — a release must not depend on
+      # undocumented behaviour — and let the wait below cope with the duplicate names.
       - name: Start CI on the release branch
         run: gh workflow run ci.yml --ref "$BRANCH"
 
-      - name: Wait for the required checks to appear
-        env: { HEAD_SHA: '${{ steps.commit.outputs.head_sha }}' }
+      # ONE source of truth: the check runs attached to the head SHA.
+      #
+      # This replaces a pair of steps that read two DIFFERENT sources — this endpoint for "have they
+      # appeared", then `gh pr checks` (the PR's GraphQL statusCheckRollup) for "have they passed".
+      # The rollup lags by seconds, so the first said "both checks reported" and the second said "no
+      # checks reported" one second later and exited 1 — it does not wait when the rollup is empty.
+      # See run 31163104469, 08:47:14 -> 08:47:15.
+      - name: Wait for the required checks
+        env:
+          HEAD_SHA: ${{ steps.commit.outputs.head_sha }}
+          # A check that never appears means CI did not start at all — a different failure with a
+          # different fix, so it gets its own much shorter deadline rather than burning the full
+          # budget before reporting it.
+          APPEAR_TIMEOUT_MIN: '10'
+          # ~35 min for the macOS build plus macos-15 queueing. The job cap is 120 and the merge
+          # step can take ~12 more, so this leaves headroom.
+          PASS_TIMEOUT_MIN: '75'
+          POLL_SECONDS: '20'
         run: |
-          for _ in $(seq 1 60); do
-            n="$(gh api "repos/$GITHUB_REPOSITORY/commits/$HEAD_SHA/check-runs" \
-                   --jq '[.check_runs[].name | select(. == "build + test (macOS, unsigned)" or . == "commit messages (conventional commits)")] | length')"
-            if [ "$n" -ge 2 ]; then echo "both checks reported"; exit 0; fi
-            sleep 10
-          done
-          echo "::error::CI never started on $BRANCH — see the GITHUB_TOKEN note in docs/versioning.md"
-          exit 1
+          set -euo pipefail
+          start=$(date +%s)
+          appear_deadline=$(( start + APPEAR_TIMEOUT_MIN * 60 ))
+          pass_deadline=$(( start + PASS_TIMEOUT_MIN * 60 ))
+          last=''; tick=0
 
-      - name: Wait for the required checks to pass
-        env: { PR: '${{ steps.pr.outputs.number }}' }
-        run: gh pr checks "$PR" --required --watch --fail-fast --interval 30
+          while :; do
+            # The required set comes from main's ruleset, not a literal here, so adding a third
+            # required check gates the release automatically. Classification (latest-per-name,
+            # which conclusions count) lives in the script so it can be unit-tested.
+            report="$(scripts/check-runs-state.sh --sha "$HEAD_SHA")"
+
+            missing=0; pending=0; failed=0; passed=0
+            while IFS=$'\t' read -r name state conclusion url; do
+              [ -n "$name" ] || continue
+              case "$state" in
+                missing) missing=$(( missing + 1 )) ;;
+                pending) pending=$(( pending + 1 )) ;;
+                passed)  passed=$(( passed + 1 )) ;;
+                failed)
+                  failed=$(( failed + 1 ))
+                  echo "::error::required check '$name' concluded '$conclusion' — $url" ;;
+              esac
+            done <<<"$report"
+
+            if [ "$failed" -gt 0 ]; then
+              echo "::error::required checks did not pass on $HEAD_SHA — the release PR is left open"
+              exit 1
+            fi
+            if [ "$missing" -eq 0 ] && [ "$pending" -eq 0 ]; then
+              echo "all $passed required checks passed on $HEAD_SHA"
+              exit 0
+            fi
+
+            state_line="missing=$missing pending=$pending passed=$passed"
+            if [ "$state_line" != "$last" ] || [ $(( tick % 15 )) -eq 0 ]; then
+              printf '%s  %s\n' "$(date -u +%H:%M:%S)" "$state_line"
+              last="$state_line"
+            fi
+            tick=$(( tick + 1 ))
+
+            now=$(date +%s)
+            if [ "$missing" -gt 0 ] && [ "$now" -ge "$appear_deadline" ]; then
+              awk -F'\t' '$2 == "missing" { print "::error::never reported: " $1 }' <<<"$report"
+              echo "::error::CI did not start on $BRANCH within ${APPEAR_TIMEOUT_MIN}m. The 'Start CI'"
+              echo "::error::dispatch is what makes the required checks run and it needs actions:write —"
+              echo "::error::check ci.yml still accepts workflow_dispatch. See docs/versioning.md."
+              exit 1
+            fi
+            if [ "$now" -ge "$pass_deadline" ]; then
+              echo "::error::required checks still running after ${PASS_TIMEOUT_MIN}m ($state_line) — giving up; the PR is left open"
+              exit 1
+            fi
+            sleep "$POLL_SECONDS"
+          done
 
       - name: Merge the release PR
         id: merge
@@ -270,14 +335,67 @@ jobs:
           PR: ${{ steps.pr.outputs.number }}
           HEAD_SHA: ${{ steps.commit.outputs.head_sha }}
         run: |
+          set -euo pipefail
+
+          # The step above proves the check RUNS are green. The ruleset does not read check runs — it
+          # reads the PR's status-check rollup, the same eventually-consistent projection that broke
+          # the previous implementation one step earlier. Here staleness surfaces as
+          # `mergeable_state: blocked` and a 405. Waiting on check runs gets us here EARLIER than
+          # before, so this is the race's new home: converge on the rollup first, then still retry.
+          #
+          # `mergeable` is null while GitHub computes the merge, and ASKING is what schedules that
+          # computation — so poll, never sleep once.
+          deadline=$(( $(date +%s) + 10 * 60 ))
+          last=''
+          while :; do
+            read -r mergeable mstate < <(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR" \
+              --jq '"\(.mergeable | tostring) \(.mergeable_state)"')
+            [ "$mstate" = "$last" ] || { echo "mergeable=$mergeable mergeable_state=$mstate"; last="$mstate"; }
+            case "$mstate" in
+              # clean = all good; unstable = a NON-required check is red/pending; has_hooks = mergeable.
+              clean|unstable|has_hooks) break ;;
+              dirty) echo "::error::PR #$PR conflicts with main — resolve it by hand"; exit 1 ;;
+              draft) echo "::error::PR #$PR is a draft"; exit 1 ;;
+            esac
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::PR #$PR is still '$mstate' after 10m even though every required check is green"
+              echo "::error::on $HEAD_SHA. Either the rollup has not caught up or a non-status rule is"
+              echo "::error::unsatisfied. The PR is left OPEN: merge it by hand and re-dispatch — the"
+              echo "::error::workflow will skip the bump and go straight to build + tag + publish."
+              exit 1
+            fi
+            sleep 10
+          done
+
           # -f sha= makes the merge conditional on the branch tip: a 409 beats merging something
           # unexpected if anything raced us.
-          sha="$(gh api -X PUT "repos/$GITHUB_REPOSITORY/pulls/$PR/merge" \
-                   -f merge_method=merge -f sha="$HEAD_SHA" \
-                   -f commit_title="Merge pull request #$PR from $BRANCH" \
-                   -f commit_message="chore: v$VERSION" --jq .sha)"
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
-          echo "merged as $sha"
+          for attempt in 1 2 3 4 5 6; do
+            if out="$(gh api -X PUT "repos/$GITHUB_REPOSITORY/pulls/$PR/merge" \
+                        -f merge_method=merge -f sha="$HEAD_SHA" \
+                        -f commit_title="Merge pull request #$PR from $GITHUB_REPOSITORY_OWNER/$BRANCH" \
+                        -f commit_message="chore: v$VERSION" 2>"$RUNNER_TEMP/merge.err")"; then
+              sha="$(jq -r '.sha // empty' <<<"$out")"
+              [ -n "$sha" ] || { echo "::error::merge reported success but returned no sha: $out"; exit 1; }
+              echo "sha=$sha" >> "$GITHUB_OUTPUT"
+              echo "merged as $sha"
+              exit 0
+            fi
+            err="$(cat "$RUNNER_TEMP/merge.err")"
+            echo "attempt $attempt/6: $err"
+            case "$err" in
+              *"Head branch was modified"*)
+                echo "::error::$BRANCH moved after the bump commit — refusing to merge $HEAD_SHA"; exit 1 ;;
+              *[Mm]"erge conflict"*)
+                echo "::error::PR #$PR conflicts with main"; exit 1 ;;
+              *"HTTP 40"[34]*|*"HTTP 422"*)
+                echo "::error::merge rejected and not retryable"; exit 1 ;;
+            esac
+            # 405 "not mergeable" and 409 "Base branch was modified" are the retryable ones, as is 5xx.
+            sleep 20
+          done
+          echo "::error::could not merge PR #$PR after 6 attempts. It is left OPEN: merge it by hand and"
+          echo "::error::re-dispatch — the workflow will skip the bump and go straight to build + publish."
+          exit 1
 
       # Leave the PR and branch alone on failure — they are the recovery material.
       - name: Explain the failure
@@ -311,18 +429,21 @@ jobs:
       always() && needs.plan.outputs.proceed == 'true'
       && (needs.bump.result == 'success' || needs.bump.result == 'skipped')
     runs-on: macos-15
-    timeout-minutes: 90
+    # libghostty cache miss (~10m) + macOS build (~35m) + notarization (occasionally >20m) + DMG +
+    # tap push. 90 was uncomfortably close; match `bump`.
+    timeout-minutes: 120
     permissions:
       contents: write   # create the tag and the GitHub Release
     env:
       VERSION: ${{ needs.plan.outputs.version }}
       TAG: ${{ needs.plan.outputs.tag }}
-      IS_PRERELEASE: ${{ needs.plan.outputs.prerelease }}
     steps:
-      # The merge commit when `bump` ran, else main's tip (recovery path).
+      # The merge commit when `bump` ran; else the exact commit `plan` measured. A skipped job's
+      # `outputs` is `{}`, so `merge_sha` is empty and the fallback wins. Both are SHAs on purpose —
+      # `main` would re-resolve to whatever the tip is NOW, which is not what was planned.
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.bump.outputs.merge_sha || 'main' }}
+          ref: ${{ needs.bump.outputs.merge_sha || needs.plan.outputs.base_sha }}
           fetch-depth: 0
 
       # Replaces the old tag-vs-VERSION check: same intent (never ship an artifact labelled with a
@@ -442,7 +563,13 @@ jobs:
       # that never shipped. A bumped VERSION with no tag is benign — a re-dispatch recomputes the
       # same version, sees needs_bump=false, skips `bump`, and lands here again.
       - name: Tag the released commit
+        id: tag
+        env:
+          # The job has no other `gh` usage (update-homebrew-tap.sh exports its own token), so
+          # without this the readback below fails with "gh auth login required".
+          GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           git config user.name  "clowder-release-bot"
           git config user.email "clowder-release-bot@users.noreply.github.com"
           # -a is mandatory: unlike a dev machine, CI has no tag.gpgsign, so a bare `git tag` would
@@ -450,6 +577,20 @@ jobs:
           # signing key to Actions would be a worse trade.
           git tag -a "$TAG" -m "$TAG" HEAD
           git push origin "refs/tags/$TAG"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+          # Do NOT hand an unresolvable tag_name to action-gh-release: POST /releases CREATES the tag
+          # at target_commitish (the DEFAULT BRANCH) when it does not exist, silently tagging a
+          # different commit than the one just built — and reporting success. Wait for the readback.
+          for _ in $(seq 1 30); do
+            if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" >/dev/null 2>&1; then
+              echo "$TAG is readable via the API"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::$TAG was pushed but is not readable via the API after 60s"
+          exit 1
 
       - name: Publish GitHub Release (signed)
         if: steps.signing.outputs.enabled == 'true'
@@ -458,7 +599,12 @@ jobs:
           # tag_name is required now that no tag triggered this run — without it the action would
           # create a release named after the branch.
           tag_name: ${{ needs.plan.outputs.tag }}
+          # Pin the commit as insurance; ignored because the tag already exists (the step above
+          # blocks until it does), but it removes the wrong-commit failure mode entirely.
+          target_commitish: ${{ steps.tag.outputs.sha }}
           files: dist/Clowder-*-macos.dmg
+          # Default is false: an unmatched glob would publish an EMPTY release and exit green.
+          fail_on_unmatched_files: true
           generate_release_notes: true
           prerelease: ${{ needs.plan.outputs.prerelease == 'true' }}
           body: |
@@ -471,7 +617,9 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.plan.outputs.tag }}
+          target_commitish: ${{ steps.tag.outputs.sha }}
           files: dist/Clowder-*-macos.zip
+          fail_on_unmatched_files: true
           generate_release_notes: true
           prerelease: ${{ needs.plan.outputs.prerelease == 'true' }}
           body: |

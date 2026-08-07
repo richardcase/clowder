@@ -46,6 +46,11 @@ jobs:
       - name: next-version.sh self-tests
         run: scripts/next-version.sh --self-test
 
+      # Same reasoning: the release workflow's check-gating decision is a pure function of JSON, and
+      # a bug in it cannot be caught outside a real release. Fixtures make it a required check.
+      - name: check-runs-state.sh self-tests
+        run: scripts/check-runs-state.sh --self-test
+
   build-and-test:
     name: build + test (macOS, unsigned)
     runs-on: macos-15

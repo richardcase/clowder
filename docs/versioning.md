@@ -96,7 +96,21 @@ silently skip a version that never shipped.
 is unnecessary, skips that job entirely, and goes straight to build → tag → publish.
 
 **The bump PR did not merge.** It is left open on purpose, with the reason in the job summary. Merge
-it by hand and re-dispatch, or close it and delete the `release/vX.Y.Z` branch to start over.
+it by hand and re-dispatch, or close it and delete the `release/vX.Y.Z` branch to start over. The
+distinct causes the workflow reports:
+
+- *a required check concluded non-success* — including `cancelled`, `skipped` and `neutral`, which
+  GitHub's rulesets count as passing but a release deliberately does not: a check that did not
+  execute has not vouched for anything.
+- *CI did not start on the branch* (10-minute deadline) — the `Start CI` dispatch is what makes the
+  required checks run; check that `ci.yml` still accepts `workflow_dispatch`.
+- *the PR is still `blocked` after 10 minutes* — the status-check rollup is a separate,
+  eventually-consistent projection from the check runs the workflow waits on, so it can lag behind
+  them. The merge retries; if it never converges, merge by hand.
+
+**A tag exists but no release was published.** Possible if the tag push succeeded and publishing then
+failed. `gh release delete --cleanup-tag` does not work in that state — delete the ref directly:
+`gh api -X DELETE repos/richardcase/clowder/git/refs/tags/vX.Y.Z`.
 
 **The workflow refuses to start.** The guard rails in `plan` fail loudly rather than doing something
 surprising:
@@ -130,6 +144,24 @@ the tag being merely annotated. The commit a tag points at is GitHub-signed eith
 On a dev machine a bare `git tag vX.Y.Z` fails with "no tag message?" — that is `tag.gpgsign = true`
 in the maintainer's global git config, **not** a repo hook. CI has no such config, which is exactly
 why `release.yml` passes `-a` explicitly: without it, CI would silently create a lightweight tag.
+
+## After changing `release.yml`
+
+**The first dispatch after any change to `release.yml` must be a `prerelease` run.**
+
+Most of this workflow cannot execute outside a real release — the `bump` job's whole difficulty comes
+from `main`'s ruleset (signed commits, required checks, no bypass actors), so there is nowhere else
+to exercise it. Two rounds of bugs have reached `main` for exactly that reason. A `prerelease: rc1`
+run drives the entire path — signed commit, PR, CI dispatch, check wait, merge, build, sign,
+notarize, tag, publish — and skips only the Homebrew cask bump.
+
+Undo is `gh release delete vX.Y.Z-rc1 --cleanup-tag`. `next-version.sh` excludes pre-release tags
+from `git describe`, so a later final release still measures from the last *final* tag.
+
+The parts that *can* be tested without a release are covered by
+`scripts/check-runs-state.sh --self-test` and `scripts/next-version.sh --self-test`, both wired into
+the required `commit messages (conventional commits)` job. Put new logic there where possible —
+`check-runs-state.sh --sha <sha>` also classifies any real commit locally.
 
 ## One-time repo setup
 
