@@ -24,6 +24,7 @@ async fn next_control_line<R: AsyncRead + Unpin>(
 
 pub mod forward;
 pub mod probe;
+pub mod remote_cli;
 pub mod target;
 pub mod tofu;
 
