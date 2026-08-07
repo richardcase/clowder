@@ -47,23 +47,51 @@ async fn main() -> Result<()> {
         }
         Some("connect") => {
             let cfg = clowder_config::Config::load();
-            let host = args.get(2).cloned()
-                .or(cfg.remote_host.clone())
-                .ok_or_else(|| anyhow!("usage: clowder connect <host:port>  (or set [remote] host / CLOWDER_REMOTE_HOST)"))?;
-            let dir = cfg.control_sock.parent()
-                .ok_or_else(|| anyhow!("cannot derive forwarder socket dir"))?
-                .join("remote");
-            clowder_client::forward::forward(
-                clowder_client::forward::RemoteTarget {
-                    label: host.clone(),
-                    address: host,
-                    tls: cfg.remote_tls || cfg.remote_token.is_some(),
-                    token: cfg.remote_token,
-                    fingerprint: None,
-                },
-                dir,
+            let flags = clowder_client::remote_cli::parse_flags(&args[2..]).map_err(anyhow::Error::msg)?;
+            flags.reject_unknown(&["socket-dir"]).map_err(anyhow::Error::msg)?;
+            let hosts = clowder_config::hosts::merged_hosts(
+                clowder_config::hosts::HostsStore::default_store().load(),
+                &cfg,
+            );
+            let target = clowder_client::target::resolve_target(flags.positional(0), &hosts, &cfg)
+                .map_err(anyhow::Error::msg)?;
+
+            // Per-host socket dir. The APP passes --socket-dir explicitly (one authority for the
+            // path, instead of Swift re-deriving this rule); the default keeps a bare
+            // `clowder connect` working from a shell.
+            let dir = match flags.str("socket-dir") {
+                Some(d) => std::path::PathBuf::from(d),
+                None => cfg
+                    .control_sock
+                    .parent()
+                    .ok_or_else(|| anyhow!("cannot derive forwarder socket dir"))?
+                    .join("remote")
+                    .join(&target.label),
+            };
+
+            // Fail fast when the very first dial never lands. Without this the forwarder binds
+            // its sockets and lives on, and the app's supervisor relaunches it forever behind a
+            // permanent "Reconnecting…" with no way to tell a typo from a daemon that is down.
+            // Exit 4 is the signal to stop and show the user (see DaemonSupervisor in M11b).
+            const FIRST_DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+            if tokio::time::timeout(
+                FIRST_DIAL_TIMEOUT,
+                tokio::net::TcpStream::connect(&target.address),
             )
             .await
+            .map_err(|_| ())
+            .and_then(|r| r.map_err(|_| ()))
+            .is_err()
+            {
+                eprintln!(
+                    "clowder connect: cannot reach {} at {} — check the address, and that the daemon \
+                     is running with [remote] listen set",
+                    target.label, target.address
+                );
+                std::process::exit(4);
+            }
+
+            clowder_client::forward::forward(target, dir).await
         }
         Some("remote-host") => {
             // Print the resolved [remote] host (or an empty line) so the macOS app can decide
