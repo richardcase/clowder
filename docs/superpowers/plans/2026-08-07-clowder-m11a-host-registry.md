@@ -175,12 +175,15 @@ Create `docs/protocol/fixtures/host-names.json`:
   { "name": "box_1", "valid": true },
   { "name": "a.b", "valid": true },
   { "name": "A", "valid": true },
+  { "name": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "valid": true },
+  { "name": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "valid": false },
   { "name": "", "valid": false },
   { "name": "has space", "valid": false },
   { "name": "sl/ash", "valid": false },
   { "name": "back\\slash", "valid": false },
   { "name": "quote\"", "valid": false },
-  { "name": "colon:name", "valid": false }
+  { "name": "colon:name", "valid": false },
+  { "name": "café", "valid": false }
 ]
 ```
 
