@@ -103,6 +103,9 @@ The bundled **`clowder` CLI** also works headlessly against a running daemon:
 ```sh
 clowder spawn <project> <task> [adapter]   # adapter defaults to "claude"; prints the new pane id
 clowder attach <pane-id>                    # attach to a pane in your terminal
+clowder remote add|list|show|set|rm         # manage a nicknamed registry of remote daemons
+clowder remote probe|trust|untrust          # pair with a remote daemon over TLS (see docs/remote-tls.md)
+clowder connect <name-or-host:port>         # forward to a remote daemon, then clowder attach as usual
 ```
 
 ## Development

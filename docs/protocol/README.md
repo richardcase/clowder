@@ -29,6 +29,34 @@ existing cases in `encoder_matches_the_golden_fixtures` / `request_fixtures_deco
 (Swift). Derive the fixture from the Rust type first — run the Rust assertion before writing the
 Swift side, and if they disagree, fix the fixture, not the encoder.
 
+## CLI stdout (Rust encodes, Swift decodes)
+
+A third direction, alongside `ControlEvent` and `ControlRequest`: JSON that `clowder remote …`
+subcommands print on **stdout**, for the macOS app's `HostRegistry` (M11b) to shell out to and
+decode. There is no control-socket message for these — the whole point of the host registry is
+that it works with **no daemon running**, so its wire format has to be a CLI's stdout instead of a
+socket frame.
+
+- **`fixtures/remote-host-list.json`** — `clowder remote list --json`'s `{"hosts": [...]}` array,
+  one object per host. Encoded by `HostView`/`ListOut` in `crates/clowder-client/src/remote_cli.rs`
+  and asserted byte-exact by its `list_output_matches_the_golden_fixture` test. Note what the
+  fixture deliberately omits: the bearer token never appears on stdout, only a `hasToken` boolean.
+- **`fixtures/remote-probe.json`** — `clowder remote probe <name> --json`'s `{"probe": {...}}`
+  object. Encoded by `ProbeView`/`ProbeOut` in the same file, asserted byte-exact by
+  `probe_output_matches_the_golden_fixture`.
+
+Both fixtures are Rust-authoritative, the same rule as `ControlEvent`: run the Rust assertion
+first, and if Swift's decoder and the fixture disagree, fix the Swift side.
+
+## `fixtures/host-names.json`
+
+Alongside `worktree-names.json` below: a shared table of `{"name": ..., "valid": ...}` cases
+checked against both independent implementations of the host-nickname validation rule — Rust's
+`validate_name` (`crates/clowder-config/src/hosts.rs`, exercised by
+`name_validation_matches_the_shared_fixture`) and, in M11b, Swift's `HostDraft.nameError`. If you
+add or change a rule in either validator, add a case here and mirror the rule in the other
+implementation — the same convention `worktree-names.json` established.
+
 ## `fixtures/worktree-names.json`
 
 Not a wire message — this is a shared table of `{"name": ..., "valid": ...}` cases checked
