@@ -92,6 +92,14 @@ lock") and the plain exit 1 used for a user error such as an unrecognized host n
 supervisor (M11b) relies on 4 to tell "typo/unreachable" apart from a daemon that's merely slow to
 come up.
 
+**Interim note (until M11b lands):** exit 4 is already app-visible, and the app does not know about
+it yet. `macos/Sources/ClowderApp/DaemonLaunch.swift` supervises `clowder connect <host>` and
+relaunches it on every exit code except 3 (bounded backoff, `min(10s, 0.5s × 2^attempt)`), so an
+unreachable remote host now makes the app respawn the forwarder every ~10 seconds once that backoff
+saturates. Before exit 4 existed, the forwarder burned ~15s of internal
+`dial_with_backoff` retries before exiting, so the loop is the same shape, just faster. Nothing is
+corrupted by it — it's a busier log and a warmer laptop until the supervisor learns to stop on 4.
+
 **Trust-on-first-use (TOFU):** on first connect to a given host, the client records the daemon's
 certificate fingerprint in `<state>/clowder/remote_known_hosts` (`$XDG_STATE_HOME` or
 `~/.local/state`), keyed by address. On every later connect it recomputes the fingerprint and compares —
@@ -129,9 +137,22 @@ clowder remote rm studio
 A few things worth knowing:
 
 - **A token requires TLS.** `--token`/`--token-stdin` implies `--tls` by default on `add`, precisely
-  because a bearer token must never cross the network in cleartext; `resolve_target` refuses a
-  token-without-TLS combination outright at connect time, so a mistaken `--no-tls --token …`
-  combination fails loudly rather than leaking the token.
+  because a bearer token must never cross the network in cleartext. Asking for the combination
+  anyway is refused **by the command that would create it** — `clowder remote add … --no-tls
+  --token …` and `clowder remote set … --no-tls` on an entry that still holds a token both fail,
+  naming the two ways out (drop `--no-tls`, or clear the token with `--no-token`). `resolve_target`
+  refuses the same combination again at connect time; that second check stays because the registry
+  is hand-editable and a file edited by hand never went through `add`/`set`.
+- **A fingerprint must be lowercase hex.** `clowder remote trust --fingerprint` lowercases what you
+  pass and then validates it (even number of `[0-9a-f]` digits). Anything else — notably a value
+  with whitespace in it — is rejected rather than stored: the matching `remote_known_hosts` line is
+  `"<address> <fingerprint>"` and is read back by whitespace-splitting, so a fingerprint containing
+  a space would be truncated on read and the pin and the known-hosts line would disagree forever.
+- **A corrupt `hosts.json` is never overwritten.** `add`/`set`/`rm`/`trust`/`untrust` refuse to run
+  against a registry file that exists but does not parse, with an error naming the file — the
+  tokens and pins stay on disk for you to rescue. (Reading is more forgiving: a corrupt registry
+  degrades to an empty host list rather than stopping the app reaching its *local* daemon.) A
+  zero-length file is treated as an empty registry, since it has nothing to preserve.
 - **Boolean flags don't take inline values.** Use `--tls` / `--no-tls`, never `--tls=<value>` —
   `--tls=false` is a hard error ("`--tls` does not take a value"), on purpose: before this was
   enforced it silently parsed as *enabling* TLS, the exact opposite of what it looked like it did.

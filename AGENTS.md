@@ -78,9 +78,9 @@ libghostty surface. **Adapters:** `claude` (Claude Code), `codex` (OpenAI Codex)
 no hooks). The `clowder` CLI: `clowder spawn <project> <task> [adapter]` and `clowder attach <pane-id>`.
 An optional remote TCP listener (`[remote] listen`/`host`) can be hardened with `[remote] tls`/`token`
 (bearer-token auth + TOFU-pinned TLS) — see `docs/remote-tls.md` for setup and the threat model. Remote
-daemons the client knows about are managed as a nicknamed registry (`clowder remote add|list|show|set|
-rm|probe|trust|untrust`) in `$XDG_STATE_HOME/clowder/hosts.json` (`CLOWDER_HOSTS_FILE` overrides), a file
-kept `0600` because it holds bearer tokens; `[remote] host` in `config.toml` still works and appears in
+daemons the client knows about are managed as a nicknamed registry
+(`clowder remote add|list|show|set|rm|probe|trust|untrust`) in `$XDG_STATE_HOME/clowder/hosts.json`
+(`CLOWDER_HOSTS_FILE` overrides), a file kept `0600` because it holds bearer tokens; `[remote] host` in `config.toml` still works and appears in
 the registry as a read-only entry (`source: config`).
 
 ## Gotchas
