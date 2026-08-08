@@ -90,15 +90,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.backends = self
         model.setHosts(hosts)
         model.connect()
-        // Task 11 replaces these three closures with the `BackendSwitching` reference above; until
-        // then, adapt the tray's existing host-name shape onto `activeBackend`/`hosts`.
         statusBar = StatusBarController(appModel: model,
-                                        showWindow: { [weak self] in self?.showWindow() },
-                                        remoteHost: { [weak self] in self?.activeBackend.hostID?.rawValue },
-                                        configuredRemoteHost: { [weak self] in self?.hosts.first?.name },
-                                        switchBackend: { [weak self] name in
-                                            self?.switchBackend(to: name.map { .remote(HostID($0)) } ?? .local)
-                                        })
+                                        backends: self,
+                                        showWindow: { [weak self] in self?.showWindow() })
         return (model, host)
     }
 
