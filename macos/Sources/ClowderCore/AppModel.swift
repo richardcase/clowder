@@ -449,6 +449,15 @@ public final class AppModel: ObservableObject {
     /// Dismiss the current error banner.
     public func dismissError() { store.clearLastError() }
 
+    /// Surface a backend-level failure — a switch that was refused, a host that could not be
+    /// reached — to the user.
+    ///
+    /// Routed into `store.lastError` so it renders in (and is dismissed from) the ONE error banner
+    /// the UI already has, instead of introducing a second, parallel error-display mechanism. It
+    /// deliberately does not require a live session: the most important case is precisely the one
+    /// where there is no connection to the backend in question.
+    public func reportBackendError(_ message: String) { store.reportLocalError(message) }
+
     /// Explicit teardown (F1): cancel any reconnect loop, then disconnect. `isShuttingDown` makes the
     /// disconnect's own `onClose` a no-op so we don't re-arm reconnect while quitting.
     public func shutdown() {

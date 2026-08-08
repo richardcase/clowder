@@ -137,37 +137,24 @@ final class ProcessDaemon: DaemonProcess {
     }
 }
 
-/// Build the backend supervisor plus the control/render socket paths the app should connect to.
-/// `remoteHost == nil` → supervise a local `clowder-daemon` (today's behavior); non-nil → supervise
-/// the `clowder connect <host>` forwarder and connect to its local sockets. Returns nil when unbundled.
+/// Build a supervisor for `plan`. Which binary, which arguments and which sockets are all decided
+/// by `backendPlan` in ClowderCore (where they are unit-tested); this only runs the plan.
+///
+/// Returns nil when running unbundled (`swift run clowder-app` has no Rust siblings), where the dev
+/// workflow is to run the daemon by hand on the default sockets — which is what `plan` already names.
 @MainActor
-func makeBackendSupervisor(remoteHost: String?) -> (supervisor: DaemonSupervisor, control: String, render: String)? {
-    let socks = ClowderPaths.socketPaths()
-    var env = ProcessInfo.processInfo.environment
+func makeBackendSupervisor(plan: BackendPlan) -> DaemonSupervisor? {
+    let name = plan.executable == .daemon ? "clowder-daemon" : "clowder"
+    guard let execPath = ClowderPaths.bundledBin(name) else { return nil }
 
-    if let host = remoteHost {
-        guard let clowderPath = ClowderPaths.bundledBin("clowder") else { return nil }
-        let dir = forwarderSocketDir(controlPath: socks.control, host: host)
-        let control = (dir as NSString).appendingPathComponent("clowder-control.sock")
-        let render = (dir as NSString).appendingPathComponent("clowder.sock")
-        let binDir = (clowderPath as NSString).deletingLastPathComponent
-        env["PATH"] = binDir + ":" + (env["PATH"] ?? "/usr/bin:/bin")
-        // Deliberately do NOT set CLOWDER_*_SOCK: overriding them would fight --socket-dir below.
-        // The app passes --socket-dir explicitly, so there is one authority for this path instead
-        // of two derivations (app + forwarder) that would have to agree independently.
-        // Task 9: this whole function is rewritten around backendPlan(target:sockets:).
-        let sup = DaemonSupervisor(spawn: {
-            ProcessDaemon(execPath: clowderPath, args: ["connect", host, "--socket-dir", dir], env: env)
-        })
-        return (sup, control, render)
-    } else {
-        guard let daemonPath = ClowderPaths.bundledBin("clowder-daemon") else { return nil }
-        env["CLOWDER_SOCK"] = socks.client
-        env["CLOWDER_CONTROL_SOCK"] = socks.control
-        env["CLOWDER_HOOK_SOCK"] = socks.hook
-        let binDir = (daemonPath as NSString).deletingLastPathComponent
-        env["PATH"] = binDir + ":" + (env["PATH"] ?? "/usr/bin:/bin")
-        let sup = DaemonSupervisor(spawn: { ProcessDaemon(execPath: daemonPath, env: env) })
-        return (sup, socks.control, socks.client)
-    }
+    var env = ProcessInfo.processInfo.environment
+    for (k, v) in plan.envOverlay { env[k] = v }
+    // The forwarder shells out to nothing, but the daemon spawns agent adapters — keep the bundled
+    // binaries first on PATH so `clowder-hook` resolves.
+    let binDir = (execPath as NSString).deletingLastPathComponent
+    env["PATH"] = binDir + ":" + (env["PATH"] ?? "/usr/bin:/bin")
+
+    return DaemonSupervisor(spawn: {
+        ProcessDaemon(execPath: execPath, args: plan.args, env: env)
+    })
 }

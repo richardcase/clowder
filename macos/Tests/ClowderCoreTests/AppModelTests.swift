@@ -240,6 +240,20 @@ final class AppModelTests: XCTestCase {
         XCTAssertNil(model.store.lastError)
     }
 
+    /// A refused backend switch must reach the user through the SAME banner as daemon errors:
+    /// `ContentView`'s status bar renders `store.lastError` and clears it via `dismissError()`, so
+    /// a backend error parked anywhere else would be invisible (or undismissable). Deliberately
+    /// runs with no connection — an unreachable-host refusal is exactly the disconnected case.
+    func testReportBackendErrorSurfacesInTheDismissableBanner() {
+        let fake = FakeControlTransport()
+        let model = AppModel(makeTransport: { fake })
+        XCTAssertNil(model.store.lastError)
+        model.reportBackendError("Cannot reach hoth at 10.0.0.2:7777.")
+        XCTAssertEqual(model.store.lastError, "Cannot reach hoth at 10.0.0.2:7777.")
+        model.dismissError()
+        XCTAssertNil(model.store.lastError)
+    }
+
     func testDropTriggersReconnectThenGoesLiveAndRehydrates() async {
         let controller = SleepController()
         var transports: [FakeControlTransport] = []

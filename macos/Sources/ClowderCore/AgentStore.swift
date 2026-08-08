@@ -92,6 +92,12 @@ public final class AgentStore: ObservableObject {
     /// Dismiss the current error (clears the error banner).
     public func clearLastError() { lastError = nil }
 
+    /// Record an error the APP produced (a backend switch we refused, a host we could not reach)
+    /// in the same one-shot slot as daemon-reported `.error` events. Deliberately the same slot:
+    /// the UI has exactly one dismissable error banner, and a parallel channel would either render
+    /// nowhere or fight it for the same strip of screen.
+    public func reportLocalError(_ message: String) { lastError = message }
+
     /// Drop all per-backend state (used when the app swaps between the local daemon and the remote
     /// forwarder). Adapters fall back to the default until the new connection reports its own list.
     public func reset() {
