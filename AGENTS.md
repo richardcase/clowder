@@ -39,10 +39,21 @@ source "$HOME/.cargo/env" && cargo test --workspace      # CI runs this with --l
 **Swift** (run inside `macos/`):
 
 ```sh
-cd macos && swift test         # ClowderCore unit tests — fast, does NOT need libghostty
-cd macos && swift build        # builds clowder-app — REQUIRES the vendored libghostty (see gotchas)
+cd macos && swift test         # ClowderCore unit tests — fast; COMPILES clowder-app too (see below)
+cd macos && swift build        # builds + LINKS clowder-app — REQUIRES the vendored libghostty
 cd macos && swift build -c release
 ```
+
+**`swift test` compiles `ClowderApp`, it just doesn't link it.** Only `ClowderCoreTests` runs, but
+SwiftPM builds the whole package graph first, so **a compile error anywhere in `ClowderApp` aborts
+`swift test` before a single test runs** — you get a compiler error, not a test failure. The
+practical consequence: a change to a `ClowderCore` signature that breaks a `ClowderApp` call site
+must fix that call site in the *same* commit, or the commit neither tests nor builds.
+
+`swift test` still does **not** need the vendored libghostty, because linking is what pulls in
+`ghostty-internal.a` and `swift test` never links the executable. Both halves verified 2026-08-08:
+moving the archive aside leaves 188 tests passing, and a deliberate syntax error in `ClowderApp`
+makes `swift test` fail to compile.
 
 **Scripts** (`scripts/`):
 
@@ -108,7 +119,9 @@ is now the one place that computes it, and the app is the only caller that passe
 - **Cargo:** always `source "$HOME/.cargo/env" && cargo …`.
 - **libghostty:** `clowder-app` links a gitignored 189 MB `macos/vendor/libghostty/ghostty-internal.a`.
   Build it with `scripts/build-libghostty.sh` — needs **zig 0.16.0** and **full Xcode** (Metal shader
-  compiler; not in CLT). `ClowderCore`/`swift test` do **not** need it.
+  compiler; not in CLT). `swift test` does **not** need the archive (it never links the executable),
+  but it **does compile `ClowderApp`** — so a compile error there breaks `swift test` even though no
+  app code is under test. See the Swift section under Build & test.
 - **Dev run:** an unbundled build (`swift run clowder-app`) does **not** auto-spawn the daemon — run
   `cargo run -p clowder-daemon` yourself and set `CLOWDER_BIN` to the `clowder` binary
   (`CLOWDER_BIN="$PWD/../target/debug/clowder"`). The packaged `.app` auto-spawns + supervises its bundled
