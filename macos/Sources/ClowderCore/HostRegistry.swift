@@ -28,7 +28,7 @@ public enum HostRegistryError: Error, LocalizedError, Equatable {
         switch self {
         case let .cli(m): return m
         case let .decode(m): return "Could not read the clowder CLI's response: \(m)"
-            }
+        }
     }
 }
 
@@ -88,14 +88,23 @@ public struct HostRegistry {
         _ = try run(["remote", "rm", name, "--json"])
     }
 
-    public func probe(name: String) throws -> HostProbe {
-        try decode(ProbeOutput.self, from: run(["remote", "probe", name, "--json"])).probe
+    /// Probe a registered host.
+    ///
+    /// `timeoutSeconds` is passed through as `--timeout`. The CLI applies it SEPARATELY to the TCP
+    /// connect, the TLS handshake and the read-line, so a call can block for up to ~3x this value —
+    /// which matters because every caller today runs it synchronously on the main thread.
+    public func probe(name: String, timeoutSeconds: Int = 3) throws -> HostProbe {
+        let args = ["remote", "probe", name, "--timeout", String(timeoutSeconds), "--json"]
+        return try decode(ProbeOutput.self, from: run(args)).probe
     }
 
     /// Probe a host that is not (yet) in the registry — what a "Test" button needs before saving.
-    public func probe(address: String, token: String?, tls: Bool) throws -> HostProbe {
+    /// See `probe(name:timeoutSeconds:)` for what the timeout actually bounds.
+    public func probe(address: String, token: String?, tls: Bool,
+                      timeoutSeconds: Int = 3) throws -> HostProbe {
         var args = ["remote", "probe", "--address", address]
         args.append(tls ? "--tls" : "--no-tls")
+        args += ["--timeout", String(timeoutSeconds)]
         if token != nil { args.append("--token-stdin") }
         args.append("--json")
         return try decode(ProbeOutput.self, from: run(args, stdin: token)).probe

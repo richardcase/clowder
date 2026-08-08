@@ -172,11 +172,22 @@ extension AppDelegate: BackendSwitching {
                 appModel?.reportBackendError("No host named \(id.rawValue) is configured.")
                 return
             }
-            // Probe first: refusing costs ~3s, whereas switching to a dead host tears down a
-            // healthy session and leaves the user with a red chip and nothing running.
-            if let probe = try? hostRegistry?.probe(name: host.name), probe.reachable == false {
-                appModel?.reportBackendError(
-                    "Cannot reach \(host.name) at \(host.address). \(probe.error ?? "")")
+            // Probe first: switching to a host that cannot serve us tears down a healthy session
+            // and leaves the user with a red chip and nothing running. `backendSwitchRefusal` also
+            // catches the two failures that are still "reachable" — a rotated certificate and a
+            // rejected token — which otherwise get past this gate and reconnect forever.
+            //
+            // `--timeout 1`, not the CLI's 3s default: the CLI bounds the connect, the handshake
+            // and the read-line each by that value, so the worst case is ~3x it, and this runs
+            // SYNCHRONOUSLY on the main thread from a click. ~3s of beachball is the ceiling we
+            // accept; ~9s is not. (Moving the probe off the main thread is the real fix, tracked
+            // as a follow-up.)
+            //
+            // A THROWN probe deliberately does not block the switch: that means the CLI itself
+            // failed (missing binary, unreadable registry), which says nothing about the host.
+            if let probe = try? hostRegistry?.probe(name: host.name, timeoutSeconds: 1),
+               let refusal = backendSwitchRefusal(probe) {
+                appModel?.reportBackendError(refusal)
                 return
             }
             target = .remote(host)

@@ -132,3 +132,31 @@ public struct HostProbe: Codable, Sendable, Equatable {
 public struct ProbeOutput: Codable, Sendable {
     public let probe: HostProbe
 }
+
+/// Why a switch to this host must be refused, or nil if it may proceed.
+///
+/// Reachability alone is not enough to commit to a switch. A host whose certificate rotated, or
+/// whose token the daemon rejects, is perfectly *reachable*: `clowder connect`'s pre-dial lands, so
+/// it does not exit 4, it binds its sockets and lives — and the daemon then rejects every forwarded
+/// stream, leaving the app reconnecting forever with the real reason visible only in `daemon.log`.
+/// Refusing here, before anything is torn down, is the only place that failure mode is legible.
+///
+/// Uses `authSummary` rather than the raw `authenticated` flag: against a plaintext daemon
+/// `authenticated` is true for any token, so reading it directly would refuse every plaintext host.
+public func backendSwitchRefusal(_ probe: HostProbe) -> String? {
+    if !probe.reachable {
+        let detail = probe.error.map { " \($0)" } ?? ""
+        return "Cannot reach \(probe.name) at \(probe.address).\(detail)"
+    }
+    if probe.fingerprintMatch == .changed {
+        return """
+        \(probe.name) presented a different certificate than the one you pinned. \
+        If you expect this (the daemon was reinstalled), re-pin it with \
+        `clowder remote trust \(probe.name)`; otherwise do not connect.
+        """
+    }
+    if probe.authSummary == .tokenRejected {
+        return "\(probe.name) rejected the access token. Update it with `clowder remote set \(probe.name) --token-stdin`."
+    }
+    return nil
+}

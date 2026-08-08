@@ -95,7 +95,7 @@ final class HostRegistryTests: XCTestCase {
         let byName = FakeCommandRunner(); byName.results = [.ok(probeJSON)]
         _ = try HostRegistry(runner: byName).probe(name: "studio")
         XCTAssertEqual(try XCTUnwrap(byName.invocations.first).args,
-                       ["remote", "probe", "studio", "--json"])
+                       ["remote", "probe", "studio", "--timeout", "3", "--json"])
 
         let byAddr = FakeCommandRunner(); byAddr.results = [.ok(probeJSON)]
         _ = try HostRegistry(runner: byAddr).probe(address: "s:7777", token: "t", tls: true)
@@ -104,6 +104,25 @@ final class HostRegistryTests: XCTestCase {
         XCTAssertTrue(inv.args.contains("s:7777"))
         XCTAssertEqual(inv.stdin, "t", "an unsaved host's token still goes via stdin")
         XCTAssertFalse(inv.args.contains("t"))
+    }
+
+    func testProbeAlwaysSendsAnExplicitTimeout() throws {
+        // The caller's timeout MUST reach argv. `probe` runs synchronously on the app's main
+        // thread and the CLI bounds the connect, the handshake and the read-line each by this
+        // value — so silently falling back to the CLI's 3s default is ~9s of frozen UI.
+        let probeJSON = #"{"probe":{"name":"studio","address":"s:7777","reachable":true,"tls":true,"fingerprint":"a1b2","pinnedFingerprint":null,"fingerprintMatch":"new","authenticated":true,"error":null}}"#
+
+        let byName = FakeCommandRunner(); byName.results = [.ok(probeJSON)]
+        _ = try HostRegistry(runner: byName).probe(name: "studio", timeoutSeconds: 1)
+        XCTAssertEqual(try XCTUnwrap(byName.invocations.first).args,
+                       ["remote", "probe", "studio", "--timeout", "1", "--json"])
+
+        let byAddr = FakeCommandRunner(); byAddr.results = [.ok(probeJSON)]
+        _ = try HostRegistry(runner: byAddr).probe(address: "s:7777", token: nil, tls: false,
+                                                   timeoutSeconds: 2)
+        let args = try XCTUnwrap(byAddr.invocations.first).args
+        let flag = try XCTUnwrap(args.firstIndex(of: "--timeout"), "argv: \(args)")
+        XCTAssertEqual(args[flag + 1], "2", "argv: \(args)")
     }
 
     func testTrustPassesTheFingerprintVerbatim() throws {

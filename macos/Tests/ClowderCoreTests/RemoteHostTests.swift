@@ -95,6 +95,41 @@ final class RemoteHostTests: XCTestCase {
         XCTAssertEqual(rejected.authSummary, .tokenRejected)
     }
 
+    private func probe(reachable: Bool = true, tls: Bool = true,
+                       match: FingerprintMatch? = .match, authenticated: Bool = true,
+                       error: String? = nil) -> HostProbe {
+        HostProbe(name: "studio", address: "studio.tail:7777", reachable: reachable, tls: tls,
+                  fingerprint: "aa", pinnedFingerprint: "aa", fingerprintMatch: match,
+                  authenticated: authenticated, error: error)
+    }
+
+    func testAHealthyProbeIsNotRefused() {
+        XCTAssertNil(backendSwitchRefusal(probe()))
+        // A plaintext daemon "authenticates" everyone; that is not a reason to refuse a switch.
+        XCTAssertNil(backendSwitchRefusal(probe(tls: false, match: nil)))
+    }
+
+    func testAnUnreachableHostIsRefusedWithTheProbesOwnError() throws {
+        let refusal = try XCTUnwrap(backendSwitchRefusal(
+            probe(reachable: false, error: "connection refused")))
+        XCTAssertTrue(refusal.contains("studio.tail:7777"), refusal)
+        XCTAssertTrue(refusal.contains("connection refused"), refusal)
+    }
+
+    func testAChangedFingerprintIsRefusedAndNamesTheRepinCommand() throws {
+        // Reachable, so the old `reachable == false` gate let this through: `clowder connect`'s
+        // pre-dial lands, the daemon then rejects every forwarded stream, and the app reconnects
+        // forever with "REMOTE DAEMON IDENTIFICATION HAS CHANGED" only in daemon.log.
+        let refusal = try XCTUnwrap(backendSwitchRefusal(probe(match: .changed)))
+        XCTAssertTrue(refusal.contains("certificate"), refusal)
+        XCTAssertTrue(refusal.contains("clowder remote trust"), refusal)
+    }
+
+    func testARejectedTokenIsRefusedAndSaysSo() throws {
+        let refusal = try XCTUnwrap(backendSwitchRefusal(probe(authenticated: false)))
+        XCTAssertTrue(refusal.contains("token"), refusal)
+    }
+
     func testBackendIDIsHashableAndDistinguishesHosts() {
         let a: BackendID = .remote(HostID("studio"))
         let b: BackendID = .remote(HostID("laptop"))
