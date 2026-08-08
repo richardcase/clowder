@@ -11,7 +11,9 @@ struct CommandPaletteView: View {
     private var results: [PaletteItem] {
         paletteResults(query: query,
                        commands: CommandRegistry.all(keymap: keymap),
-                       worktrees: model.store.orderedWorktrees)
+                       worktrees: model.store.orderedWorktrees,
+                       hosts: model.hosts,
+                       activeBackend: model.activeBackend)
     }
 
     var body: some View {
@@ -65,12 +67,13 @@ struct CommandPaletteView: View {
         .opacity(isEnabled(item) ? 1 : 0.4)
     }
 
-    /// Command rows dim when the command doesn't apply to the current selection; agent rows are
-    /// always enabled (picking one always makes sense).
+    /// Command rows dim when the command doesn't apply to the current selection; agent and backend
+    /// rows are always enabled (picking one always makes sense).
     private func isEnabled(_ item: PaletteItem) -> Bool {
         switch item.kind {
         case let .command(id): return model.isEnabled(id)
         case .agent: return true
+        case .backend: return true
         }
     }
 
@@ -78,6 +81,7 @@ struct CommandPaletteView: View {
         switch kind {
         case .command: return "command"
         case .agent: return "terminal"
+        case .backend: return "network"
         }
     }
 
@@ -91,6 +95,7 @@ struct CommandPaletteView: View {
         switch results[selectedIndex].kind {
         case let .command(id): model.run(id)
         case let .agent(pane): model.selection = .worktree(pane)
+        case let .backend(id): model.requestSwitch(to: id)
         }
         close()
     }
