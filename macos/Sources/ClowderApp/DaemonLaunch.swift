@@ -145,7 +145,7 @@ func makeBackendSupervisor(remoteHost: String?) -> (supervisor: DaemonSupervisor
 
     if let host = remoteHost {
         guard let clowderPath = ClowderPaths.bundledBin("clowder") else { return nil }
-        let dir = forwarderSocketDir(controlPath: socks.control)
+        let dir = forwarderSocketDir(controlPath: socks.control, host: host)
         let control = (dir as NSString).appendingPathComponent("clowder-control.sock")
         let render = (dir as NSString).appendingPathComponent("clowder.sock")
         let binDir = (clowderPath as NSString).deletingLastPathComponent
