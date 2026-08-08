@@ -257,6 +257,21 @@ fn token_from(flags: &Flags) -> Result<Option<String>> {
     Ok(flags.str("token").map(String::from))
 }
 
+/// Refuse to *create* an entry that carries a token with TLS off. `resolve_target` refuses the
+/// same combination at connect time and keeps doing so — it still has to catch hand-edited
+/// registries — but by then the command that caused it is days in the past and the error blames
+/// the entry instead of the typo.
+fn refuse_token_without_tls(has_token: bool, tls: bool, name: &str) -> Result<()> {
+    if has_token && !tls {
+        anyhow::bail!(
+            "refusing to store a token for {name:?} with TLS off — a bearer token must never \
+             cross the network in cleartext. Drop --no-tls (a token implies --tls), or clear the \
+             token with --no-token."
+        );
+    }
+    Ok(())
+}
+
 /// Find a registry (writable) record by name, refusing config-sourced entries with an
 /// explanation rather than a generic "not found".
 fn find_writable(all: &[HostEntry], name: &str) -> Result<()> {
@@ -344,6 +359,9 @@ fn cmd_add(flags: &Flags) -> Result<()> {
     // A token is only usable over TLS, so default TLS on when one is given rather than
     // silently creating a combination `resolve_target` will refuse.
     let tls = flags.tristate("tls", "no-tls").map_err(anyhow::Error::msg)?.unwrap_or(token.is_some());
+    // Refuse the unusable combination HERE, not days later at connect time: `resolve_target`'s
+    // refusal blames the entry, when the thing that needs fixing is this command.
+    refuse_token_without_tls(token.is_some(), tls, &name)?;
     let record = HostRecord { name, address, tls, token, fingerprint: None };
     HostsStore::default_store().try_mutate(|all| all.push(record.clone()))?;
     report_one(&record, flags.bool("json"))
@@ -352,7 +370,13 @@ fn cmd_add(flags: &Flags) -> Result<()> {
 fn cmd_set(flags: &Flags) -> Result<()> {
     flags.reject_unknown(&["json", "tls", "no-tls", "token", "token-stdin", "no-token", "rename", "address"]).map_err(anyhow::Error::msg)?;
     let name = flags.positional(1).ok_or_else(|| anyhow::anyhow!("usage: clowder remote set <name> [--address …] [--rename …] …"))?.to_string();
-    find_writable(&merged(), &name)?;
+    let all = merged();
+    find_writable(&all, &name)?;
+    let existing = all
+        .iter()
+        .find(|e| e.record.name == name)
+        .map(|e| e.record.clone())
+        .ok_or_else(|| anyhow::anyhow!("unknown host {name:?}"))?;
     if let Some(new) = flags.str("rename") {
         hosts::validate_name(new).map_err(anyhow::Error::msg)?;
         if new != name && merged().iter().any(|e| e.record.name == new) {
@@ -368,6 +392,18 @@ fn cmd_set(flags: &Flags) -> Result<()> {
         anyhow::bail!("--token/--token-stdin and --no-token contradict each other");
     }
     let clear_token = flags.bool("no-token");
+    // Apply the same edits the mutation below will, so the refusal sees the state this command is
+    // about to create — `set --no-tls` on an entry that already holds a token is the same
+    // permanently-unusable entry as `add --no-tls --token`.
+    let effective_token = if token.is_some() {
+        token.clone()
+    } else if clear_token {
+        None
+    } else {
+        existing.token.clone()
+    };
+    let effective_tls = tls.unwrap_or(existing.tls);
+    refuse_token_without_tls(effective_token.is_some(), effective_tls, &name)?;
     let rename = flags.str("rename").map(String::from);
     let address = flags.str("address").map(String::from);
 
@@ -500,6 +536,11 @@ async fn cmd_trust(flags: &Flags) -> Result<()> {
         .str("fingerprint")
         .ok_or_else(|| anyhow::anyhow!("--fingerprint is required — run `clowder remote probe {name}` first"))?
         .to_lowercase();
+    // Validated, not just lowercased: `record_known_host` writes `"{address} {fp}\n"` and
+    // `tofu::check` reads it back with `split_whitespace()`, so a fingerprint carrying whitespace
+    // would be silently truncated on read and the registry pin and the known-hosts line would
+    // disagree forever.
+    hosts::validate_fingerprint(&fp).map_err(anyhow::Error::msg)?;
     let all = merged();
     find_writable(&all, &name)?;
     if flags.bool("verify") {
@@ -955,6 +996,112 @@ mod tests {
             sentinel,
             "a failed --verify must write nothing to known_hosts"
         );
+
+        std::env::remove_var("XDG_STATE_HOME");
+        std::env::remove_var("CLOWDER_HOSTS_FILE");
+    }
+
+    #[tokio::test]
+    async fn cmd_trust_rejects_a_fingerprint_that_is_not_lowercase_hex() {
+        // A fingerprint with whitespace in it is the damaging case: `record_known_host` writes
+        // `"{address} {fp}\n"` and `tofu::check` reads the line back with `split_whitespace()`,
+        // so "aa 11" would be stored whole in the registry but truncated to "aa" on the
+        // known-hosts path — the two would disagree permanently.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_STATE_HOME", dir.path());
+        std::env::set_var("CLOWDER_HOSTS_FILE", dir.path().join("hosts.json"));
+
+        HostsStore::default_store()
+            .try_mutate(|all| {
+                all.push(HostRecord {
+                    name: "studio".into(),
+                    address: "10.0.0.5:7777".into(),
+                    tls: true,
+                    token: None,
+                    fingerprint: None,
+                })
+            })
+            .unwrap();
+        let before = HostsStore::default_store().load();
+
+        // Note "AA11" is deliberately absent: `cmd_trust` lowercases before validating, so
+        // uppercase input is canonicalized, not rejected.
+        for bad in ["aa 11", "aa1", "not-hex", "aa:11", ""] {
+            let flags = parse_flags(&args(&["trust", "studio", "--fingerprint", bad])).unwrap();
+            let err = cmd_trust(&flags).await.unwrap_err();
+            assert!(
+                err.to_string().contains("hex"),
+                "must name the expected form for {bad:?}: {err}"
+            );
+        }
+        assert_eq!(HostsStore::default_store().load(), before, "a rejected fingerprint must not be stored");
+        assert!(
+            !crate::tofu::known_hosts_path().exists(),
+            "a rejected fingerprint must not reach known_hosts either"
+        );
+
+        std::env::remove_var("XDG_STATE_HOME");
+        std::env::remove_var("CLOWDER_HOSTS_FILE");
+    }
+
+    #[test]
+    fn add_refuses_a_token_with_tls_explicitly_off() {
+        // Previously accepted, then refused days later by `resolve_target` at connect time — with
+        // an error blaming the entry rather than the command that created it.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_STATE_HOME", dir.path());
+        std::env::set_var("CLOWDER_HOSTS_FILE", dir.path().join("hosts.json"));
+
+        let flags = parse_flags(&args(&["add", "studio", "10.0.0.5:7777", "--no-tls", "--token", "s3cr3t"])).unwrap();
+        let err = cmd_add(&flags).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("--no-tls"), "must name the flag to drop: {msg}");
+        assert!(HostsStore::default_store().load().is_empty(), "the unusable entry must not be created");
+
+        // The same command without --no-tls is still fine, and implies TLS.
+        let ok = parse_flags(&args(&["add", "studio", "10.0.0.5:7777", "--token", "s3cr3t"])).unwrap();
+        cmd_add(&ok).unwrap();
+        let loaded = HostsStore::default_store().load();
+        assert!(loaded[0].tls, "a token implies TLS");
+
+        std::env::remove_var("XDG_STATE_HOME");
+        std::env::remove_var("CLOWDER_HOSTS_FILE");
+    }
+
+    #[test]
+    fn set_refuses_turning_tls_off_while_a_token_remains() {
+        // The `set` half of the same hazard: the token need not be given on THIS command — an
+        // entry that already has one is made just as unusable by a bare `--no-tls`.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_STATE_HOME", dir.path());
+        std::env::set_var("CLOWDER_HOSTS_FILE", dir.path().join("hosts.json"));
+
+        HostsStore::default_store()
+            .try_mutate(|all| {
+                all.push(HostRecord {
+                    name: "studio".into(),
+                    address: "10.0.0.5:7777".into(),
+                    tls: true,
+                    token: Some("s3cr3t".into()),
+                    fingerprint: None,
+                })
+            })
+            .unwrap();
+
+        let flags = parse_flags(&args(&["set", "studio", "--no-tls"])).unwrap();
+        let err = cmd_set(&flags).unwrap_err();
+        assert!(err.to_string().contains("--no-token"), "must name the way out: {err}");
+        assert!(HostsStore::default_store().load()[0].tls, "the refused edit must not be applied");
+
+        // Dropping the token in the same breath is the documented fix, and must be allowed.
+        let ok = parse_flags(&args(&["set", "studio", "--no-tls", "--no-token"])).unwrap();
+        cmd_set(&ok).unwrap();
+        let loaded = HostsStore::default_store().load();
+        assert!(!loaded[0].tls);
+        assert_eq!(loaded[0].token, None);
 
         std::env::remove_var("XDG_STATE_HOME");
         std::env::remove_var("CLOWDER_HOSTS_FILE");
