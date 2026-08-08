@@ -211,6 +211,39 @@ extension AppDelegate: BackendSwitching {
         })
         surfaceHost?.retarget(socketPath: plan.renderPath)
     }
+
+    /// The active backend's supervisor state, read fresh on every call. Exposed as a method (not a
+    /// stored/published property) because neither `DaemonSupervisor` nor `AppDelegate` publish —
+    /// see `ConnectionChipView`'s doc comment for how the sidebar chip gets liveness out of that.
+    func activeSupervisorState() -> DaemonSupervisor.State {
+        supervisors[activeBackend]?.state ?? .stopped
+    }
+
+    /// Retry the ACTIVE backend after the chip surfaced `canRetry` (a `.failed` supervisor, or a
+    /// send failure that closed the control channel). Unlike `switchBackend`, this never tears
+    /// down or swaps backends — the active backend stays active; only its supervisor (if it needs
+    /// one) and its control connection get a fresh attempt.
+    func retryActiveBackend() {
+        let target: BackendTarget
+        switch activeBackend {
+        case .local:
+            target = .local
+        case let .remote(id):
+            guard let host = hosts.first(where: { $0.id == id }) else {
+                appModel?.reportBackendError("No host named \(id.rawValue) is configured.")
+                return
+            }
+            target = .remote(host)
+        }
+        let plan = backendPlan(target: target, sockets: sockets)
+        // `.start()` is a no-op while a process/relaunch is already in flight (guarded on
+        // `process == nil, relaunchTask == nil`), so calling it unconditionally is safe — it only
+        // does something when the supervisor actually needs restarting (e.g. `.failed`/`.stopped`).
+        supervisors[activeBackend]?.start()
+        appModel?.reconnect(to: activeBackend, makeTransport: {
+            try UnixSocketConnection(path: plan.controlPath)
+        })
+    }
 }
 
 /// Hides the window on close instead of destroying it, so the app stays alive in the menu bar.
@@ -231,9 +264,9 @@ struct ClowderApp: App {
             // Bootstrap on first body evaluation if the launch callback hasn't run yet;
             // idempotent, so a later applicationDidFinishLaunching is a no-op.
             let boot = delegate.bootstrap()
-            // Task 10 removes `isRemote:` in favour of deriving it from `model.activeBackend`
-            // inside the view; until then this reads the delegate at body-evaluation time.
-            ContentView(surfaceHost: boot.surfaceHost, isRemote: delegate.activeBackend != .local)
+            ContentView(surfaceHost: boot.surfaceHost,
+                        supervisorState: { [weak d = delegate] in d?.activeSupervisorState() ?? .stopped },
+                        onRetry: { [weak d = delegate] in d?.retryActiveBackend() })
                 .environmentObject(boot.appModel)
                 .frame(minWidth: 900, minHeight: 560)
                 .background(WindowAccessor { [weak d = delegate] window in d?.adoptWindow(window) })

@@ -5,8 +5,10 @@ import ClowderCore
 struct ContentView: View {
     @EnvironmentObject var model: AppModel
     let surfaceHost: SurfaceHost
-    /// False in remote mode: a local NSOpenPanel would return a path the daemon cannot see.
-    let isRemote: Bool
+    /// The active backend's supervisor state, threaded down to `ConnectionChipView`. See that
+    /// view's doc comment for why this is a closure rather than a plain value.
+    let supervisorState: () -> DaemonSupervisor.State
+    let onRetry: () -> Void
 
     @State private var expanded: Set<String> = ContentView.loadExpanded()
 
@@ -25,7 +27,10 @@ struct ContentView: View {
             }
         }
         .sheet(isPresented: $model.showingAddProject) {
-            AddProjectSheet(canBrowse: !isRemote) { path in
+            // Read live off `model.activeBackend` (`@Published`) rather than a flag computed once
+            // when the scene was built — that flag went stale across a backend swap and offered
+            // the local file browser for a remote backend (or hid it for a local one).
+            AddProjectSheet(canBrowse: model.activeBackend == .local) { path in
                 model.addProject(path: path)
             }
         }
@@ -102,6 +107,10 @@ struct ContentView: View {
                         .contextMenu { projectMenu(project) }
                 }
             }
+        }
+        .safeAreaInset(edge: .bottom) {
+            Divider()
+            ConnectionChipView(supervisorState: supervisorState, onRetry: onRetry)
         }
         .overlay {
             if model.store.sidebar.isEmpty && model.connectionState == .live {
