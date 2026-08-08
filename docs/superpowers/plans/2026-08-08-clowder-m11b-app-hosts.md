@@ -27,11 +27,18 @@ targets that branch, not `main`.
 
 ## Global Constraints
 
-- **Swift lives in `macos/`**: `cd macos && swift test` runs `ClowderCore`'s XCTest suite and does **not**
-  need the vendored libghostty. `cd macos && swift build` builds `clowder-app` and **does** need it
-  (189 MB gitignored `macos/vendor/libghostty/ghostty-internal.a`, built by
-  `scripts/build-libghostty.sh`, needs zig 0.16 + full Xcode). Plan on `swift test` for every Core task;
-  only the App tasks need a build.
+- **Swift lives in `macos/`**: `cd macos && swift test` runs `ClowderCore`'s XCTest suite.
+  `cd macos && swift build` also builds `clowder-app`, which needs the vendored libghostty (189 MB
+  gitignored `macos/vendor/libghostty/ghostty-internal.a`, built by `scripts/build-libghostty.sh`,
+  needs zig 0.16 + full Xcode).
+- **CORRECTION (verified 2026-08-08, after this plan was first written): `swift test` DOES compile the
+  `ClowderApp` target.** SwiftPM builds the whole package graph, so a compile error anywhere in
+  `ClowderApp` aborts `swift test` before any test binary is linked — the suite does not merely stay
+  green, it does not run at all. **Consequence: every task must leave the whole package compiling.**
+  A Core change that breaks an App call site must include the minimal call-site update in the same
+  commit, even when the real rewiring belongs to a later task. Do not defer it and do not work around
+  it with `swift build --product ClowderPackageTests`; a commit that does not build is a `git bisect`
+  hazard, and this repo merges feature branches so every commit lands individually in `main`.
 - **Prefix every cargo command** with `source "$HOME/.cargo/env" && ` (Task 1 only).
 - **Trust the toolchain over the editor**: stale SourceKit "No such module" / "cannot find type"
   diagnostics are common here. Believe `swift build` / `swift test` output.
@@ -1067,17 +1074,32 @@ public func backendPlan(target: BackendTarget, sockets: SocketPaths) -> BackendP
 Then delete `macos/Sources/ClowderCore/RemotePaths.swift` and
 `macos/Tests/ClowderCoreTests/RemotePathsTests.swift`.
 
-- [ ] **Step 4: Run to verify the tests pass**
+- [ ] **Step 4: Keep the package compiling with a minimal call-site update**
+
+Deleting `forwarderSocketDir(controlPath:)` breaks its only caller,
+`makeBackendSupervisor` in `macos/Sources/ClowderApp/DaemonLaunch.swift:148`. Since `swift test`
+compiles `ClowderApp` too (see the corrected Global Constraint), leaving it broken makes the suite
+un-runnable and puts a non-building commit in history.
+
+Make the **minimal** change — one line, same behavior as before apart from the now per-host directory:
+
+```swift
+        let dir = forwarderSocketDir(controlPath: socks.control, host: host)
+```
+
+Change nothing else in `ClowderApp`. Task 9 rewrites this whole function around `backendPlan`; this is
+only the stopgap that keeps every commit buildable, exactly as M11a's Task 4 did for `forward.rs`.
+
+- [ ] **Step 5: Run to verify the tests pass**
 
 Run: `cd macos && swift test`
-Expected: PASS. `swift test` compiles only `ClowderCore` + its tests, so the `makeBackendSupervisor`
-call site in `ClowderApp` (still calling the deleted one-argument function) will **not** break this
-command — Task 9 fixes it. Note this in your report; do not "fix" `ClowderApp` here.
+Expected: PASS — 151 tests (147 baseline − 2 from the deleted `RemotePathsTests` + 6 new).
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
-git add macos/Sources/ClowderCore/BackendPlan.swift macos/Tests/ClowderCoreTests/BackendPlanTests.swift
+git add macos/Sources/ClowderCore/BackendPlan.swift macos/Tests/ClowderCoreTests/BackendPlanTests.swift \
+        macos/Sources/ClowderApp/DaemonLaunch.swift
 git rm macos/Sources/ClowderCore/RemotePaths.swift macos/Tests/ClowderCoreTests/RemotePathsTests.swift
 git commit -m "feat(app): derive backend launch plans, one authority for socket paths"
 ```
