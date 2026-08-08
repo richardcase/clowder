@@ -166,7 +166,7 @@ final class AppModelTests: XCTestCase {
         XCTAssertFalse(model.store.worktrees.isEmpty)
 
         let second = FakeControlTransport()
-        model.reconnect(makeTransport: { second })
+        model.reconnect(to: .local, makeTransport: { second })
 
         XCTAssertTrue(first.disconnected)                                  // old backend torn down
         XCTAssertTrue(model.store.worktrees.isEmpty)                       // old worktrees dropped
@@ -198,7 +198,7 @@ final class AppModelTests: XCTestCase {
         model.connect()
 
         let second = FakeControlTransport()
-        model.reconnect(makeTransport: { second })    // shutdown() disconnects `first` (defers its close)
+        model.reconnect(to: .local, makeTransport: { second })    // shutdown() disconnects `first` (defers its close)
         XCTAssertEqual(model.connectionState, .live)
 
         // Pump the main queue so `first`'s deferred onClose fires: the identity guard must ignore it,
@@ -518,6 +518,99 @@ final class AppModelTests: XCTestCase {
         model.connect()
         model.selection = .worktree(4)
         XCTAssertTrue(fake.sentLines.contains { $0.contains("getSplitTree") }, "\(fake.sentLines)")
+    }
+}
+
+/// A fake `BackendSwitching` so views and menus can be driven without an AppDelegate.
+@MainActor
+final class FakeBackendSwitching: BackendSwitching {
+    var hosts: [RemoteHost] = []
+    var activeBackend: BackendID = .local
+    private(set) var switched: [BackendID] = []
+    private(set) var refreshCount = 0
+    func switchBackend(to backend: BackendID) { switched.append(backend) }
+    func refreshHosts() { refreshCount += 1 }
+}
+
+@MainActor
+final class AppModelBackendTests: XCTestCase {
+    private func hosts() -> [RemoteHost] {
+        [RemoteHost(name: "studio", address: "s:7777", tls: true, hasToken: true,
+                    fingerprint: "a1b2", trusted: true, source: .registry)]
+    }
+
+    func testActiveBackendStartsLocal() {
+        let model = AppModel(makeTransport: { FakeControlTransport() })
+        XCTAssertEqual(model.activeBackend, .local)
+    }
+
+    func testReconnectToRecordsTheNewBackend() {
+        let model = AppModel(makeTransport: { FakeControlTransport() })
+        model.connect()
+        model.reconnect(to: .remote(HostID("studio")), makeTransport: { FakeControlTransport() })
+        XCTAssertEqual(model.activeBackend, .remote(HostID("studio")))
+    }
+
+    func testSwitchingAwayAndBackRestoresTheSelection() async {
+        let model = AppModel(makeTransport: { FakeControlTransport() })
+        model.connect()
+        model.selection = .worktree(42)
+
+        model.reconnect(to: .remote(HostID("studio")), makeTransport: { FakeControlTransport() })
+        // The remote backend's panes are different, so the selection must be cleared on arrival.
+        XCTAssertNil(model.selection)
+
+        let local = FakeControlTransport()
+        model.reconnect(to: .local, makeTransport: { local })
+        // The restore can only apply once the returning backend's worktrees exist in the store —
+        // hydrate it exactly as the existing tests do (e.g. testAppliedEventsFlowToStore).
+        local.deliver(#"{"type":"worktreeList","worktrees":[{"pane":42,"project":"/p","name":"t","branch":"clowder/t","state":"Working"}]}"#)
+        let restored = await eventually { model.selection == .worktree(42) }
+        XCTAssertTrue(restored, "returning to a backend must restore where the user left off")
+    }
+
+    func testSelectionMemoryIsPerBackend() async {
+        let model = AppModel(makeTransport: { FakeControlTransport() })
+        model.connect()
+        model.selection = .worktree(1)
+        model.reconnect(to: .remote(HostID("studio")), makeTransport: { FakeControlTransport() })
+        model.selection = .worktree(2)
+        let local = FakeControlTransport()
+        model.reconnect(to: .local, makeTransport: { local })
+        local.deliver(#"{"type":"worktreeList","worktrees":[{"pane":1,"project":"/p","name":"t","branch":"clowder/t","state":"Working"}]}"#)
+        _ = await eventually { model.selection != nil }
+        XCTAssertEqual(model.selection, .worktree(1), "each backend remembers its own selection")
+    }
+
+    func testReconnectToTheSameBackendStillReconnects() {
+        // A Retry after `.failed` targets the backend already active; it must not be a no-op.
+        let model = AppModel(makeTransport: { FakeControlTransport() })
+        model.connect()
+        var built = 0
+        model.reconnect(to: .local, makeTransport: { built += 1; return FakeControlTransport() })
+        XCTAssertEqual(built, 1)
+    }
+
+    func testHostsArePublishedForTheUISurfaces() {
+        let model = AppModel(makeTransport: { FakeControlTransport() })
+        model.setHosts(hosts())
+        XCTAssertEqual(model.hosts.map(\.name), ["studio"])
+    }
+
+    func testBackendSwitchingIsForwardedToTheDelegate() {
+        let model = AppModel(makeTransport: { FakeControlTransport() })
+        let fake = FakeBackendSwitching()
+        model.backends = fake
+        model.requestSwitch(to: .remote(HostID("studio")))
+        XCTAssertEqual(fake.switched, [.remote(HostID("studio"))])
+        model.requestHostRefresh()
+        XCTAssertEqual(fake.refreshCount, 1)
+    }
+
+    func testRequestSwitchWithNoDelegateIsHarmless() {
+        let model = AppModel(makeTransport: { FakeControlTransport() })
+        model.requestSwitch(to: .local)     // must not crash or trap
+        XCTAssertEqual(model.activeBackend, .local)
     }
 }
 

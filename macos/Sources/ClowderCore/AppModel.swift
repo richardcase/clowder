@@ -16,6 +16,16 @@ public struct PendingLifecycle: Equatable, Sendable {
     }
 }
 
+/// Who owns backend processes and the host list. `AppDelegate` conforms; the chip, the menu bar,
+/// and the command palette all read this one source rather than each holding their own closures.
+@MainActor
+public protocol BackendSwitching: AnyObject {
+    var hosts: [RemoteHost] { get }
+    var activeBackend: BackendID { get }
+    func switchBackend(to backend: BackendID)
+    func refreshHosts()
+}
+
 /// Owns the control channel and the app's selection. Libghostty-free so it is unit-testable.
 /// Retaining `session` is what keeps ControlSession's `[weak self]` receiver alive.
 @MainActor
@@ -30,6 +40,7 @@ public final class AppModel: ObservableObject {
     public let store: AgentStore
     @Published public var selection: SidebarSelection? {
         didSet {
+            if selection != nil { pendingRestore = nil }
             focusedPane = selectedPane          // focus the root pane on (re)select
             switch selection {
             case let .worktree(pane):
@@ -78,6 +89,28 @@ public final class AppModel: ObservableObject {
     /// Paths whose terminal has been live at least once (drives `closedProjectTerminals` above).
     private var everOpenedProjectPaths: Set<String> = []
 
+    /// Which backend the control channel is pointed at.
+    @Published public private(set) var activeBackend: BackendID = .local
+    /// The known remote hosts, as last read from the registry.
+    @Published public private(set) var hosts: [RemoteHost] = []
+
+    /// Owns the backend processes. `weak` because the delegate owns this model.
+    public weak var backends: BackendSwitching?
+
+    /// Where the user was in each backend, so switching feels like tabs rather than a restart.
+    /// `reconnect` necessarily clears `selection` — the new backend's panes are different — and
+    /// this is what puts it back on return.
+    private var lastSelection: [BackendID: SidebarSelection] = [:]
+
+    /// A selection to re-apply once the incoming backend's worktrees arrive. Cleared after one
+    /// successful restore (or when the user selects something themselves).
+    private var pendingRestore: SidebarSelection?
+
+    public func setHosts(_ hosts: [RemoteHost]) { self.hosts = hosts }
+
+    public func requestSwitch(to backend: BackendID) { backends?.switchBackend(to: backend) }
+    public func requestHostRefresh() { backends?.refreshHosts() }
+
     private var makeTransport: () throws -> ControlTransport
     private var connection: ControlTransport?
     private var session: ControlSession?
@@ -100,6 +133,7 @@ public final class AppModel: ObservableObject {
         self.storeSubscription = store.objectWillChange.sink { [weak self] _ in
             self?.objectWillChange.send()
             DispatchQueue.main.async {
+                self?.restorePendingSelectionIfPossible()
                 self?.reconcileFocus()
                 self?.reconcileProjectSelection()
             }
@@ -129,10 +163,17 @@ public final class AppModel: ObservableObject {
     /// Point the control channel at a different backend (a live local↔remote swap): tear down the
     /// current connection + reconnect loop, drop the previous backend's agents, then connect to the
     /// new transport. Keeps the same `AppModel` instance so SwiftUI views stay bound.
-    public func reconnect(makeTransport newMakeTransport: @escaping () throws -> ControlTransport) {
+    ///
+    /// Remembers the outgoing backend's selection and restores the incoming one's once the
+    /// connection is live and its worktrees have arrived.
+    public func reconnect(to backend: BackendID,
+                          makeTransport newMakeTransport: @escaping () throws -> ControlTransport) {
+        if let current = selection { lastSelection[activeBackend] = current }
         shutdown()                       // cancel reconnect, disconnect, clear session/connection
         store.reset()                    // drop the previous backend's agents/trees
         selection = nil
+        activeBackend = backend
+        pendingRestore = lastSelection[backend]
         self.makeTransport = newMakeTransport
         isShuttingDown = false
         connectionState = .connecting
@@ -277,6 +318,21 @@ public final class AppModel: ObservableObject {
         guard session != nil else { return }
         let r = min(0.95, max(0.05, ratio))
         try? session?.send(.setSplitRatio(split: split, ratio: r))
+    }
+
+    /// Re-apply a remembered selection once its target exists in the new backend's store.
+    /// Silently gives up if the pane or project is gone — a worktree may have been landed on the
+    /// other machine since we were last here.
+    private func restorePendingSelectionIfPossible() {
+        guard let want = pendingRestore, selection == nil else { return }
+        switch want {
+        case let .worktree(pane):
+            guard store.worktrees[pane] != nil else { return }
+        case let .project(path):
+            guard store.projects.contains(where: { $0.path == path }) else { return }
+        }
+        pendingRestore = nil
+        selection = want
     }
 
     /// If the focused pane is no longer a leaf of the current tree (a companion closed, or an

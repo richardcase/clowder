@@ -107,7 +107,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         daemonSupervisor = backend.supervisor
         currentRemoteHost = remoteHost
         backend.supervisor.start()
-        appModel?.reconnect(makeTransport: { try UnixSocketConnection(path: backend.control) })
+        appModel?.reconnect(to: remoteHost.map { .remote(HostID($0)) } ?? .local,
+                            makeTransport: { try UnixSocketConnection(path: backend.control) })
         surfaceHost?.retarget(socketPath: backend.render)
     }
 
