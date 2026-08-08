@@ -47,12 +47,42 @@ pub fn validate_name(name: &str) -> Result<(), String> {
     if let Some(bad) = name.chars().find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))) {
         return Err(format!("name may only contain letters, digits, '.', '_' and '-' (found {bad:?})"));
     }
+    // '.' is in the allowed set (so "a.b" works), which lets the two path-traversal names through
+    // the character check. `..` is exactly the non-separator escape from the per-host socket
+    // directory this name becomes (`<runtime>/clowder/remote/<name>/`), and `.` names the
+    // directory itself.
+    if name == "." || name == ".." {
+        return Err("name must not be '.' or '..'".into());
+    }
+    Ok(())
+}
+
+/// A certificate pin as it is stored and as `remote_known_hosts` records it: lowercase hex, even
+/// length. Whitespace matters more than it looks — `remote_known_hosts` lines are
+/// `"{address} {fingerprint}"` and are read back with `split_whitespace()`, so a fingerprint
+/// containing a space would be silently truncated on read and the pin would never match again.
+pub fn validate_fingerprint(fp: &str) -> Result<(), String> {
+    if fp.is_empty() {
+        return Err("fingerprint must not be empty (expected lowercase hex)".into());
+    }
+    if fp.len() % 2 != 0 || !fp.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)) {
+        return Err(format!(
+            "fingerprint must be lowercase hex with an even number of digits, e.g. the value \
+             printed by `clowder remote probe` (got {fp:?})"
+        ));
+    }
     Ok(())
 }
 
 /// Requires an explicit port: `host:port`, or `[v6]:port` for a bracketed IPv6 literal.
 /// There is no default port to fall back on — the daemon's `[remote] listen` is operator-chosen.
 pub fn validate_address(address: &str) -> Result<(), String> {
+    // Whitespace anywhere is fatal, not cosmetic: `remote_known_hosts` lines are
+    // `"{address} {fingerprint}"`, read back with `split_whitespace()`, so `"a b:7777"` would
+    // write a line whose first token is `a`, never match on read, and grow the file without bound.
+    if address.chars().any(char::is_whitespace) {
+        return Err(format!("address must not contain whitespace (got {address:?})"));
+    }
     let (host, port) = split_host_port(address)
         .ok_or_else(|| format!("address must be host:port or [ipv6]:port (got {address:?})"))?;
     if host.is_empty() {
@@ -129,9 +159,42 @@ impl HostsStore {
         }
     }
 
+    /// Like `load`, but a file that exists and does not parse is an ERROR rather than an empty
+    /// list. Only `try_mutate` uses this: `load`'s tolerance is what keeps a corrupt registry from
+    /// stopping the app reaching its local daemon, but tolerating it on the WRITE path would
+    /// serialize the empty fallback straight back over the file — one hand-edit typo followed by
+    /// any `clowder remote add|set|rm|trust|untrust` would delete every bearer token and every
+    /// trust pin. `agents.json` can afford that; a file of secrets and trust decisions cannot.
+    fn load_for_mutation(&self) -> Result<Vec<HostRecord>> {
+        let bytes = match std::fs::read(&self.path) {
+            Ok(b) => b,
+            // Missing is the ordinary "first write" case; anything else (a permissions problem,
+            // an I/O error) means we cannot know what we would be overwriting.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => {
+                return Err(anyhow::Error::from(e))
+                    .with_context(|| format!("read host registry {}", self.path.display()))
+            }
+        };
+        // A zero-length file has nothing to preserve, so treat it as "empty" rather than wedging
+        // the CLI on a truncated write from an older crash.
+        if bytes.iter().all(|b| b.is_ascii_whitespace()) {
+            return Ok(Vec::new());
+        }
+        serde_json::from_slice(&bytes).map_err(|e| {
+            anyhow::anyhow!(
+                "host registry {} is not valid JSON ({e}); refusing to overwrite it — it holds \
+                 your bearer tokens and certificate pins. Fix or move the file, then retry.",
+                self.path.display()
+            )
+        })
+    }
+
     /// Load, apply `f`, write back — the whole cycle under an exclusive advisory lock held on a
     /// SEPARATE `.lock` file. It has to be separate: the data file is replaced by `rename`, so a
     /// lock held on its inode would not be seen by the next writer.
+    ///
+    /// A corrupt existing file aborts the mutation (see `load_for_mutation`) — nothing is written.
     pub fn try_mutate<R>(&self, f: impl FnOnce(&mut Vec<HostRecord>) -> R) -> Result<R> {
         if let Some(dir) = self.path.parent() {
             std::fs::create_dir_all(dir)
@@ -139,7 +202,7 @@ impl HostsStore {
             let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
         }
         let _guard = FileLock::acquire(&lock_path(&self.path))?;
-        let mut all = self.load();
+        let mut all = self.load_for_mutation()?;
         let out = f(&mut all);
         let bytes = serde_json::to_vec_pretty(&all)?;
         write_atomic_0600(&self.path, &bytes)?;
@@ -320,8 +383,27 @@ mod tests {
         for good in ["studio", "mac-studio", "box_1", "a.b", "A", &"x".repeat(64)] {
             assert!(validate_name(good).is_ok(), "{good:?} should be valid");
         }
-        for bad in ["", "has space", "sl/ash", "quote\"", &"x".repeat(65), "tab\there"] {
+        // "." and ".." pass the character check ('.' is allowed so "a.b" works) but must be
+        // rejected outright: the name becomes a socket directory name in M11b, and ".." is
+        // precisely the traversal that needs no path separator.
+        for bad in ["", "has space", "sl/ash", "quote\"", &"x".repeat(65), "tab\there", ".", ".."] {
             assert!(validate_name(bad).is_err(), "{bad:?} should be invalid");
+        }
+        // A dot elsewhere is still fine — the rule is exact-match, not "contains a dot".
+        for good in ["...", "a..b", ".a", "a."] {
+            assert!(validate_name(good).is_ok(), "{good:?} should still be valid");
+        }
+    }
+
+    #[test]
+    fn fingerprints_must_be_even_length_lowercase_hex() {
+        for good in ["aa11", "00", &"ab".repeat(32)] {
+            assert!(validate_fingerprint(good).is_ok(), "{good:?} should be valid");
+        }
+        // Whitespace is the one that actually corrupts state: `remote_known_hosts` is
+        // whitespace-delimited, so "aa 11" would be truncated to "aa" on read.
+        for bad in ["", "aa 11", "aa\t11", "AA11", "aa1", "zz11", "aa:11", "aa11\n"] {
+            assert!(validate_fingerprint(bad).is_err(), "{bad:?} should be invalid");
         }
     }
 
@@ -330,7 +412,13 @@ mod tests {
         for good in ["h:7777", "10.0.0.5:1", "studio.tail1234.ts.net:7777", "[::1]:7777", "[fd7a::1]:22"] {
             assert!(validate_address(good).is_ok(), "{good:?} should be valid");
         }
-        for bad in ["", "h", "h:", ":7777", "h:0", "h:70000", "h:abc", "::1:7777", "[::1]7777"] {
+        // Whitespace anywhere is invalid: `remote_known_hosts` lines are whitespace-delimited, so
+        // "a b:7777" would write a line keyed on "a" that never matches on read, appending a new
+        // line on every single connect.
+        for bad in [
+            "", "h", "h:", ":7777", "h:0", "h:70000", "h:abc", "::1:7777", "[::1]7777",
+            "a b:7777", " h:7777", "h:7777 ", "h :7777", "h:77\t77", "h:7777\n",
+        ] {
             assert!(validate_address(bad).is_err(), "{bad:?} should be invalid");
         }
     }
@@ -406,6 +494,36 @@ mod tests {
         store.try_mutate(|all| all.push(rec("studio", "h:7777"))).unwrap();
         assert_eq!(mode_of(&p), 0o600, "the file holds bearer tokens");
         assert_eq!(mode_of(p.parent().unwrap()), 0o700);
+    }
+
+    #[test]
+    fn a_corrupt_file_is_never_overwritten_by_a_mutation() {
+        // The data-loss case: `load` falls back to an empty vec on a parse error, so a
+        // `try_mutate` that reused it would serialize that empty vec straight over a file full of
+        // bearer tokens and certificate pins. One hand-edit typo would silently delete them all.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("hosts.json");
+        let original = br#"[{"name":"studio","address":"h:7777","tls":true,"token":"s3cr3t","fingerprint":"aa11"},"#;
+        std::fs::write(&p, original).unwrap(); // valid-looking, but truncated: not parseable
+        let store = HostsStore::new(p.clone());
+
+        let err = store.try_mutate(|all| all.push(rec("new", "h:1"))).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("hosts.json"), "the error must name the file: {msg}");
+
+        // The whole point: the tokens are still on disk, byte for byte.
+        assert_eq!(std::fs::read(&p).unwrap(), original, "the original bytes must survive");
+    }
+
+    #[test]
+    fn an_empty_file_is_treated_as_an_empty_registry() {
+        // Nothing to preserve in a zero-length file, so it must not wedge every later mutation.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("hosts.json");
+        std::fs::write(&p, b"  \n").unwrap();
+        let store = HostsStore::new(p.clone());
+        store.try_mutate(|all| all.push(rec("studio", "h:7777"))).unwrap();
+        assert_eq!(store.load(), vec![rec("studio", "h:7777")]);
     }
 
     #[test]

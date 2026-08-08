@@ -12,5 +12,9 @@
   { "name": "back\\slash", "valid": false },
   { "name": "quote\"", "valid": false },
   { "name": "colon:name", "valid": false },
-  { "name": "café", "valid": false }
+  { "name": "café", "valid": false },
+  { "name": ".", "valid": false },
+  { "name": "..", "valid": false },
+  { "name": "...", "valid": true },
+  { "name": "a..b", "valid": true }
 ]
