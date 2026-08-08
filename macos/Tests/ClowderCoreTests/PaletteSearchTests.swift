@@ -73,6 +73,29 @@ final class PaletteSearchTests: XCTestCase {
         XCTAssertFalse(items.contains { $0.title == "Connect to laptop" })
     }
 
+    func testAQueryMatchingOnlyTheAddressFindsTheHost() {
+        // Hosts are routinely remembered by where they live, not what they were named.
+        let items = paletteResults(query: "laptop.tail", commands: [], worktrees: [],
+                                   hosts: twoHosts(), activeBackend: .local)
+        let titles = items.compactMap { item -> String? in
+            if case .backend = item.kind { return item.title }
+            return nil
+        }
+        XCTAssertEqual(titles, ["Connect to laptop"])
+    }
+
+    func testANoiseQueryDoesNotSurfaceEveryBackend() {
+        // "not" is a subsequence of "Connect to", which used to be part of every backend's
+        // haystack — so every host matched every such query.
+        for noise in ["not", "con", "cot", "net"] {
+            let items = paletteResults(query: noise, commands: [], worktrees: [],
+                                       hosts: twoHosts(), activeBackend: .remote(HostID("studio")))
+            let backends = items.filter { if case .backend = $0.kind { return true }; return false }
+            XCTAssertTrue(backends.isEmpty,
+                          "\"\(noise)\" matches nothing in these hosts, got \(backends.map(\.title))")
+        }
+    }
+
     func testBackendsSortAfterCommandsAndBeforeAgents() {
         // NOTE: `CommandRegistry.all` is a FUNCTION taking a keymap, not a static property.
         let cmds = CommandRegistry.all(keymap: Keymap())

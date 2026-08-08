@@ -66,8 +66,11 @@ public func paletteResults(query: String,
     }
     let backendItems = candidates.enumerated().compactMap { (i, c) -> (Int, Int, PaletteItem)? in
         let (id, name, address) = c
+        // Match the host's OWN text only. Including the "Connect to " prefix put a shared literal
+        // in every backend's haystack, so any query that is a subsequence of it — `con`, `net`,
+        // `not`, `cot` — surfaced every backend regardless of what the user meant.
         let haystack = [name, address].compactMap { $0 }.joined(separator: " ")
-        guard let r = fuzzyRank(trimmed, "Connect to \(haystack)") else { return nil }
+        guard let r = fuzzyRank(trimmed, haystack) else { return nil }
         return (r, i, PaletteItem(id: .backend(id), title: "Connect to \(name)",
                                   subtitle: address, kind: .backend(id)))
     }
