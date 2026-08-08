@@ -56,17 +56,19 @@ async fn main() -> Result<()> {
             let target = clowder_client::target::resolve_target(flags.positional(0), &hosts, &cfg)
                 .map_err(anyhow::Error::msg)?;
 
-            // Per-host socket dir. The APP passes --socket-dir explicitly (one authority for the
-            // path, instead of Swift re-deriving this rule); the default keeps a bare
-            // `clowder connect` working from a shell.
+            // The caller owns the forwarder's socket path. --socket-dir is used verbatim; the
+            // default is deliberately FLAT (`<control parent>/remote`, no per-host segment),
+            // because it is a compatibility guarantee: the macOS app derives this exact path in
+            // ClowderCore's `forwarderSocketDir`, and shell users have it in their env already.
+            // A caller that wants per-host isolation asks for it with --socket-dir rather than
+            // having the layout changed underneath it.
             let dir = match flags.str("socket-dir") {
                 Some(d) => std::path::PathBuf::from(d),
                 None => cfg
                     .control_sock
                     .parent()
                     .ok_or_else(|| anyhow!("cannot derive forwarder socket dir"))?
-                    .join("remote")
-                    .join(&target.label),
+                    .join("remote"),
             };
 
             // Fail fast when the very first dial never lands. Without this the forwarder binds
