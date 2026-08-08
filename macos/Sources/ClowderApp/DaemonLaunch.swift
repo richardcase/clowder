@@ -150,10 +150,13 @@ func makeBackendSupervisor(remoteHost: String?) -> (supervisor: DaemonSupervisor
         let render = (dir as NSString).appendingPathComponent("clowder.sock")
         let binDir = (clowderPath as NSString).deletingLastPathComponent
         env["PATH"] = binDir + ":" + (env["PATH"] ?? "/usr/bin:/bin")
-        // Deliberately do NOT set CLOWDER_*_SOCK: the forwarder derives its own dir from the default
-        // control sock (a clean env), which must equal `dir` above — overriding it would push the
-        // forwarder to `.../remote/remote`.
-        let sup = DaemonSupervisor(spawn: { ProcessDaemon(execPath: clowderPath, args: ["connect", host], env: env) })
+        // Deliberately do NOT set CLOWDER_*_SOCK: overriding them would fight --socket-dir below.
+        // The app passes --socket-dir explicitly, so there is one authority for this path instead
+        // of two derivations (app + forwarder) that would have to agree independently.
+        // Task 9: this whole function is rewritten around backendPlan(target:sockets:).
+        let sup = DaemonSupervisor(spawn: {
+            ProcessDaemon(execPath: clowderPath, args: ["connect", host, "--socket-dir", dir], env: env)
+        })
         return (sup, control, render)
     } else {
         guard let daemonPath = ClowderPaths.bundledBin("clowder-daemon") else { return nil }
