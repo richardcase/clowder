@@ -42,34 +42,37 @@ struct ConnectionChipView: View {
             Button {
                 model.requestSwitch(to: .local)
             } label: {
-                Label("Local", systemImage: model.activeBackend == .local ? "checkmark" : "")
+                backendLabel("Local", active: model.activeBackend == .local)
             }
             .disabled(model.activeBackend == .local)
 
+            Divider()
             if model.hosts.isEmpty {
-                Divider()
-                Text("No remote hosts configured")
+                // Not a dead end: name the command that fixes it. (The next milestone replaces
+                // this hint — and the removed "Manage Hosts…" item — with a real Settings pane.)
+                Text("No remote hosts. Add one: clowder remote add <name> <host:port>")
             } else {
-                Divider()
                 ForEach(model.hosts) { host in
                     Button {
                         model.requestSwitch(to: host.backend)
                     } label: {
                         // An unpaired host still connects (trust-on-first-use) — say so rather
                         // than hiding it, so the user knows which hosts they have verified.
-                        Text(host.isTrusted ? host.name : "\(host.name) — not paired")
+                        backendLabel(host.isTrusted ? host.name : "\(host.name) — not paired",
+                                     active: host.backend == model.activeBackend)
                     }
                     .disabled(host.backend == model.activeBackend)
                 }
+                Divider()
+                // Same reason as above: the only way to add a host today is the CLI, so say so
+                // rather than offering a `SettingsLink` to a Settings scene that does not exist.
+                Text("Add a host: clowder remote add <name> <host:port>")
             }
 
             if chip.canRetry {
                 Divider()
                 Button("Retry", action: onRetry)
             }
-
-            Divider()
-            SettingsLink { Text("Manage Hosts…") }
         } label: {
             HStack(spacing: 6) {
                 Circle().fill(color(chip.tone)).frame(width: 7, height: 7)
@@ -87,6 +90,18 @@ struct ConnectionChipView: View {
         .menuStyle(.borderlessButton)
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
+    }
+
+    /// One idiom for every backend row: a checkmark when it is the active one, and NO image
+    /// otherwise. An empty `systemImage` name is not a valid symbol — it logs a console warning and
+    /// leaves a blank slot — so the inactive rows must be plain `Text`, not a `Label` with "".
+    @ViewBuilder
+    private func backendLabel(_ title: String, active: Bool) -> some View {
+        if active {
+            Label(title, systemImage: "checkmark")
+        } else {
+            Text(title)
+        }
     }
 
     private func color(_ tone: ChipTone) -> Color {
