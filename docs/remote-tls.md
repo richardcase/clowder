@@ -80,11 +80,13 @@ registry first (an exact name, then an exact address), and falls back to treatin
 has always done, so nothing in this paragraph is a compatibility break.
 
 The forwarder's local socket directory is **flat by default** — `<the control socket's parent>/remote`,
-the same path `clowder connect` has always used — **not** one subdirectory per host. That's
-deliberate: the macOS app spawns `clowder connect <host>` without any socket-dir flag and expects
-that exact flat path, so changing the default would have broken its remote mode. Pass `--socket-dir
-<dir>` if you want per-host isolation (e.g. two `clowder connect` processes for two hosts at once);
-the app opts into this itself when it needs it, everyone else keeps the flat default.
+the same path `clowder connect` has always used — **not** one subdirectory per host. Pass
+`--socket-dir <dir>` for per-host isolation (e.g. two `clowder connect` processes for two hosts at
+once, or several forwarders that must not collide). The macOS app always passes it: since M11b it can
+run more than one backend's forwarder at a time and needs each host's sockets kept apart, so every
+`clowder connect` it spawns gets `--socket-dir <runtime>/clowder/remote/<host>` (computed once, in
+`macos/Sources/ClowderCore/BackendPlan.swift`). Everyone else — a bare shell invocation of `clowder
+connect` — still gets the flat default.
 
 `clowder connect` exits **4** when the very first dial to the target never lands (bad address, daemon
 down, wrong port) — distinct from exit 3 (`clowder-daemon`'s "another instance already owns the
@@ -92,13 +94,11 @@ lock") and the plain exit 1 used for a user error such as an unrecognized host n
 supervisor (M11b) relies on 4 to tell "typo/unreachable" apart from a daemon that's merely slow to
 come up.
 
-**Interim note (until M11b lands):** exit 4 is already app-visible, and the app does not know about
-it yet. `macos/Sources/ClowderApp/DaemonLaunch.swift` supervises `clowder connect <host>` and
-relaunches it on every exit code except 3 (bounded backoff, `min(10s, 0.5s × 2^attempt)`), so an
-unreachable remote host now makes the app respawn the forwarder every ~10 seconds once that backoff
-saturates. Before exit 4 existed, the forwarder burned ~15s of internal
-`dial_with_backoff` retries before exiting, so the loop is the same shape, just faster. Nothing is
-corrupted by it — it's a busier log and a warmer laptop until the supervisor learns to stop on 4.
+**The app stops on exit 4 instead of respawning.** `ClowderCore/DaemonSupervisor.swift` treats code 4
+as terminal: it enters a `.failed` state (surfaced as a red chip with a Retry) rather than looping
+through its bounded backoff, so an unreachable remote host produces one failed launch and a wait for
+the user, not a respawn every ~10 seconds. Before M11b, the supervisor didn't distinguish exit 4 from
+any other unexpected exit and relaunched it like any crash; that interim behavior is gone.
 
 **Trust-on-first-use (TOFU):** on first connect to a given host, the client records the daemon's
 certificate fingerprint in `<state>/clowder/remote_known_hosts` (`$XDG_STATE_HOME` or

@@ -31,6 +31,9 @@ native SwiftUI macOS app renders every agent's live terminal via [libghostty](ht
 - **Survivable** — the daemon owns the agent PTYs and keeps them running while the window is closed; the
   app **launches + supervises its own daemon** and **auto-reconnects** (bounded backoff) if the
   connection drops.
+- **Switch between Local and remote hosts** — pick which backend is active from the sidebar's
+  connection chip, the menu bar, or the command palette (⌘K); switching away from Local detaches its
+  daemon rather than killing it, so agents on both sides keep running while you're elsewhere.
 - **Robust daemon** — a `~/.config/clowder/config.toml` config file (sockets, pane defaults, and
   `[worktrees] base` to put worktrees wherever you like), per-user sockets, a single-instance guard,
   graceful shutdown that kills child PTYs, companion-crash reaping, and structured `tracing` logs.
