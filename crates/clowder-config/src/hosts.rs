@@ -219,14 +219,18 @@ fn lock_path(path: &Path) -> PathBuf {
 /// An exclusive advisory `flock`, released when dropped (or when the process dies) — the same
 /// primitive and crate the daemon's `InstanceLock` uses, but BLOCKING: two interactive writers
 /// should serialize, not fail.
-struct FileLock {
+///
+/// Exported for `clowder-client`'s `remote_known_hosts` writes, which need the identical
+/// cross-process mutual-exclusion guarantee for the identical reason: a shell and the app's
+/// Settings pane (or two shells) can race a read-modify-write of that file too.
+pub struct FileLock {
     // Held only for its lifetime — dropping it closes the fd, which releases the flock. Named
     // `_file` (matching `InstanceLock`'s convention) so the compiler doesn't flag it as dead code.
     _file: std::fs::File,
 }
 
 impl FileLock {
-    fn acquire(path: &Path) -> Result<Self> {
+    pub fn acquire(path: &Path) -> Result<Self> {
         let file = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -251,7 +255,11 @@ fn create_private(path: &Path) -> Result<std::fs::File> {
 }
 
 /// Write `bytes` to `path` atomically, never widening permissions and never leaving a temp file.
-fn write_atomic_0600(path: &Path, bytes: &[u8]) -> Result<()> {
+///
+/// Exported for `clowder-client`'s `remote_known_hosts` writes, which need the identical
+/// guarantees for the identical reason: that file also holds trust decisions and is written by
+/// more than one process.
+pub fn write_atomic_0600(path: &Path, bytes: &[u8]) -> Result<()> {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let mut tmp = path.as_os_str().to_os_string();
     tmp.push(format!(

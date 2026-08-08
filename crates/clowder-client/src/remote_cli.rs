@@ -595,18 +595,39 @@ fn report_one(record: &HostRecord, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// The lock file guarding `remote_known_hosts` — the same `.lock`-sibling scheme as
+/// `tofu::check`, so a mirror write here and a TOFU record in `tofu::check` serialize against
+/// each other rather than each seeing the other's read-modify-write window.
+fn known_hosts_lock_path() -> std::path::PathBuf {
+    let mut s = crate::tofu::known_hosts_path().into_os_string();
+    s.push(".lock");
+    std::path::PathBuf::from(s)
+}
+
 /// Drop `address`'s line from `remote_known_hosts`, best-effort. A failure here is not worth
 /// failing the command over: the registry is the source of truth, and a stale line only ever
 /// causes a loud refuse, never a silent trust.
 fn prune_known_host(address: &str) {
     let path = crate::tofu::known_hosts_path();
-    let Ok(text) = std::fs::read_to_string(&path) else { return };
+    let guard = match clowder_config::hosts::FileLock::acquire(&known_hosts_lock_path()) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("clowder: lock {}: {e}", path.display());
+            return;
+        }
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        drop(guard);
+        return;
+    };
     let kept: String = text
         .lines()
         .filter(|l| l.split_whitespace().next() != Some(address))
         .map(|l| format!("{l}\n"))
         .collect();
-    let _ = std::fs::write(&path, kept);
+    if let Err(e) = clowder_config::hosts::write_atomic_0600(&path, kept.as_bytes()) {
+        eprintln!("clowder: write {}: {e}", path.display());
+    }
 }
 
 /// Record `address → fp` in `remote_known_hosts`, replacing any existing line for that address.
@@ -616,6 +637,13 @@ fn record_known_host(address: &str, fp: &str) {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
+    let guard = match clowder_config::hosts::FileLock::acquire(&known_hosts_lock_path()) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("clowder: lock {}: {e}", path.display());
+            return;
+        }
+    };
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
     let mut out: String = existing
         .lines()
@@ -623,7 +651,12 @@ fn record_known_host(address: &str, fp: &str) {
         .map(|l| format!("{l}\n"))
         .collect();
     out.push_str(&format!("{address} {fp}\n"));
-    let _ = std::fs::write(&path, out);
+    // Held across the write too: releasing after the read would let another writer's
+    // read-modify-write interleave right here and drop this address's line (or vice versa).
+    if let Err(e) = clowder_config::hosts::write_atomic_0600(&path, out.as_bytes()) {
+        eprintln!("clowder: write {}: {e}", path.display());
+    }
+    drop(guard);
 }
 
 #[cfg(test)]

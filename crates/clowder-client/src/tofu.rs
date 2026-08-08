@@ -13,6 +13,14 @@ pub fn known_hosts_path() -> PathBuf {
 
 /// Record-or-verify `fp` for `host`. Ok = trusted (recorded on first sight); Err(msg) = refuse.
 pub fn check(path: &Path, host: &str, fp: &str) -> Result<(), String> {
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    // Hold the lock across read-modify-write: two clients recording different hosts on first
+    // sight would otherwise interleave and drop one another's line, losing trust for a host
+    // neither of them was touching.
+    let _guard = clowder_config::hosts::FileLock::acquire(&lock_path(path))
+        .map_err(|e| format!("lock known_hosts: {e}"))?;
     let existing = match std::fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -34,13 +42,21 @@ pub fn check(path: &Path, host: &str, fp: &str) -> Result<(), String> {
             }
         }
     }
-    // First sight: record and accept.
-    if let Some(dir) = path.parent() { let _ = std::fs::create_dir_all(dir); }
     let mut content = existing;
-    if !content.is_empty() && !content.ends_with('\n') { content.push('\n'); }
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
     content.push_str(&format!("{host} {fp}\n"));
-    std::fs::write(path, content).map_err(|e| format!("write known_hosts: {e}"))?;
-    Ok(())
+    clowder_config::hosts::write_atomic_0600(path, content.as_bytes())
+        .map_err(|e| format!("write known_hosts: {e}"))
+}
+
+/// The lock file guarding `remote_known_hosts`. Separate from the data file because the data file
+/// is replaced by `rename`, so a lock on its inode would not be seen by the next writer.
+fn lock_path(path: &Path) -> std::path::PathBuf {
+    let mut s = path.as_os_str().to_os_string();
+    s.push(".lock");
+    std::path::PathBuf::from(s)
 }
 
 /// How to decide whether a presented server certificate is the daemon we meant to reach.
@@ -309,5 +325,41 @@ mod tests {
         assert!(verify(t(), &der).is_ok(), "same cert accepts");
         let (other_der, _) = a_cert();
         assert!(verify(t(), &other_der).is_err(), "changed cert refuses");
+    }
+
+    #[test]
+    fn concurrent_first_sight_records_do_not_lose_lines() {
+        // Each thread records a DIFFERENT host into the same file. Without a lock, two
+        // read-all/filter/write cycles interleave and one host's line is lost.
+        let dir = tempfile::tempdir().unwrap();
+        let kh = dir.path().join("known_hosts");
+        let handles: Vec<_> = (0..16u32)
+            .map(|i| {
+                let kh = kh.clone();
+                std::thread::spawn(move || {
+                    check(&kh, &format!("host{i}:7777"), "aa11").unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let text = std::fs::read_to_string(&kh).unwrap();
+        for i in 0..16u32 {
+            assert!(
+                text.lines().any(|l| l.split_whitespace().next() == Some(&format!("host{i}:7777"))),
+                "host{i} lost from known_hosts:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn known_hosts_is_written_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let kh = dir.path().join("known_hosts");
+        check(&kh, "h:7777", "aa11").unwrap();
+        let mode = std::fs::metadata(&kh).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "known_hosts records who you trust; it should not be world-readable");
     }
 }
