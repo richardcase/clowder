@@ -126,6 +126,8 @@ final class ProcessDaemon: DaemonProcess {
 
     func terminate() { if process.isRunning { process.terminate() } }   // SIGTERM → M5b graceful shutdown
 
+    var isRunning: Bool { process.isRunning }
+
     func setOnExit(_ handler: @escaping (Int32) -> Void) {
         onExit = handler
         if launchFailed {
