@@ -1,8 +1,9 @@
 //! `clowder connect` exit codes are a contract with the macOS app's DaemonSupervisor:
 //! 4 = the first dial never landed (stop and show the user), anything else = relaunchable.
 //!
-//! The default socket directory is a second contract with the same app: ClowderCore's
-//! `forwarderSocketDir` derives `<control parent>/remote` independently, so the two must agree.
+//! The default socket directory is a separate contract, with SHELL users: `clowder connect <host>`
+//! with no `--socket-dir` must keep binding where it always has. The macOS app is now the only
+//! caller that passes `--socket-dir` (a per-host directory), so nothing re-derives this default.
 
 use std::process::Command;
 
@@ -39,10 +40,11 @@ fn connect_to_an_unknown_name_exits_1_not_4() {
 
 /// With no `--socket-dir`, the forwarder must bind exactly where it always has:
 /// `<control-sock parent>/remote/{clowder.sock,clowder-control.sock}` — FLAT, with no per-host
-/// segment. The macOS app re-derives this path in Swift and does not pass `--socket-dir`, so a
-/// per-host default would leave it watching an empty directory forever. Per-host isolation is
-/// opt-in via `--socket-dir`, which is why this default is a compatibility guarantee and not an
-/// implementation detail.
+/// segment. This is a compatibility guarantee for shell users, who invoke `clowder connect` without
+/// the flag and have that path in their env and scripts already; changing the layout underneath
+/// them would silently point them at an empty directory. Per-host isolation is opt-in via
+/// `--socket-dir` — which the macOS app passes (it hands over `<control parent>/remote/<host>`), so
+/// the app does not depend on this default at all.
 #[test]
 fn the_default_socket_dir_is_flat_and_has_no_per_host_segment() {
     let tmp = tempfile::tempdir().unwrap();

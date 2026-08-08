@@ -58,10 +58,12 @@ async fn main() -> Result<()> {
 
             // The caller owns the forwarder's socket path. --socket-dir is used verbatim; the
             // default is deliberately FLAT (`<control parent>/remote`, no per-host segment),
-            // because it is a compatibility guarantee: the macOS app derives this exact path in
-            // ClowderCore's `forwarderSocketDir`, and shell users have it in their env already.
-            // A caller that wants per-host isolation asks for it with --socket-dir rather than
-            // having the layout changed underneath it.
+            // because it is a compatibility guarantee for SHELL users, who run `clowder connect`
+            // with no flag and already have that path in their env and scripts. A caller that
+            // wants per-host isolation asks for it with --socket-dir rather than having the
+            // layout changed underneath it — which is exactly what the macOS app does, passing
+            // `<control parent>/remote/<host>`. The app is the only caller that passes the flag,
+            // so nothing mirrors this default in Swift any more.
             let dir = match flags.str("socket-dir") {
                 Some(d) => std::path::PathBuf::from(d),
                 None => cfg
