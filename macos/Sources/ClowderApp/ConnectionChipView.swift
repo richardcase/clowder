@@ -27,6 +27,18 @@ struct ConnectionChipView: View {
 
     var body: some View {
         Menu {
+            // Refresh the host registry as the menu opens, so a host added on the CLI while the app
+            // is running shows up without a restart. This has to live INSIDE `content:`, not as a
+            // `.onTapGesture` on the `Menu` itself: `Menu`'s press-to-open handling (an
+            // `NSPopUpButton`/`NSMenu` on macOS) consumes the mouse-down before a sibling gesture
+            // recognizer ever sees it, so a tap gesture on the `Menu` is a silent no-op — the same
+            // well-known issue as `.onTapGesture` on a plain `Button`. SwiftUI evaluates `content:`
+            // when the menu is about to present, so an invisible view's `.onAppear` here fires
+            // exactly on open. Do not "simplify" this back onto the `Menu`.
+            Color.clear
+                .frame(width: 0, height: 0)
+                .onAppear { model.requestHostRefresh() }
+
             Button {
                 model.requestSwitch(to: .local)
             } label: {
@@ -75,7 +87,6 @@ struct ConnectionChipView: View {
         .menuStyle(.borderlessButton)
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
-        .onTapGesture { model.requestHostRefresh() }   // re-read the registry as the menu opens
     }
 
     private func color(_ tone: ChipTone) -> Color {
