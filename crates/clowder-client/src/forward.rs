@@ -182,6 +182,88 @@ mod tests {
         let _ = fwd.await;
     }
 
+    #[tokio::test]
+    async fn a_token_is_sent_over_tls() {
+        // The positive half of `a_token_is_never_sent_over_plaintext`, and the security-critical
+        // seam of the whole feature: without this, deleting the token from the hello entirely
+        // still passes the suite, because every other assertion is a negative one and `probe`'s
+        // TLS test exercises `probe::authenticate`, a different function with its own copy of the
+        // condition.
+        let (addr, fp, hello_rx) = tls_remote_recording_hello().await;
+        let (mut client, server) = tokio::io::duplex(4096);
+        let mut target = plain_target(&addr.to_string());
+        target.tls = true;
+        target.token = Some("s3cr3t".into());
+        target.fingerprint = Some(fp); // pinned, so the test never touches the real known_hosts
+        let fwd = tokio::spawn(async move { forward_stream(server, &target, Channel::Control).await });
+
+        client.write_all(b"ping").await.unwrap();
+        let mut got = [0u8; 4];
+        client.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"ping"); // the bytes really did round-trip through TLS
+        let (channel, token) = hello_rx.await.unwrap();
+        assert_eq!(channel, 1, "Control hello byte");
+        assert_eq!(
+            token.as_deref(),
+            Some("s3cr3t"),
+            "the token must reach the daemon over TLS — otherwise no host can ever authenticate"
+        );
+
+        drop(client);
+        let _ = fwd.await;
+    }
+
+    /// A TLS fake remote: a fresh self-signed cert (so no daemon state dir and no env var are
+    /// involved), one accepted connection, the hello recorded, then an echo.
+    async fn tls_remote_recording_hello(
+    ) -> (std::net::SocketAddr, String, tokio::sync::oneshot::Receiver<(u8, Option<String>)>) {
+        use std::sync::Arc;
+        use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        use tokio_rustls::rustls::ServerConfig;
+
+        let ck = rcgen::generate_simple_self_signed(vec!["clowder".to_string()]).unwrap();
+        let cert_der = ck.cert.der().to_vec();
+        let fp = clowder_proto::cert_fingerprint_hex(&cert_der);
+        let key_der = ck.key_pair.serialize_der();
+        let provider = Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
+        let config = ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from(cert_der)],
+                PrivateKeyDer::Pkcs8(key_der.into()),
+            )
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut sock = acceptor.accept(tcp).await.unwrap();
+            let (channel, token) = clowder_proto::read_hello(&mut sock).await.unwrap();
+            let byte = match channel {
+                Channel::Control => 1u8,
+                Channel::Render => 2u8,
+            };
+            let _ = tx.send((byte, token));
+            let mut buf = [0u8; 64];
+            loop {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if sock.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        (addr, fp, rx)
+    }
+
     // A fake remote: reads the full channel hello (channel byte + length-prefixed optional
     // token), records both, then echoes the rest back.
     async fn echo_remote_recording_hello_returning_token(
