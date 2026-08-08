@@ -72,8 +72,10 @@ public struct RemoteHost: Codable, Identifiable, Hashable, Sendable {
 
     public var id: HostID { HostID(name) }
     public var backend: BackendID { .remote(id) }
-    /// Paired: a pin is recorded, so the certificate is checked strictly on every connect.
-    public var isTrusted: Bool { fingerprint != nil }
+    /// Whether this host is paired with a certificate pin. This is the CLI's verdict, not a
+    /// local re-derivation — the CLI computes it from the presence of a fingerprint, and this
+    /// property returns that wire value to ensure changes to the contract surface immediately.
+    public var isTrusted: Bool { trusted }
     /// `config`-sourced entries are read-only — they are defined in `config.toml`.
     public var isEditable: Bool { source == .registry }
 }

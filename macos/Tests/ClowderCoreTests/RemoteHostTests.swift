@@ -29,6 +29,8 @@ final class RemoteHostTests: XCTestCase {
 
         let config = out.hosts[1]
         XCTAssertEqual(config.name, "config")
+        XCTAssertEqual(config.address, "10.0.0.5:7777")
+        XCTAssertFalse(config.tls)
         XCTAssertFalse(config.hasToken)
         XCTAssertNil(config.fingerprint)
         XCTAssertEqual(config.source, .config)
@@ -46,6 +48,31 @@ final class RemoteHostTests: XCTestCase {
         XCTAssertEqual(out.probe.fingerprintMatch, .new)
         XCTAssertTrue(out.probe.authenticated)
         XCTAssertNil(out.probe.error)
+    }
+
+    func testTrustedAndFingerprintInvariant() throws {
+        let out = try JSONDecoder().decode(ListOutput.self, from: fixture("remote-host-list.json"))
+        for host in out.hosts {
+            XCTAssertEqual(host.trusted, host.fingerprint != nil,
+                           "Host '\(host.name)': trusted field must equal (fingerprint != nil)")
+        }
+    }
+
+    func testIsTrustedReturnsTheWireValue() {
+        // isTrusted must return the decoded `trusted` value, not recompute from fingerprint.
+        // This ensures drift in the Rust implementation surfaces immediately.
+        let withFingerprint = RemoteHost(name: "p", address: "h:1", tls: true, hasToken: true,
+                                         fingerprint: "abc", trusted: true, source: .registry)
+        XCTAssertEqual(withFingerprint.isTrusted, true)
+
+        let withoutFingerprint = RemoteHost(name: "p", address: "h:1", tls: true, hasToken: true,
+                                            fingerprint: nil, trusted: false, source: .registry)
+        XCTAssertEqual(withoutFingerprint.isTrusted, false)
+
+        // This would only catch drift if isTrusted computes from fingerprint instead of the wire value
+        let mismatched = RemoteHost(name: "p", address: "h:1", tls: true, hasToken: true,
+                                    fingerprint: nil, trusted: true, source: .registry)
+        XCTAssertEqual(mismatched.isTrusted, true, "isTrusted must equal the decoded trusted field")
     }
 
     func testProbeAuthenticationIsNotClaimedForAPlaintextDaemon() {
