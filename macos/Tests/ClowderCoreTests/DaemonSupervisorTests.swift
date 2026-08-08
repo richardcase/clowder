@@ -160,6 +160,9 @@ final class DaemonSupervisorTests: XCTestCase {
         sup.detach()
         spawned[0].exit(139)                // crashed while detached
         XCTAssertEqual(sup.state, .detached, "a detached supervisor must not resurrect the process")
+        // The relaunch runs in a Task, so the assertions below are only meaningful AFTER a
+        // suspension point — without one they would pass however the supervisor behaved.
+        for _ in 0..<20 { await Task.yield() }
         XCTAssertEqual(controller.parkedCount, 0, "no relaunch may be scheduled while detached")
         XCTAssertEqual(spawned.count, 1)
     }
@@ -177,6 +180,8 @@ final class DaemonSupervisorTests: XCTestCase {
             return XCTFail("expected .failed, got \(sup.state)")
         }
         XCTAssertFalse(reason.isEmpty, "the chip shows this reason to the user")
+        // Same as the detached case: yield first, so a relaunch would have had the chance to run.
+        for _ in 0..<20 { await Task.yield() }
         XCTAssertEqual(controller.parkedCount, 0, "an unreachable host must not relaunch forever")
         XCTAssertEqual(spawned.count, 1)
     }
