@@ -125,6 +125,71 @@ public final class HostsViewModel: ObservableObject {
         if succeeded, selected == id { select(nil) }
     }
 
+    /// Where the pairing flow is. `observed` carries what the probe saw — nothing is written until the
+    /// user confirms, which is the whole point of splitting observe from trust.
+    public enum PairingState: Equatable, Sendable {
+        case idle
+        case probing
+        case observed(HostProbe)
+        case failed(String)
+    }
+
+    @Published public private(set) var pairing: PairingState = .idle
+    /// A fingerprint the user pasted from an out-of-band source, to be compared by software rather
+    /// than by eye. Empty means "not comparing".
+    @Published public var expectedFingerprint: String = ""
+
+    private var observedProbe: HostProbe? {
+        if case let .observed(p) = pairing { return p }
+        return nil
+    }
+
+    /// Nil when there is nothing to compare; otherwise whether the typed expectation matches.
+    public var fingerprintComparison: Bool? {
+        guard let observed = observedProbe?.fingerprint else { return nil }
+        let typed = expectedFingerprint.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !typed.isEmpty else { return nil }
+        return typed == observed.lowercased()
+    }
+
+    /// Trust is offered only when a certificate was actually observed, and only when any typed
+    /// expectation agrees with it.
+    public var canTrust: Bool {
+        guard let probe = observedProbe, probe.reachable, probe.fingerprint != nil else { return false }
+        return fingerprintComparison != false
+    }
+
+    public func beginPairing() async {
+        guard let host = selectedHost else { return }
+        pairing = .probing
+        expectedFingerprint = ""
+        do {
+            // Off the main actor: the CLI bounds each phase separately, so a probe can take ~3× its
+            // timeout, and this runs while a sheet is on screen.
+            pairing = .observed(try await registry.probeAsync(name: host.name))
+        } catch {
+            pairing = .failed((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
+        }
+    }
+
+    public func confirmTrust() async {
+        guard let host = selectedHost, canTrust,
+              let fingerprint = observedProbe?.fingerprint else { return }
+        await run {
+            // Verbatim what was displayed. If a cert is swapped between probe and trust, the pin
+            // fails loudly on the very next connect — an accepted, documented TOCTOU.
+            try self.registry.trust(name: host.name, fingerprint: fingerprint)
+            self.hosts = try self.registry.list()
+            self.onHostsChanged()
+        }
+        if lastError == nil { cancelPairing() }
+    }
+
+    public func cancelPairing() {
+        pairing = .idle
+        expectedFingerprint = ""
+    }
+
     /// Run a CLI-touching operation with busy state and uniform error surfacing. Task 4's pairing
     /// operations use this too, so it stays file-private rather than becoming API. Returns whether
     /// `body` completed without throwing, so callers can gate state advancement on success.

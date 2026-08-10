@@ -184,4 +184,102 @@ final class HostsViewModelTests: XCTestCase {
         m.select(HostID("config"))
         XCTAssertFalse(m.canEditSelection, "[remote] host lives in config.toml and is read-only")
     }
+
+    private let probeNewJSON = #"{"probe":{"name":"studio","address":"s:7777","reachable":true,"tls":true,"fingerprint":"a1b2","pinnedFingerprint":null,"fingerprintMatch":"new","authenticated":true,"error":null}}"#
+    private let probeUnreachableJSON = #"{"probe":{"name":"studio","address":"s:7777","reachable":false,"tls":true,"fingerprint":null,"pinnedFingerprint":null,"fingerprintMatch":null,"authenticated":false,"error":"connection refused"}}"#
+    private let probePlaintextJSON = #"{"probe":{"name":"studio","address":"s:7777","reachable":true,"tls":false,"fingerprint":null,"pinnedFingerprint":null,"fingerprintMatch":null,"authenticated":true,"error":null}}"#
+
+    func testBeginPairingProbesAndOffersTheFingerprint() async {
+        let fake = FakeCommandRunner()
+        fake.results = [.ok(twoHostsJSON), .ok(probeNewJSON)]
+        let m = model(fake)
+        await m.reload()
+        m.select(HostID("studio"))
+        await m.beginPairing()
+        guard case let .observed(probe) = m.pairing else {
+            return XCTFail("expected .observed, got \(m.pairing)")
+        }
+        XCTAssertEqual(probe.fingerprint, "a1b2")
+        XCTAssertEqual(probe.authSummary, .tokenAccepted)
+        XCTAssertTrue(m.canTrust, "a new fingerprint with no expectation typed is trustable")
+    }
+
+    func testAnUnreachableHostCannotBeTrusted() async {
+        let fake = FakeCommandRunner()
+        fake.results = [.ok(twoHostsJSON), .ok(probeUnreachableJSON)]
+        let m = model(fake)
+        await m.reload()
+        m.select(HostID("studio"))
+        await m.beginPairing()
+        XCTAssertFalse(m.canTrust)
+    }
+
+    func testAPlaintextDaemonPresentsNoFingerprintAndCannotBeTrusted() async {
+        // No TLS means no certificate to pin, and "authenticated" is meaningless there.
+        let fake = FakeCommandRunner()
+        fake.results = [.ok(twoHostsJSON), .ok(probePlaintextJSON)]
+        let m = model(fake)
+        await m.reload()
+        m.select(HostID("studio"))
+        await m.beginPairing()
+        guard case let .observed(probe) = m.pairing else { return XCTFail("expected .observed") }
+        XCTAssertEqual(probe.authSummary, .nonePlaintext)
+        XCTAssertFalse(m.canTrust, "there is no certificate to trust")
+    }
+
+    func testAMismatchedExpectedFingerprintBlocksTrust() async {
+        let fake = FakeCommandRunner()
+        fake.results = [.ok(twoHostsJSON), .ok(probeNewJSON)]
+        let m = model(fake)
+        await m.reload()
+        m.select(HostID("studio"))
+        await m.beginPairing()
+        m.expectedFingerprint = "deadbeef"
+        XCTAssertFalse(m.canTrust, "a typed expectation that disagrees must block trust")
+        XCTAssertNotNil(m.fingerprintComparison)
+        m.expectedFingerprint = "A1B2"       // case- and whitespace-insensitive
+        XCTAssertTrue(m.canTrust)
+    }
+
+    func testConfirmTrustSendsTheObservedFingerprintVerbatim() async {
+        let fake = FakeCommandRunner()
+        fake.results = [.ok(twoHostsJSON), .ok(probeNewJSON), .ok("{}"), .ok(twoHostsJSON)]
+        var notified = 0
+        let m = model(fake, onChanged: { notified += 1 })
+        await m.reload()
+        m.select(HostID("studio"))
+        await m.beginPairing()
+        await m.confirmTrust()
+        XCTAssertEqual(fake.invocations[2].args,
+                       ["remote", "trust", "studio", "--fingerprint", "a1b2", "--json"])
+        XCTAssertEqual(notified, 1)
+        XCTAssertEqual(m.pairing, .idle, "a successful trust closes the sheet")
+    }
+
+    func testCancelPairingClearsEverything() async {
+        let fake = FakeCommandRunner()
+        fake.results = [.ok(twoHostsJSON), .ok(probeNewJSON)]
+        let m = model(fake)
+        await m.reload()
+        m.select(HostID("studio"))
+        await m.beginPairing()
+        m.expectedFingerprint = "aa"
+        m.cancelPairing()
+        XCTAssertEqual(m.pairing, .idle)
+        XCTAssertEqual(m.expectedFingerprint, "")
+    }
+
+    func testAFailedProbeBecomesAPairingFailureNotASilentIdle() async {
+        let fake = FakeCommandRunner()
+        fake.results = [.ok(twoHostsJSON), .failed(#"{"error":"unknown host"}"#)]
+        let m = model(fake)
+        await m.reload()
+        m.select(HostID("studio"))
+        await m.beginPairing()
+        guard case let .failed(message) = m.pairing else {
+            return XCTFail("expected .failed, got \(m.pairing)")
+        }
+        XCTAssertTrue(message.contains("unknown host"), message)
+        XCTAssertFalse(m.canTrust)
+    }
 }
