@@ -169,4 +169,50 @@ final class HostRegistryTests: XCTestCase {
             }
         }
     }
+
+    func testRemoveSendsTheExpectedArguments() throws {
+        let fake = FakeCommandRunner()
+        fake.results = [.ok("{}")]
+        try HostRegistry(runner: fake).remove(name: "studio")
+        XCTAssertEqual(fake.invocations.map(\.args), [["remote", "rm", "studio", "--json"]])
+    }
+
+    func testUntrustSendsTheExpectedArguments() throws {
+        let fake = FakeCommandRunner()
+        fake.results = [.ok(#"{"name":"studio","address":"s:7777","tls":true,"hasToken":true,"fingerprint":null,"trusted":false,"source":"registry"}"#)]
+        try HostRegistry(runner: fake).untrust(name: "studio")
+        XCTAssertEqual(fake.invocations.map(\.args), [["remote", "untrust", "studio", "--json"]])
+    }
+
+    func testRemoveSurfacesTheCLIsError() {
+        let fake = FakeCommandRunner()
+        fake.results = [.failed(#"{"error":"\"config\" is defined by [remote] host in config.toml"}"#)]
+        XCTAssertThrowsError(try HostRegistry(runner: fake).remove(name: "config")) { error in
+            guard case let HostRegistryError.cli(m) = error else { return XCTFail("expected .cli") }
+            XCTAssertTrue(m.contains("config.toml"), m)
+        }
+    }
+
+    func testProbeAsyncReturnsTheSameResultAsTheSyncCall() async throws {
+        let probeJSON = #"{"probe":{"name":"studio","address":"s:7777","reachable":true,"tls":true,"fingerprint":"a1b2","pinnedFingerprint":null,"fingerprintMatch":"new","authenticated":true,"error":null}}"#
+        let fake = FakeCommandRunner()
+        fake.results = [.ok(probeJSON)]
+        let probe = try await HostRegistry(runner: fake).probeAsync(name: "studio", timeoutSeconds: 2)
+        XCTAssertEqual(probe.fingerprint, "a1b2")
+        XCTAssertEqual(fake.invocations.map(\.args),
+                       [["remote", "probe", "studio", "--timeout", "2", "--json"]])
+    }
+
+    func testProbeAsyncPropagatesFailures() async {
+        let fake = FakeCommandRunner()
+        fake.results = [.failed(#"{"error":"unknown host \"nope\""}"#)]
+        do {
+            _ = try await HostRegistry(runner: fake).probeAsync(name: "nope")
+            XCTFail("a failing probe must throw")
+        } catch let HostRegistryError.cli(m) {
+            XCTAssertTrue(m.contains("nope"), m)
+        } catch {
+            XCTFail("expected .cli, got \(error)")
+        }
+    }
 }

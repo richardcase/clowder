@@ -44,7 +44,11 @@ public enum TokenEdit: Sendable, Equatable {
 /// The app never parses `config.toml` or `hosts.json` itself — the CLI owns both, including the
 /// merge that surfaces `[remote] host` as a read-only entry. This mirrors how the app already
 /// asked the CLI for the resolved remote host before M11.
-public struct HostRegistry {
+///
+/// `Sendable` because the pairing flow runs `probeAsync` off the main actor: the CLI bounds each of
+/// connect / TLS handshake / read-line by the timeout separately, so a probe can take ~3× it, and
+/// blocking `@MainActor` for that long freezes the Settings window.
+public struct HostRegistry: Sendable {
     private let runner: CommandRunner
     public init(runner: CommandRunner) { self.runner = runner }
 
@@ -108,6 +112,27 @@ public struct HostRegistry {
         if token != nil { args.append("--token-stdin") }
         args.append("--json")
         return try decode(ProbeOutput.self, from: run(args, stdin: token)).probe
+    }
+
+    /// `probe(name:timeoutSeconds:)` off the calling actor.
+    ///
+    /// The work is a blocking subprocess call, so it goes to a detached task rather than merely being
+    /// `async` — an `async` function that never suspends would still run on the caller's executor.
+    public func probeAsync(name: String, timeoutSeconds: Int = 3) async throws -> HostProbe {
+        let registry = self
+        return try await Task.detached(priority: .userInitiated) {
+            try registry.probe(name: name, timeoutSeconds: timeoutSeconds)
+        }.value
+    }
+
+    /// `probe(address:token:tls:timeoutSeconds:)` off the calling actor. Used by "Test" before a host
+    /// is saved, so the token is still in hand and still goes via stdin.
+    public func probeAsync(address: String, token: String?, tls: Bool,
+                           timeoutSeconds: Int = 3) async throws -> HostProbe {
+        let registry = self
+        return try await Task.detached(priority: .userInitiated) {
+            try registry.probe(address: address, token: token, tls: tls, timeoutSeconds: timeoutSeconds)
+        }.value
     }
 
     public func trust(name: String, fingerprint: String) throws {
