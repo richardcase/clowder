@@ -1,3 +1,4 @@
+import Foundation
 import XCTest
 @testable import ClowderCore
 
@@ -301,6 +302,30 @@ final class HostsViewModelTests: XCTestCase {
         m.cancelPairing()
         XCTAssertEqual(m.pairing, .idle)
         XCTAssertEqual(m.expectedFingerprint, "")
+    }
+
+    func testIsBusyIsObservableAndTheCLICallRunsOffTheMainThread() async {
+        // `isBusy` gates three controls in the UI. It can only ever be seen true if `run` actually
+        // suspends — a blocking call made inline on the main actor never yields SwiftUI a run-loop
+        // turn between setting it and clearing it.
+        let fake = FakeCommandRunner(); fake.results = [.ok(twoHostsJSON)]
+        let started = expectation(description: "the CLI call started")
+        let release = DispatchSemaphore(value: 0)
+        // Park the call in flight. The wait is bounded so that a regression which runs the body on
+        // the main actor fails this test instead of deadlocking the suite.
+        fake.onRun = { started.fulfill(); _ = release.wait(timeout: .now() + 2) }
+        let m = model(fake)
+
+        let reload = Task { await m.reload() }
+        await fulfillment(of: [started], timeout: 5)
+        XCTAssertTrue(m.isBusy, "the main actor must be free, with isBusy true, while the CLI runs")
+        release.signal()
+        await reload.value
+
+        XCTAssertFalse(m.isBusy)
+        XCTAssertEqual(fake.ranOnMainThread, [false],
+                       "the blocking CLI call must not run on the main thread")
+        XCTAssertEqual(m.hosts.map(\.name), ["studio", "config"], "and the result still lands")
     }
 
     func testAFailedProbeBecomesAPairingFailureNotASilentIdle() async {

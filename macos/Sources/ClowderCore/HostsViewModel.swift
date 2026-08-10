@@ -40,10 +40,9 @@ public final class HostsViewModel: ObservableObject {
     public func dismissError() { lastError = nil }
 
     public func reload() async {
-        await run {
-            // Assign only on success: a failed reload must not blank a list the user is looking at.
-            self.hosts = try self.registry.list()
-        }
+        // Assign only on success: a failed reload must not blank a list the user is looking at.
+        guard let hosts = await run({ try $0.list() }) else { return }
+        self.hosts = hosts
     }
 
     public func select(_ id: HostID?) {
@@ -70,40 +69,39 @@ public final class HostsViewModel: ObservableObject {
         }
         let typedToken = (draft.token?.isEmpty == false) ? draft.token : nil
         let isNew = draft.isNew
-        let originalName = selected?.rawValue
+        // `isNew` is only ever set by `select`/`beginAdd`, and `select` always sets `selected`
+        // alongside a non-new draft — so an edit always has an original name. The guard below is
+        // defensive, not a real path; past it, "no original name" means exactly "a new host".
+        let originalName: String? = isNew ? nil : selected?.rawValue
+        guard isNew || originalName != nil else { return }
 
         // BackendID *is* the host name, so renaming the connected host would leave the app pointed
-        // at an id that no longer resolves: the chip goes permanently orange and loses its Retry
-        // while still connected, and retrying reports a host that "is not configured". Same
-        // reasoning as `remove`, which has refused this since it was written.
-        if !isNew, let originalName, draft.name != originalName,
+        // at an id that no longer resolves: the chip goes permanently orange with no Retry, and
+        // retrying reports a host that "is not configured". Same reasoning as `remove`.
+        if let originalName, draft.name != originalName,
            activeBackend() == .remote(HostID(originalName)) {
             lastError = "You are connected to \(originalName). "
                 + "Switch to another backend before renaming it."
             return
         }
 
-        let succeeded = await run {
-            if isNew {
-                _ = try self.registry.add(name: draft.name, address: draft.address,
-                                          token: typedToken, tls: draft.tls)
-            } else {
-                // `isNew` is only ever set by `select`/`beginAdd`, and `select` always sets
-                // `selected` alongside a non-new draft — so `originalName` is always present on
-                // this branch. The guard is defensive, not a real path.
-                guard let originalName else { return }
-                _ = try self.registry.update(
+        // Only value types cross to the detached task — nothing `@MainActor` is touched there.
+        let name = draft.name, address = draft.address, tls = draft.tls
+        let hosts = await run { registry -> [RemoteHost] in
+            if let originalName {
+                _ = try registry.update(
                     name: originalName,
-                    rename: draft.name == originalName ? nil : draft.name,
-                    address: draft.address,
+                    rename: name == originalName ? nil : name,
+                    address: address,
                     // Only `.set` when the user actually typed one. `.unchanged` is what keeps an
                     // existing token intact through an unrelated edit.
                     token: typedToken.map { .set($0) } ?? .unchanged,
-                    tls: draft.tls
+                    tls: tls
                 )
+            } else {
+                _ = try registry.add(name: name, address: address, token: typedToken, tls: tls)
             }
-            self.hosts = try self.registry.list()
-            self.onHostsChanged()
+            return try registry.list()
         }
         // A failed save must not disturb what the user typed: `self.draft` was never touched above,
         // so their name/address/TLS/token are still exactly as entered and they can fix the problem
@@ -111,7 +109,9 @@ public final class HostsViewModel: ObservableObject {
         // never re-displayed once written. Advancing `selected` on failure would be worse than just
         // losing the form: for a rename it would point at a name that was never persisted, so a
         // retry's `originalName` would target a host that does not exist.
-        guard succeeded else { return }
+        guard let hosts else { return }
+        self.hosts = hosts
+        onHostsChanged()
         // Clear the typed token so it does not linger in memory or get re-sent on the next save.
         draft.token = nil
         self.draft = draft
@@ -125,15 +125,18 @@ public final class HostsViewModel: ObservableObject {
             lastError = "You are connected to \(id.rawValue). Switch to another backend before removing it."
             return
         }
-        let succeeded = await run {
-            try self.registry.remove(name: id.rawValue)
-            self.hosts = try self.registry.list()
-            self.onHostsChanged()
+        let name = id.rawValue
+        let hosts = await run { registry -> [RemoteHost] in
+            try registry.remove(name: name)
+            return try registry.list()
         }
         // Only deselect once the host is actually gone — a failed remove leaves it in `hosts`, and
         // clearing the selection anyway would strand the user looking at a blank editor for a host
         // that is still right there in the list.
-        if succeeded, selected == id { select(nil) }
+        guard let hosts else { return }
+        self.hosts = hosts
+        onHostsChanged()
+        if selected == id { select(nil) }
     }
 
     /// Where the pairing flow is. `observed` carries what the probe saw — nothing is written until the
@@ -186,14 +189,19 @@ public final class HostsViewModel: ObservableObject {
     public func confirmTrust() async {
         guard let host = selectedHost, canTrust,
               let fingerprint = observedProbe?.fingerprint else { return }
-        await run {
+        let name = host.name
+        let hosts = await run { registry -> [RemoteHost] in
             // Verbatim what was displayed. If a cert is swapped between probe and trust, the pin
             // fails loudly on the very next connect — an accepted, documented TOCTOU.
-            try self.registry.trust(name: host.name, fingerprint: fingerprint)
-            self.hosts = try self.registry.list()
-            self.onHostsChanged()
+            try registry.trust(name: name, fingerprint: fingerprint)
+            return try registry.list()
         }
-        if lastError == nil { cancelPairing() }
+        // Bind the result rather than re-deriving success from `lastError`, exactly as `save` and
+        // `remove` do — one definition of "it worked" for all four operations.
+        guard let hosts else { return }
+        self.hosts = hosts
+        onHostsChanged()
+        cancelPairing()
     }
 
     public func cancelPairing() {
@@ -201,20 +209,24 @@ public final class HostsViewModel: ObservableObject {
         expectedFingerprint = ""
     }
 
-    /// Run a CLI-touching operation with busy state and uniform error surfacing. Task 4's pairing
-    /// operations use this too, so it stays file-private rather than becoming API. Returns whether
-    /// `body` completed without throwing, so callers can gate state advancement on success.
-    @discardableResult
-    private func run(_ body: @escaping () throws -> Void) async -> Bool {
+    /// Run a registry operation off the main actor, with busy state and uniform error surfacing.
+    ///
+    /// The closure touches only the (`Sendable`) registry; results are applied by the caller back on
+    /// the main actor, so no `@MainActor` state is mutated off-actor. Going off-actor is what makes
+    /// `isBusy` mean anything: with the blocking `Process` call inline there was no suspension point
+    /// between setting it and clearing it, so SwiftUI never saw it true — and the UI froze for the
+    /// ~200-300 ms each operation's CLI spawns take. Returns nil when `body` threw, so callers can
+    /// gate state advancement on success.
+    private func run<T: Sendable>(_ body: @escaping @Sendable (HostRegistry) throws -> T) async -> T? {
         isBusy = true
         lastError = nil
         defer { isBusy = false }
+        let registry = self.registry
         do {
-            try body()
-            return true
+            return try await Task.detached(priority: .userInitiated) { try body(registry) }.value
         } catch {
             lastError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-            return false
+            return nil
         }
     }
 }

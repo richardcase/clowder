@@ -1,3 +1,4 @@
+import Foundation
 import XCTest
 @testable import ClowderCore
 
@@ -10,9 +11,17 @@ final class FakeCommandRunner: CommandRunner, @unchecked Sendable {
     private(set) var invocations: [Invocation] = []
     var results: [CommandResult] = []
     var thrownError: Error?
+    /// Whether each call happened on the main thread — how a test pins that the blocking CLI call is
+    /// made off the main actor.
+    private(set) var ranOnMainThread: [Bool] = []
+    /// Called inside `run`, on whatever thread the caller used, after the call is recorded. Lets a
+    /// test park a call in flight and inspect the model while it is still running.
+    var onRun: (@Sendable () -> Void)?
 
     func run(_ args: [String], stdin: String?) throws -> CommandResult {
+        ranOnMainThread.append(Thread.isMainThread)
         invocations.append(Invocation(args: args, stdin: stdin))
+        onRun?()
         if let thrownError { throw thrownError }
         guard !results.isEmpty else {
             return CommandResult(status: 0, stdout: Data("{}".utf8), stderr: Data())
