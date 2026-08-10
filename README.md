@@ -34,6 +34,9 @@ native SwiftUI macOS app renders every agent's live terminal via [libghostty](ht
 - **Switch between Local and remote hosts** — pick which backend is active from the sidebar's
   connection chip, the menu bar, or the command palette (⌘K); switching away from Local detaches its
   daemon rather than killing it, so agents on both sides keep running while you're elsewhere.
+- **Manage remote hosts from the app** — add, edit, remove and pair remote daemons in Settings
+  (**⌘,** ▸ Hosts), with the same probe-then-trust pairing flow as the CLI, instead of dropping to
+  `clowder remote`.
 - **Robust daemon** — a `~/.config/clowder/config.toml` config file (sockets, pane defaults, and
   `[worktrees] base` to put worktrees wherever you like), per-user sockets, a single-instance guard,
   graceful shutdown that kills child PTYs, companion-crash reaping, and structured `tracing` logs.
@@ -100,13 +103,15 @@ Double-click `Clowder.app` — it launches and **supervises its own daemon** (no
 - Drive the agent's terminal directly; **⌘D / ⌘⇧D** split a companion shell; **⌘L** Lands the agent,
   Discard is in the menu.
 - The menu-bar item shows how many agents need attention.
+- **⌘,** opens Settings ▸ Hosts to add, edit, remove and pair remote daemons without touching the
+  CLI — the connection chip's "Manage Hosts…" item opens the same window.
 
 The bundled **`clowder` CLI** also works headlessly against a running daemon:
 
 ```sh
 clowder spawn <project> <task> [adapter]   # adapter defaults to "claude"; prints the new pane id
 clowder attach <pane-id>                    # attach to a pane in your terminal
-clowder remote add|list|show|set|rm         # manage a nicknamed registry of remote daemons
+clowder remote add|list|show|set|rm         # manage a nicknamed registry of remote daemons (or Settings ▸ Hosts)
 clowder remote probe|trust|untrust          # pair with a remote daemon over TLS (see docs/remote-tls.md)
 clowder connect <name-or-host:port>         # forward to a remote daemon, then clowder attach as usual
 ```

@@ -122,7 +122,9 @@ the unpinned hosts will notice.
 
 `clowder remote add|list|show|set|rm` manage a nicknamed registry of remote daemons
 (`$XDG_STATE_HOME/clowder/hosts.json`, `0600`, no daemon required — it's a pure client-side file).
-This is the backing store for the macOS app's Settings pane in M11b; the CLI is the same code path.
+This is the backing store for the macOS app's Settings ▸ Hosts window (**⌘,**, added in M11c); the app
+shells out to the same `clowder` binary, so the CLI and the GUI are the same code path and see the
+same registry.
 
 ```sh
 clowder remote add studio studio.tailnet:7777           # plaintext entry
@@ -196,10 +198,26 @@ clowder remote trust studio --fingerprint <hex> --verify   # re-probes and refus
 clowder remote untrust studio                               # clear the pin (see the pruning rule above)
 ```
 
+**The macOS app offers the same probe → compare → trust flow** in Settings ▸ Hosts (**⌘,**): select a
+host and press Pair… to open a sheet that probes it, shows the observed fingerprint grouped into
+4-character blocks, and offers a field to paste an expectation to compare against. Trust is disabled
+until either nothing has been pasted or the pasted value matches the observed fingerprint byte-for-byte
+— a typed mismatch is called out in red and blocks the button, so the comparison happens in software
+rather than by eye. The probe runs off the main thread, so the window stays responsive while an
+unreachable host times out.
+
+**This does not remove the out-of-band requirement below — it only moves where you type the
+comparison.** The sheet shows you what the daemon presented *over the same connection you are
+pairing*; it cannot tell you what the daemon actually generated. Whether you run `clowder remote
+trust --fingerprint` by hand or paste into the sheet's compare field, the value you compare against
+must still come from a channel the pairing connection isn't also carrying — the daemon's own console
+or `clowder remote-token` run on the daemon's own machine, never a copy relayed back over the same
+network path you're trying to verify.
+
 **Pairing only closes the MITM window if the fingerprint is compared out-of-band** — that is, through
 a channel the network path you're pairing over isn't also carrying. Don't compare the fingerprint
-`probe` just showed you against itself; compare it against a source that didn't come over that same
-wire:
+`probe` (or the app's Pair sheet) just showed you against itself; compare it against a source that
+didn't come over that same wire:
 
 - `clowder remote-token`, run **on the daemon host itself** (SSH in, or a local terminal there), or
 - the daemon's own startup log line (`remote TLS enabled — token: … cert fingerprint (sha256): …`).
