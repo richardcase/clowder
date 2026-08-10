@@ -75,17 +75,28 @@ struct PairingSheet: View {
             Label("This daemon is not using TLS, so it presents no certificate to pin.",
                   systemImage: "lock.open")
                 .foregroundStyle(.orange)
-        } else if !probe.reachable {
-            Label(probe.error ?? "Could not reach the daemon.", systemImage: "network.slash")
+        }
+
+        // Covers both unreachable and "reachable but the TLS handshake never produced a
+        // certificate" — the case a plain reachable/tls/fingerprint if-else chain silently
+        // dropped, leaving a failed handshake's real error unshown.
+        if let displayError = probe.displayError {
+            Label(displayError, systemImage: "exclamationmark.triangle.fill")
                 .foregroundStyle(.orange)
         }
 
-        switch probe.authSummary {
-        case .tokenAccepted: Label("Token accepted", systemImage: "checkmark.seal").font(.caption)
-        case .tokenRejected: Label("Token rejected", systemImage: "xmark.seal")
-                .font(.caption).foregroundStyle(.red)
-        case .nonePlaintext: Label("No authentication (plaintext daemon)", systemImage: "exclamationmark.triangle")
-                .font(.caption).foregroundStyle(.orange)
+        // Gated on shouldReportAuthentication: `authenticated` is meaningless before the probe
+        // got far enough to attempt it (unreachable, or a TLS handshake that never completed), and
+        // was otherwise rendering as a spurious "Token rejected" for a connection that never
+        // happened.
+        if probe.shouldReportAuthentication {
+            switch probe.authSummary {
+            case .tokenAccepted: Label("Token accepted", systemImage: "checkmark.seal").font(.caption)
+            case .tokenRejected: Label("Token rejected", systemImage: "xmark.seal")
+                    .font(.caption).foregroundStyle(.red)
+            case .nonePlaintext: Label("No authentication (plaintext daemon)", systemImage: "exclamationmark.triangle")
+                    .font(.caption).foregroundStyle(.orange)
+            }
         }
     }
 }

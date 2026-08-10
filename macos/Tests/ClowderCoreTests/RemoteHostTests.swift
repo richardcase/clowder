@@ -167,4 +167,48 @@ final class RemoteHostTests: XCTestCase {
     func testGroupedFingerprintOfAnEmptyStringIsEmpty() {
         XCTAssertEqual(groupedFingerprint(""), "")
     }
+
+    func testUnreachableProbeDoesNotReportAuthenticationButDoesDisplayItsError() {
+        // ProbeResult::unreachable hardcodes authenticated: false — that is NOT a rejected token,
+        // the connection never happened. authSummary would compute .tokenRejected here, which is
+        // why the sheet must gate on shouldReportAuthentication rather than rendering authSummary
+        // unconditionally.
+        let probe = HostProbe(name: "studio", address: "studio.tail:7777", reachable: false, tls: true,
+                              fingerprint: nil, pinnedFingerprint: nil, fingerprintMatch: nil,
+                              authenticated: false, error: "connection refused")
+        XCTAssertFalse(probe.shouldReportAuthentication)
+        XCTAssertEqual(probe.displayError, "connection refused")
+    }
+
+    func testFailedTLSHandshakeDisplaysItsErrorInsteadOfBeingSwallowed() {
+        // Reachable (TCP connected) but the TLS handshake itself failed, so fingerprint is nil and
+        // authenticate() was never reached. Previously nothing in the view showed this: fingerprint
+        // nil skipped the "here's the cert" branch, tls == true skipped the "no TLS" branch, and
+        // reachable == true skipped the "could not reach" branch — the error vanished.
+        let probe = HostProbe(name: "studio", address: "studio.tail:7777", reachable: true, tls: true,
+                              fingerprint: nil, pinnedFingerprint: nil, fingerprintMatch: nil,
+                              authenticated: false, error: "TLS handshake failed: invalid certificate")
+        XCTAssertFalse(probe.shouldReportAuthentication)
+        XCTAssertEqual(probe.displayError, "TLS handshake failed: invalid certificate")
+    }
+
+    func testASuccessfulTLSProbeReportsAuthenticationAndHasNoDisplayError() {
+        let probe = HostProbe(name: "studio", address: "studio.tail:7777", reachable: true, tls: true,
+                              fingerprint: "aabb", pinnedFingerprint: nil, fingerprintMatch: .new,
+                              authenticated: true, error: nil)
+        XCTAssertTrue(probe.shouldReportAuthentication)
+        XCTAssertNil(probe.displayError)
+    }
+
+    func testAReachablePlaintextProbeStillReportsAuthenticationSoNonePlaintextIsShown() {
+        // A plaintext daemon "authenticates" any token — .nonePlaintext exists specifically to say
+        // so. Suppressing shouldReportAuthentication here would hide that warning, not just a
+        // spurious result, so this case reports even though there is no fingerprint to observe.
+        let probe = HostProbe(name: "studio", address: "studio.tail:7777", reachable: true, tls: false,
+                              fingerprint: nil, pinnedFingerprint: nil, fingerprintMatch: nil,
+                              authenticated: true, error: nil)
+        XCTAssertTrue(probe.shouldReportAuthentication)
+        XCTAssertEqual(probe.authSummary, .nonePlaintext)
+        XCTAssertNil(probe.displayError)
+    }
 }

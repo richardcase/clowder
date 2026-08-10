@@ -126,6 +126,36 @@ public struct HostProbe: Codable, Sendable, Equatable {
         guard tls else { return .nonePlaintext }
         return authenticated ? .tokenAccepted : .tokenRejected
     }
+
+    /// Whether `authSummary` means anything and should be shown.
+    ///
+    /// `authenticated` is only meaningful once the probe got far enough to actually attempt
+    /// authentication. Two cases where it did not, but `authenticated` is still `false` on the
+    /// wire (`ProbeResult::unreachable` and a failed TLS handshake both hardcode it) and would
+    /// otherwise render as a spurious "Token rejected":
+    ///  - unreachable (`!reachable`) — the connection never happened at all.
+    ///  - a TLS host that connected but never produced a certificate (`tls && fingerprint == nil`)
+    ///    — the handshake itself failed, so `authenticate()` (which runs strictly after the
+    ///    handshake) was never reached.
+    ///
+    /// A reachable **plaintext** host (`!tls`) still reports: `authSummary` folds that case into
+    /// `.nonePlaintext`, whose entire job is to say "this daemon accepts any token" — suppressing
+    /// it here would hide exactly the warning it exists to show.
+    public var shouldReportAuthentication: Bool {
+        guard reachable else { return false }
+        if tls && fingerprint == nil { return false }
+        return true
+    }
+
+    /// The message the pairing sheet should surface for a probe that didn't succeed, so a real
+    /// failure (e.g. "TLS handshake failed: …") is never silently dropped. `nil` when there is
+    /// nothing useful to say — a probe that got a certificate and/or completed authentication
+    /// speaks for itself via `authSummary` and the fingerprint UI.
+    public var displayError: String? {
+        if !reachable { return error ?? "Could not reach the daemon." }
+        if tls && fingerprint == nil { return error ?? "The TLS handshake failed." }
+        return nil
+    }
 }
 
 /// The `clowder remote probe --json` envelope.
