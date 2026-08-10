@@ -46,11 +46,24 @@ impl Config {
     /// env overrides. A missing/invalid file is non-fatal.
     pub fn load() -> Config {
         let file = config_path().and_then(read_file).unwrap_or_default();
-        Config::resolve(file, &|k| std::env::var(k).ok())
+        Config::resolve_with(file, &|k| std::env::var(k).ok(), &passwd_shell)
     }
 
     /// Pure resolver (testable): env > file > default. `get_env(key)` yields the env value.
+    ///
+    /// The passwd database is not consulted; `resolve_with` is the variant that takes it. Tests and
+    /// `Default` use this one, so they stay independent of the machine they run on.
     fn resolve(f: FileConfig, get_env: &dyn Fn(&str) -> Option<String>) -> Config {
+        Config::resolve_with(f, get_env, &|| None)
+    }
+
+    /// As `resolve`, plus the passwd-database tier of the shell chain. `passwd` is injected rather
+    /// than called directly so the whole resolver stays pure and testable — see `resolve_shell`.
+    fn resolve_with(
+        f: FileConfig,
+        get_env: &dyn Fn(&str) -> Option<String>,
+        passwd: &dyn Fn() -> Option<String>,
+    ) -> Config {
         let s = f.sockets.unwrap_or_default();
         let p = f.pane.unwrap_or_default();
         let r = f.remote.unwrap_or_default();
@@ -81,7 +94,7 @@ impl Config {
             hook_sock: path("CLOWDER_HOOK_SOCK", s.hook, default_sock("clowder-hook.sock")),
             backlog_cap: get_env("CLOWDER_BACKLOG_CAP").and_then(|v| v.parse().ok())
                 .or(p.backlog_cap).unwrap_or(DEFAULT_BACKLOG_CAP),
-            shell: get_env("SHELL").or(p.shell).unwrap_or_else(|| "/bin/sh".into()),
+            shell: resolve_shell(get_env, p.shell, passwd),
             default_cols: p.cols.unwrap_or(DEFAULT_COLS),
             default_rows: p.rows.unwrap_or(DEFAULT_ROWS),
             // An empty value from EITHER env or file means "off" — the daemon skips the TCP bind
@@ -98,6 +111,59 @@ impl Config {
                 .unwrap_or_else(|| default_worktree_base_from(get_env)),
         }
     }
+}
+
+/// The user's shell: `$SHELL` › `[pane] shell` › the passwd database › `/bin/sh`.
+///
+/// The passwd tier is NOT optional. A GUI-launched `.app` is started by launchd, which sets **no**
+/// `SHELL` at all, and a login `zsh` does not export one either — so without passwd every pane in
+/// the packaged app runs `/bin/sh` instead of the user's shell (issue #76).
+///
+/// Empty counts as unset at every tier, matching every other lookup in this module: launchd
+/// contexts can hand out `SHELL=""`, and an empty shell is not a program.
+///
+/// Pure: the environment arrives via `get_env` and the passwd lookup via `passwd`, so the resolver
+/// and its tests drive this same code path.
+fn resolve_shell(
+    get_env: &dyn Fn(&str) -> Option<String>,
+    file: Option<String>,
+    passwd: &dyn Fn() -> Option<String>,
+) -> String {
+    get_env("SHELL")
+        .filter(|v| !v.is_empty())
+        .or_else(|| file.filter(|v| !v.is_empty()))
+        .or_else(passwd)
+        .unwrap_or_else(|| "/bin/sh".into())
+}
+
+/// The user's shell against the real environment, for callers holding no `Config`
+/// (e.g. `Daemon::new_with_paths`). Same family as `default_worktree_base()`.
+pub fn login_shell() -> String {
+    resolve_shell(&|k| std::env::var(k).ok(), None, &passwd_shell)
+}
+
+/// The login shell recorded for this uid in the passwd database, if it is usable.
+///
+/// Mirrors what `portable-pty` does privately for the child's `SHELL` var, but we need it for the
+/// *program* the daemon runs, which portable-pty's copy cannot give us. `None` on any doubt — a
+/// null entry, a non-UTF-8 or empty `pw_shell`, or one that isn't executable — so the caller falls
+/// through to `/bin/sh` rather than failing to spawn.
+pub fn passwd_shell() -> Option<String> {
+    // SAFETY: `getpwuid` returns a pointer into a static buffer owned by libc, valid until the next
+    // passwd call on this thread. We copy the string out immediately and never retain the pointer.
+    // Not thread-safe in general, hence the "call this once at startup" contract on `login_shell`.
+    let shell = unsafe {
+        let ent = libc::getpwuid(libc::getuid());
+        if ent.is_null() {
+            return None;
+        }
+        std::ffi::CStr::from_ptr((*ent).pw_shell).to_str().ok()?.to_string()
+    };
+    if shell.is_empty() {
+        return None;
+    }
+    rustix::fs::access(shell.as_str(), rustix::fs::Access::EXEC_OK).ok()?;
+    Some(shell)
 }
 
 /// Where agent worktrees are provisioned: `$XDG_DATA_HOME/clowder/worktrees` ›
@@ -191,6 +257,54 @@ mod tests {
         assert_eq!((c.default_cols, c.default_rows), (80, 24));
         // No XDG_DATA_HOME/HOME in `no_env` → the /tmp last resort.
         assert_eq!(c.worktree_base, PathBuf::from("/tmp/clowder/worktrees"));
+    }
+
+    #[test]
+    fn shell_resolves_env_then_file_then_passwd_then_sh() {
+        let passwd = || Some("/opt/homebrew/bin/fish".to_string());
+        let shell_env = |k: &str| (k == "SHELL").then(|| "/bin/bash".to_string());
+
+        // env wins over everything
+        let f = FileConfig { pane: Some(PaneCfg { shell: Some("/bin/ksh".into()), ..Default::default() }), ..Default::default() };
+        assert_eq!(Config::resolve_with(f, &shell_env, &passwd).shell, "/bin/bash");
+
+        // file wins over passwd — a user who set `[pane] shell` meant it
+        let f2 = FileConfig { pane: Some(PaneCfg { shell: Some("/bin/ksh".into()), ..Default::default() }), ..Default::default() };
+        assert_eq!(Config::resolve_with(f2, &no_env, &passwd).shell, "/bin/ksh");
+
+        // neither → passwd. This is the launchd/GUI case from #76: no SHELL in the environment.
+        assert_eq!(
+            Config::resolve_with(FileConfig::default(), &no_env, &passwd).shell,
+            "/opt/homebrew/bin/fish"
+        );
+
+        // passwd unusable → /bin/sh
+        assert_eq!(Config::resolve_with(FileConfig::default(), &no_env, &|| None).shell, "/bin/sh");
+    }
+
+    #[test]
+    fn passwd_shell_is_absent_or_an_executable_absolute_path() {
+        // Smoke test for the one unsafe block in this crate. We can't assert a specific shell (it
+        // differs per machine and per CI runner), but the contract is checkable: either it declines,
+        // or it hands back something we can actually exec.
+        if let Some(shell) = passwd_shell() {
+            assert!(shell.starts_with('/'), "passwd shell should be absolute, got {shell:?}");
+            assert!(rustix::fs::access(shell.as_str(), rustix::fs::Access::EXEC_OK).is_ok());
+        }
+    }
+
+    #[test]
+    fn empty_shell_is_treated_as_unset_at_every_tier() {
+        // launchd can hand out SHELL="" — that must fall through to passwd, not spawn "".
+        let empty_env = |k: &str| (k == "SHELL").then(String::new);
+        let passwd = || Some("/bin/zsh".to_string());
+        assert_eq!(
+            Config::resolve_with(FileConfig::default(), &empty_env, &passwd).shell,
+            "/bin/zsh"
+        );
+
+        let f: FileConfig = toml::from_str("[pane]\nshell = \"\"\n").unwrap();
+        assert_eq!(Config::resolve_with(f, &empty_env, &passwd).shell, "/bin/zsh");
     }
 
     #[test]
