@@ -207,6 +207,10 @@ public final class HostsViewModel: ObservableObject {
     public func cancelPairing() {
         pairing = .idle
         expectedFingerprint = ""
+        // The sheet renders `lastError` itself (it sits above the settings window's alert, which
+        // AppKit will not present over a sheet), so a failed Trust must not survive into the next
+        // pairing attempt.
+        lastError = nil
     }
 
     /// Run a registry operation off the main actor, with busy state and uniform error surfacing.

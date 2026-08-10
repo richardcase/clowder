@@ -304,6 +304,23 @@ final class HostsViewModelTests: XCTestCase {
         XCTAssertEqual(m.expectedFingerprint, "")
     }
 
+    func testCancelPairingClearsAFailedTrustError() async {
+        // The sheet renders `lastError` itself, so a failure from one attempt must not still be on
+        // screen when the next pairing attempt opens.
+        let fake = FakeCommandRunner()
+        fake.results = [.ok(twoHostsJSON), .ok(probeNewJSON), .failed(#"{"error":"trust failed"}"#)]
+        let m = model(fake)
+        await m.reload()
+        m.select(HostID("studio"))
+        await m.beginPairing()
+        await m.confirmTrust()
+        XCTAssertNotNil(m.lastError, "a failed trust must say so")
+        XCTAssertNotEqual(m.pairing, .idle, "a failed trust must not close the sheet")
+
+        m.cancelPairing()
+        XCTAssertNil(m.lastError)
+    }
+
     func testIsBusyIsObservableAndTheCLICallRunsOffTheMainThread() async {
         // `isBusy` gates three controls in the UI. It can only ever be seen true if `run` actually
         // suspends — a blocking call made inline on the main actor never yields SwiftUI a run-loop

@@ -27,6 +27,15 @@ struct PairingSheet: View {
                 observed(probe)
             }
 
+            // `lastError` is what a failed Trust leaves behind. Its only other surface is the alert
+            // on HostsSettingsView — the view *underneath* this sheet, which AppKit will not present
+            // over it — so without this, clicking Trust on a CLI failure looked like nothing
+            // happened. `cancelPairing()` clears it, so it cannot leak into a new attempt.
+            if let error = model.lastError {
+                Label(error, systemImage: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+            }
+
             HStack {
                 Button("Cancel") { model.cancelPairing(); isPresented = false }
                     .keyboardShortcut(.cancelAction)
