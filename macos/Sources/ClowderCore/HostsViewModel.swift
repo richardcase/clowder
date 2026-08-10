@@ -72,6 +72,17 @@ public final class HostsViewModel: ObservableObject {
         let isNew = draft.isNew
         let originalName = selected?.rawValue
 
+        // BackendID *is* the host name, so renaming the connected host would leave the app pointed
+        // at an id that no longer resolves: the chip goes permanently orange and loses its Retry
+        // while still connected, and retrying reports a host that "is not configured". Same
+        // reasoning as `remove`, which has refused this since it was written.
+        if !isNew, let originalName, draft.name != originalName,
+           activeBackend() == .remote(HostID(originalName)) {
+            lastError = "You are connected to \(originalName). "
+                + "Switch to another backend before renaming it."
+            return
+        }
+
         let succeeded = await run {
             if isNew {
                 _ = try self.registry.add(name: draft.name, address: draft.address,

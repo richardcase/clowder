@@ -143,6 +143,40 @@ final class HostsViewModelTests: XCTestCase {
         XCTAssertNotNil(m.lastError)
     }
 
+    func testRenamingTheActiveHostIsRefused() async {
+        // BackendID *is* the host name: a rename would leave `activeBackend` pointing at a name that
+        // is no longer in `hosts`, which costs the chip its Retry while still connected.
+        let fake = FakeCommandRunner(); fake.results = [.ok(twoHostsJSON)]
+        let m = model(fake, activeBackend: .remote(HostID("studio")))
+        await m.reload()
+        m.select(HostID("studio"))
+        m.draft?.name = "studio-2"
+        await m.save()
+
+        XCTAssertEqual(fake.invocations.count, 1, "only the reload — no set should have run")
+        XCTAssertTrue(m.lastError?.lowercased().contains("connected") == true, m.lastError ?? "nil")
+        XCTAssertEqual(m.draft?.name, "studio-2", "the draft must stay exactly as typed")
+        XCTAssertEqual(m.selected, HostID("studio"))
+    }
+
+    func testEditingTheActiveHostWithoutRenamingIsAllowed() async {
+        // Only the *rename* strands the app; re-pointing the connected host at a new address is a
+        // normal thing to do from Settings.
+        let fake = FakeCommandRunner()
+        fake.results = [.ok(twoHostsJSON), .ok(oneHostJSON), .ok(twoHostsJSON)]
+        let m = model(fake, activeBackend: .remote(HostID("studio")))
+        await m.reload()
+        m.select(HostID("studio"))
+        m.draft?.address = "moved:9999"
+        await m.save()
+
+        guard fake.invocations.count == 3 else {
+            return XCTFail("expected list, set, list — got \(fake.invocations.map(\.args))")
+        }
+        XCTAssertEqual(fake.invocations[1].args.prefix(3).map { $0 }, ["remote", "set", "studio"])
+        XCTAssertNil(m.lastError)
+    }
+
     func testRemovingTheActiveHostIsRefused() async {
         let fake = FakeCommandRunner(); fake.results = [.ok(twoHostsJSON)]
         let m = model(fake, activeBackend: .remote(HostID("studio")))
