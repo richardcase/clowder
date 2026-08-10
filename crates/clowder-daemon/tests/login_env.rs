@@ -79,7 +79,7 @@ trap 'echo "goodbye"' EXIT
 #[tokio::test]
 async fn a_hanging_rc_file_times_out_instead_of_wedging_startup() {
     let dir = tempfile::tempdir().unwrap();
-    let shell = fake_shell(&dir.path().to_path_buf(), "hangs", "sleep 60\n");
+    let shell = fake_shell(&dir.path().to_path_buf(), "hangs", "exec sleep 60\n");
 
     let started = Instant::now();
     let err = capture(&spec(&shell, 300)).await.unwrap_err();
@@ -90,6 +90,47 @@ async fn a_hanging_rc_file_times_out_instead_of_wedging_startup() {
         elapsed < Duration::from_secs(5),
         "capture should give up at ~300ms, took {elapsed:?}"
     );
+}
+
+#[tokio::test]
+async fn a_timed_out_capture_kills_the_shell() {
+    // One leaked shell per daemon start would be a real leak, so prove the process is gone rather
+    // than merely abandoned.
+    //
+    // The timeout is deliberately generous: the shell has to be scheduled and write its PID before
+    // the deadline, and with a short one that races under parallel test load — the capture kills it
+    // first and the pidfile never appears. The test still finishes in ~1.5s.
+    let dir = tempfile::tempdir().unwrap();
+    let pidfile = dir.path().join("pid");
+    let shell = fake_shell(
+        &dir.path().to_path_buf(),
+        "hangs-slowly",
+        &format!("echo $$ > '{}'\nexec sleep 60\n", pidfile.display()),
+    );
+
+    let err = capture(&spec(&shell, 1500)).await.unwrap_err();
+    assert!(err.to_string().contains("timed out"), "unexpected error: {err}");
+
+    let pid = std::fs::read_to_string(&pidfile)
+        .expect("fake shell should have recorded its PID well inside a 1.5s deadline");
+    let pid = pid.trim();
+    let mut dead = false;
+    for _ in 0..100 {
+        if !pid_alive(pid) {
+            dead = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(dead, "the timed-out capture shell (pid {pid}) was left running");
+}
+
+fn pid_alive(pid: &str) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", pid])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 #[tokio::test]
