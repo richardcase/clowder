@@ -67,10 +67,10 @@ struct HostEditorView: View {
                 HStack {
                     Spacer()
                     Button("Revert") { model.select(model.selected) }
-                        .disabled(model.draft?.isNew == true)
+                        .disabled(!model.isDirty)
                     Button("Save") { Task { await model.save() } }
                         .keyboardShortcut(.defaultAction)
-                        .disabled(isReadOnly || !(model.draft?.isValid ?? false) || model.isBusy)
+                        .disabled(isReadOnly || !(model.draft?.isValid ?? false) || model.isBusy || !model.isDirty)
                 }
             }
         }

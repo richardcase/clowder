@@ -37,6 +37,34 @@ public final class HostsViewModel: ObservableObject {
     /// `[remote] host` entries live in `config.toml`, which clowder never rewrites.
     public var canEditSelection: Bool { selectedHost?.isEditable ?? false }
 
+    /// Whether `draft` differs from what's actually stored, so Save/Revert only light up when there
+    /// is something to save or discard.
+    ///
+    /// `draft.token` is special: `select` always fills it with `nil` (the app never reads a stored
+    /// token back), so `nil`/empty does not mean "the token was cleared" — it means "leave the stored
+    /// one alone". Only a non-empty typed token counts as a change.
+    public var isDirty: Bool {
+        guard let draft else { return false }
+        guard !draft.isNew else {
+            // Nothing is stored yet, so "dirty" can't mean "differs from storage". Instead it means
+            // "the user has put something into this draft" — an untouched new draft is already
+            // `!isValid`, so this only matters for Revert, where it lets an in-progress new host be
+            // discarded via `select(nil)` rather than being permanently un-revertable.
+            return draft != HostDraft()
+        }
+        guard let selectedHost else {
+            // Shouldn't happen — a non-new draft only ever comes from `select`, which always sets
+            // `selected` alongside it — but if it did, there is nothing to diff against. Treat the
+            // draft as dirty so Save/Revert don't lock up.
+            return true
+        }
+        if draft.name != selectedHost.name { return true }
+        if draft.address != selectedHost.address { return true }
+        if draft.tls != selectedHost.tls { return true }
+        if let token = draft.token, !token.isEmpty { return true }
+        return false
+    }
+
     public func dismissError() { lastError = nil }
 
     public func reload() async {

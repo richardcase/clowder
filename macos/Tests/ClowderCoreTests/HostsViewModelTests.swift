@@ -212,6 +212,62 @@ final class HostsViewModelTests: XCTestCase {
         XCTAssertNotNil(m.lastError)
     }
 
+    func testAnUntouchedSelectionIsNotDirty() async {
+        let fake = FakeCommandRunner(); fake.results = [.ok(twoHostsJSON)]
+        let m = model(fake)
+        await m.reload()
+        m.select(HostID("studio"))
+        XCTAssertFalse(m.isDirty, "selecting a host and touching nothing must not read as a change")
+    }
+
+    func testChangingTheNameIsDirty() async {
+        let fake = FakeCommandRunner(); fake.results = [.ok(twoHostsJSON)]
+        let m = model(fake)
+        await m.reload()
+        m.select(HostID("studio"))
+        m.draft?.name = "studio-2"
+        XCTAssertTrue(m.isDirty)
+    }
+
+    func testChangingTheAddressIsDirty() async {
+        let fake = FakeCommandRunner(); fake.results = [.ok(twoHostsJSON)]
+        let m = model(fake)
+        await m.reload()
+        m.select(HostID("studio"))
+        m.draft?.address = "moved:9999"
+        XCTAssertTrue(m.isDirty)
+    }
+
+    func testTogglingTLSIsDirty() async {
+        let fake = FakeCommandRunner(); fake.results = [.ok(twoHostsJSON)]
+        let m = model(fake)
+        await m.reload()
+        m.select(HostID("studio"))
+        m.draft?.tls.toggle()
+        XCTAssertTrue(m.isDirty)
+    }
+
+    func testTypingATokenIsDirtyButClearingItBackIsNot() async {
+        let fake = FakeCommandRunner(); fake.results = [.ok(twoHostsJSON)]
+        let m = model(fake)
+        await m.reload()
+        m.select(HostID("studio"))
+        XCTAssertFalse(m.isDirty)
+        m.draft?.token = "s3cr3t"
+        XCTAssertTrue(m.isDirty, "typing a token is a real change to send")
+        m.draft?.token = ""
+        XCTAssertFalse(m.isDirty,
+                       "an empty token means \"leave the stored one alone\", not \"clear it\"")
+    }
+
+    func testANewDraftIsNotDirtyUntouchedButIsOnceTyped() {
+        let m = model(FakeCommandRunner())
+        m.beginAdd()
+        XCTAssertFalse(m.isDirty, "an untouched new draft has nothing to revert")
+        m.draft?.name = "studio"
+        XCTAssertTrue(m.isDirty, "a typed-into new draft is revertable (discardable) via Revert")
+    }
+
     func testAConfigSourcedHostIsNotEditable() async {
         let fake = FakeCommandRunner(); fake.results = [.ok(twoHostsJSON)]
         let m = model(fake)
