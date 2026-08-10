@@ -72,11 +72,14 @@ public final class HostsViewModel: ObservableObject {
         let isNew = draft.isNew
         let originalName = selected?.rawValue
 
-        await run {
+        let succeeded = await run {
             if isNew {
                 _ = try self.registry.add(name: draft.name, address: draft.address,
                                           token: typedToken, tls: draft.tls)
             } else {
+                // `isNew` is only ever set by `select`/`beginAdd`, and `select` always sets
+                // `selected` alongside a non-new draft — so `originalName` is always present on
+                // this branch. The guard is defensive, not a real path.
                 guard let originalName else { return }
                 _ = try self.registry.update(
                     name: originalName,
@@ -91,6 +94,13 @@ public final class HostsViewModel: ObservableObject {
             self.hosts = try self.registry.list()
             self.onHostsChanged()
         }
+        // A failed save must not disturb what the user typed: `self.draft` was never touched above,
+        // so their name/address/TLS/token are still exactly as entered and they can fix the problem
+        // (e.g. a bad address) and retry without re-typing anything — including a token, which is
+        // never re-displayed once written. Advancing `selected` on failure would be worse than just
+        // losing the form: for a rename it would point at a name that was never persisted, so a
+        // retry's `originalName` would target a host that does not exist.
+        guard succeeded else { return }
         // Clear the typed token so it does not linger in memory or get re-sent on the next save.
         draft.token = nil
         self.draft = draft
@@ -104,24 +114,31 @@ public final class HostsViewModel: ObservableObject {
             lastError = "You are connected to \(id.rawValue). Switch to another backend before removing it."
             return
         }
-        await run {
+        let succeeded = await run {
             try self.registry.remove(name: id.rawValue)
             self.hosts = try self.registry.list()
             self.onHostsChanged()
         }
-        if selected == id { select(nil) }
+        // Only deselect once the host is actually gone — a failed remove leaves it in `hosts`, and
+        // clearing the selection anyway would strand the user looking at a blank editor for a host
+        // that is still right there in the list.
+        if succeeded, selected == id { select(nil) }
     }
 
     /// Run a CLI-touching operation with busy state and uniform error surfacing. Task 4's pairing
-    /// operations use this too, so it stays file-private rather than becoming API.
-    private func run(_ body: @escaping () throws -> Void) async {
+    /// operations use this too, so it stays file-private rather than becoming API. Returns whether
+    /// `body` completed without throwing, so callers can gate state advancement on success.
+    @discardableResult
+    private func run(_ body: @escaping () throws -> Void) async -> Bool {
         isBusy = true
         lastError = nil
         defer { isBusy = false }
         do {
             try body()
+            return true
         } catch {
             lastError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            return false
         }
     }
 }

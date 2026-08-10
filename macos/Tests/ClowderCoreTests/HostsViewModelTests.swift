@@ -110,6 +110,39 @@ final class HostsViewModelTests: XCTestCase {
         XCTAssertNotNil(m.lastError)
     }
 
+    func testAFailedSaveForANewHostLeavesTheDraftIntact() async {
+        let fake = FakeCommandRunner()
+        fake.results = [.failed(#"{"error":"address already in use"}"#)]
+        let m = model(fake)
+        m.beginAdd()
+        m.draft?.name = "studio"
+        m.draft?.address = "s:7777"
+        m.draft?.tls = true
+        m.draft?.token = "s3cr3t"
+        await m.save()
+
+        XCTAssertEqual(m.draft?.name, "studio")
+        XCTAssertEqual(m.draft?.address, "s:7777")
+        XCTAssertEqual(m.draft?.tls, true)
+        XCTAssertEqual(m.draft?.token, "s3cr3t",
+                       "a failed save must not wipe what the user typed, including the token")
+        XCTAssertNotNil(m.lastError)
+    }
+
+    func testAFailedRenameLeavesSelectedPointingAtTheOriginalName() async {
+        let fake = FakeCommandRunner()
+        fake.results = [.ok(twoHostsJSON), .failed(#"{"error":"address already in use"}"#)]
+        let m = model(fake)
+        await m.reload()
+        m.select(HostID("studio"))
+        m.draft?.name = "studio-2"
+        await m.save()
+
+        XCTAssertEqual(m.selected, HostID("studio"),
+                       "a failed rename must not point selection at a name that was never persisted")
+        XCTAssertNotNil(m.lastError)
+    }
+
     func testRemovingTheActiveHostIsRefused() async {
         let fake = FakeCommandRunner(); fake.results = [.ok(twoHostsJSON)]
         let m = model(fake, activeBackend: .remote(HostID("studio")))
@@ -129,6 +162,19 @@ final class HostsViewModelTests: XCTestCase {
         XCTAssertEqual(fake.invocations[1].args, ["remote", "rm", "studio", "--json"])
         XCTAssertEqual(fake.invocations[2].args, ["remote", "list", "--json"])
         XCTAssertEqual(notified, 1)
+    }
+
+    func testAFailedRemoveLeavesSelectedUnchanged() async {
+        let fake = FakeCommandRunner()
+        fake.results = [.ok(twoHostsJSON), .failed(#"{"error":"boom"}"#)]
+        let m = model(fake)
+        await m.reload()
+        m.select(HostID("studio"))
+        await m.remove(HostID("studio"))
+
+        XCTAssertEqual(m.selected, HostID("studio"),
+                       "a failed remove must not deselect a host that is still there")
+        XCTAssertNotNil(m.lastError)
     }
 
     func testAConfigSourcedHostIsNotEditable() async {
