@@ -133,6 +133,21 @@ public struct ProbeOutput: Codable, Sendable {
     public let probe: HostProbe
 }
 
+/// A hex fingerprint (`RemoteHost.fingerprint` or `HostProbe.fingerprint`) split into 4-character
+/// groups — the form people can actually compare, e.g. by eye against a daemon's startup log.
+///
+/// A free function rather than a method on either type: it is pure string formatting with no
+/// dependency on `RemoteHost` or `HostProbe`, and both the editor's stored pin and the pairing
+/// sheet's freshly-observed value need it. Lives in `ClowderCore`, not a view, so it is testable —
+/// `ClowderApp` has no test target.
+public func groupedFingerprint(_ fingerprint: String) -> String {
+    stride(from: 0, to: fingerprint.count, by: 4).map {
+        let start = fingerprint.index(fingerprint.startIndex, offsetBy: $0)
+        let end = fingerprint.index(start, offsetBy: min(4, fingerprint.count - $0))
+        return String(fingerprint[start..<end])
+    }.joined(separator: " ")
+}
+
 /// Why a switch to this host must be refused, or nil if it may proceed.
 ///
 /// Reachability alone is not enough to commit to a switch. A host whose certificate rotated, or

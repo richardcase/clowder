@@ -142,4 +142,29 @@ final class RemoteHostTests: XCTestCase {
         XCTAssertEqual(BackendID.local.description, "Local")
         XCTAssertEqual(BackendID.remote(HostID("studio")).description, "studio")
     }
+
+    func testGroupedFingerprintSplitsASHA256HexStringInto16GroupsOfFour() {
+        // A real SHA-256 hex digest: 64 characters.
+        let digest = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
+        // (65 chars above would be wrong — trim to exactly 64.)
+        let sha256 = String(digest.prefix(64))
+        XCTAssertEqual(sha256.count, 64)
+
+        let grouped = groupedFingerprint(sha256)
+        let groups = grouped.split(separator: " ")
+        XCTAssertEqual(groups.count, 16, "a 64-character hex string must split into 16 groups of 4")
+        for group in groups {
+            XCTAssertEqual(group.count, 4)
+        }
+        XCTAssertEqual(groups.joined(), sha256, "grouping must not drop or reorder characters")
+    }
+
+    func testGroupedFingerprintDoesNotCrashOnAShortString() {
+        XCTAssertEqual(groupedFingerprint("a1b"), "a1b")
+        XCTAssertEqual(groupedFingerprint("a1b2c"), "a1b2 c")
+    }
+
+    func testGroupedFingerprintOfAnEmptyStringIsEmpty() {
+        XCTAssertEqual(groupedFingerprint(""), "")
+    }
 }

@@ -12,6 +12,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // applicationDidFinishLaunching on some macOS versions, so nothing may force-unwrap these.
     private(set) var appModel: AppModel?
     private(set) var surfaceHost: SurfaceHost?
+    /// Backs the Settings window's Hosts pane. Built once in `bootstrap()` (idempotent), alongside
+    /// `hostRegistry` — the two are always created together.
+    private(set) var hostsModel: HostsViewModel?
     private var mainWindow: NSWindow?
     private var windowCloseDelegate: HideOnCloseDelegate?
     private var statusBar: StatusBarController?
@@ -30,8 +33,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// startup). Creating the ghostty app object here is run-loop-independent; the wakeup tick
     /// is queued via DispatchQueue.main and serviced once the run loop is up.
     @discardableResult
-    func bootstrap() -> (appModel: AppModel, surfaceHost: SurfaceHost) {
-        if let appModel, let surfaceHost { return (appModel, surfaceHost) }
+    func bootstrap() -> (appModel: AppModel, surfaceHost: SurfaceHost, hostsModel: HostsViewModel?) {
+        if let appModel, let surfaceHost { return (appModel, surfaceHost, hostsModel) }
 
         // Bundled binary + per-user sockets (dev overrides via env/CLOWDER_BIN still honored).
         let socks = ClowderPaths.socketPaths()
@@ -42,7 +45,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // The CLI owns config.toml + hosts.json parsing, so the app reads the host list through it
         // rather than parsing either itself.
-        hostRegistry = HostRegistry(runner: ProcessCommandRunner(executablePath: clowderBinary))
+        let registry = HostRegistry(runner: ProcessCommandRunner(executablePath: clowderBinary))
+        hostRegistry = registry
+        hostsModel = HostsViewModel(
+            registry: registry,
+            activeBackend: { [weak self] in self?.activeBackend ?? .local },
+            // The Settings-added/removed host must reach the sidebar chip, the menu bar and the
+            // command palette — all three read `hosts` off this delegate via `refreshHosts()`.
+            onHostsChanged: { [weak self] in self?.refreshHosts() }
+        )
         refreshHosts()
 
         // Always start Local. Unlike pre-M11b, a configured `[remote] host` no longer changes what
@@ -93,7 +104,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusBar = StatusBarController(appModel: model,
                                         backends: self,
                                         showWindow: { [weak self] in self?.showWindow() })
-        return (model, host)
+        return (model, host, hostsModel)
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -299,6 +310,14 @@ struct ClowderApp: App {
                 menuItem("Land Agent", .landAgent)
                 Button("Discard Agent…") { delegate.appModel?.run(.discardAgent) }
             }
+        }
+
+        Settings {
+            // bootstrap() is idempotent, so calling it here makes a Settings-first launch (⌘,
+            // before the WindowGroup has ever rendered) safe too. The Settings scene body cannot
+            // see the WindowGroup's @EnvironmentObject, so the model is passed explicitly.
+            SettingsView(hosts: delegate.bootstrap().hostsModel)
+                .frame(width: 680, height: 460)
         }
     }
 
