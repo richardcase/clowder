@@ -26,11 +26,11 @@ or via env: `CLOWDER_LISTEN=0.0.0.0:7777 CLOWDER_REMOTE_TLS=1`.
 `listen` alone (with `tls` unset/false) serves the remote listener in **plaintext** — there is no
 `allow_plaintext` key; plaintext is simply the absence of `tls = true`. Binding to anything other than
 loopback or a Tailscale tailnet address (CGNAT `100.64.0.0/10`, or IPv6 `fd7a:115c:a1e0::/48`) logs a
-startup warning (`should_warn_exposed`, in `crates/clowder-daemon/src/remote.rs`) — this check runs
+startup line (`should_warn_exposed`, in `crates/clowder-daemon/src/remote.rs`) — this check runs
 **unconditionally**, before TLS is even considered, so it fires the same way whether `tls` is on or off.
-With `tls = false` the wording is accurate (no authentication at all); with `tls = true` the wording is
-stale/over-cautious (token auth is in fact active) — a known minor to be refined later, not a bug to rely
-on for "TLS suppresses the warning."
+The daemon picks the level to match: with `tls = false` it's a `warn!` (no authentication at all is
+genuinely worth flagging); with `tls = true` it's an `info!` (token auth is active, so exposure alone
+isn't an error condition, just worth a note in the log).
 
 With `tls = true`, on first start the daemon generates and persists, under
 `$XDG_STATE_HOME/clowder` (else `~/.local/state/clowder`), mode `0600`:
@@ -65,23 +65,167 @@ host = "<addr:port>"
 token = "<token>"
 ```
 
-or via env: `CLOWDER_REMOTE_HOST=<addr:port> CLOWDER_REMOTE_TOKEN=<token>`. Then:
+or via env: `CLOWDER_REMOTE_HOST=<addr:port> CLOWDER_REMOTE_TOKEN=<token>`. Or skip config entirely
+and give the daemon a nickname in the host registry (see "Managing hosts" below). Then:
 
 ```sh
-clowder connect <host:port>   # host:port optional if [remote] host / CLOWDER_REMOTE_HOST is set
+clowder connect <name-or-host:port>   # selector optional if [remote] host / CLOWDER_REMOTE_HOST is set
 ```
 
 `clowder connect` runs a local forwarder that dials the remote daemon (TLS-wrapped and
-token-authenticated when the daemon has `tls = true`); once it's up, use ordinary `clowder attach
-<pane-id>` against the forwarded local socket as usual.
+token-authenticated when the target has `tls = true`); once it's up, use ordinary `clowder attach
+<pane-id>` against the forwarded local socket as usual. It resolves its argument against the host
+registry first (an exact name, then an exact address), and falls back to treating an unrecognized
+`host:port`-shaped argument as an ad-hoc TOFU target — the same thing `clowder connect <host:port>`
+has always done, so nothing in this paragraph is a compatibility break.
+
+The forwarder's local socket directory is **flat by default** — `<the control socket's parent>/remote`,
+the same path `clowder connect` has always used — **not** one subdirectory per host. Pass
+`--socket-dir <dir>` for per-host isolation (e.g. two `clowder connect` processes for two hosts at
+once, or several forwarders that must not collide). The macOS app always passes it: since M11b it can
+run more than one backend's forwarder at a time and needs each host's sockets kept apart, so every
+`clowder connect` it spawns gets `--socket-dir <runtime>/clowder/remote/<host>` (computed once, in
+`macos/Sources/ClowderCore/BackendPlan.swift`). Everyone else — a bare shell invocation of `clowder
+connect` — still gets the flat default.
+
+`clowder connect` exits **4** when the very first dial to the target never lands (bad address, daemon
+down, wrong port) — distinct from exit 3 (`clowder-daemon`'s "another instance already owns the
+lock") and the plain exit 1 used for a user error such as an unrecognized host name. The app's
+supervisor (M11b) relies on 4 to tell "typo/unreachable" apart from a daemon that's merely slow to
+come up.
+
+**The app stops on exit 4 instead of respawning.** `ClowderCore/DaemonSupervisor.swift` treats code 4
+as terminal: it enters a `.failed` state (surfaced as a red chip with a Retry) rather than looping
+through its bounded backoff, so an unreachable remote host produces one failed launch and a wait for
+the user, not a respawn every ~10 seconds. Before M11b, the supervisor didn't distinguish exit 4 from
+any other unexpected exit and relaunched it like any crash; that interim behavior is gone.
 
 **Trust-on-first-use (TOFU):** on first connect to a given host, the client records the daemon's
 certificate fingerprint in `<state>/clowder/remote_known_hosts` (`$XDG_STATE_HOME` or
-`~/.local/state`), keyed by host. On every later connect it recomputes the fingerprint and compares —
+`~/.local/state`), keyed by address. On every later connect it recomputes the fingerprint and compares —
 a match proceeds silently; a **mismatch is refused loudly** (the connection is not made) since it could
 mean either a legitimate cert rotation on the daemon side or a man-in-the-middle. To reconnect after a
 legitimate rotation, remove the corresponding line from `remote_known_hosts` so the client re-records
 the new fingerprint on the next connect.
+
+**The registry pin is authoritative over `remote_known_hosts`.** A host managed through `clowder
+remote …` (below) carries its own `fingerprint` field once paired, and that field — not
+`remote_known_hosts` — is what `clowder connect <name>` checks. `remote_known_hosts` is only
+*consulted* for a target with no pin (a bare `clowder connect <address>` with no matching registry
+entry, or a registry entry that has never been trusted). `clowder remote trust` *writes* both: the
+registry pin and the matching `remote_known_hosts` line, so that a plain-shell `clowder connect
+<address>` — which has no registry entry to look up and so falls onto the TOFU path — ends up trusting
+the exact same fingerprint the registry already pinned. If you hand-edit `remote_known_hosts`, only
+the unpinned hosts will notice.
+
+## Managing hosts
+
+`clowder remote add|list|show|set|rm` manage a nicknamed registry of remote daemons
+(`$XDG_STATE_HOME/clowder/hosts.json`, `0600`, no daemon required — it's a pure client-side file).
+This is the backing store for the macOS app's Settings ▸ Hosts window (**⌘,**, added in M11c); the app
+shells out to the same `clowder` binary, so the CLI and the GUI are the same code path and see the
+same registry.
+
+```sh
+clowder remote add studio studio.tailnet:7777           # plaintext entry
+clowder remote add pi 10.0.0.9:7777 --token-stdin <<<"$TOKEN"   # reads the token from stdin, not argv
+clowder remote list                                       # name, address, tls/plain, paired/unpaired, source
+clowder remote list --json                                 # machine-readable — see docs/protocol/fixtures/remote-host-list.json
+clowder remote show studio [--json]
+clowder remote set studio --rename studio-mini --tls
+clowder remote rm studio
+```
+
+A few things worth knowing:
+
+- **A token requires TLS.** `--token`/`--token-stdin` implies `--tls` by default on `add`, precisely
+  because a bearer token must never cross the network in cleartext. Asking for the combination
+  anyway is refused **by the command that would create it** — `clowder remote add … --no-tls
+  --token …` and `clowder remote set … --no-tls` on an entry that still holds a token both fail,
+  naming the two ways out (drop `--no-tls`, or clear the token with `--no-token`). `resolve_target`
+  refuses the same combination again at connect time; that second check stays because the registry
+  is hand-editable and a file edited by hand never went through `add`/`set`.
+- **A fingerprint must be lowercase hex.** `clowder remote trust --fingerprint` lowercases what you
+  pass and then validates it (even number of `[0-9a-f]` digits). Anything else — notably a value
+  with whitespace in it — is rejected rather than stored: the matching `remote_known_hosts` line is
+  `"<address> <fingerprint>"` and is read back by whitespace-splitting, so a fingerprint containing
+  a space would be truncated on read and the pin and the known-hosts line would disagree forever.
+- **A corrupt `hosts.json` is never overwritten.** `add`/`set`/`rm`/`trust`/`untrust` refuse to run
+  against a registry file that exists but does not parse, with an error naming the file — the
+  tokens and pins stay on disk for you to rescue. (Reading is more forgiving: a corrupt registry
+  degrades to an empty host list rather than stopping the app reaching its *local* daemon.) A
+  zero-length file is treated as an empty registry, since it has nothing to preserve.
+- **Boolean flags don't take inline values.** Use `--tls` / `--no-tls`, never `--tls=<value>` —
+  `--tls=false` is a hard error ("`--tls` does not take a value"), on purpose: before this was
+  enforced it silently parsed as *enabling* TLS, the exact opposite of what it looked like it did.
+- The token never appears in `list`/`show` output (only a `hasToken` boolean) or, via `--token-stdin`,
+  in argv (which is world-readable through `ps`).
+- **`[remote] host` in `config.toml` still works** and shows up in `clowder remote list` as a
+  read-only entry (`source` = `config`) — `clowder remote set`/`rm` refuse to touch it and name the
+  fix (edit `config.toml`, or add a separate registry entry alongside it). If a registry entry's
+  address matches `[remote] host`'s, the registry entry wins entirely and the config entry is hidden
+  from `list` until that registry entry is removed.
+- `untrust` and `rm` prune the matching `remote_known_hosts` line, but **only when no other entry —
+  including the `[remote] host` virtual entry — still dials that same address.** Two nicknames can
+  point at one daemon; removing or untrusting one must not silently un-trust the other.
+
+## Pairing
+
+`clowder remote probe` reaches a daemon and reports what it presented, **without saving anything** —
+not the registry, not `remote_known_hosts`. That's the point of splitting pairing into two steps:
+observing and trusting are separate acts, with a human in between.
+
+```sh
+clowder remote probe studio                                  # a saved registry entry
+clowder remote probe --address 10.0.0.9:7777 --tls           # a host not yet in the registry
+clowder remote probe studio --json
+```
+
+Prints reachability, whether TLS was seen, the observed fingerprint, how it compares to any existing
+pin (`new` / `match` / `changed`), and whether the token authenticated — `auth` reads `none
+(plaintext daemon)` against a plaintext listener, since a plaintext daemon accepts any token and
+reporting "authenticated" there would be a lie.
+
+`--timeout` (default `3`, in seconds) bounds the TCP connect, the TLS handshake, and the read of the
+daemon's first line **separately, each by the same value** — so one probe can take up to roughly 3×
+what you pass, about 9 seconds worst-case at the default. That's expected, not a bug to file.
+
+Once you've seen a fingerprint you trust, record it:
+
+```sh
+clowder remote trust studio --fingerprint <hex>            # from the probe output above
+clowder remote trust studio --fingerprint <hex> --verify   # re-probes and refuses on any mismatch
+clowder remote untrust studio                               # clear the pin (see the pruning rule above)
+```
+
+**The macOS app offers the same probe → compare → trust flow** in Settings ▸ Hosts (**⌘,**): select a
+host and press Pair… to open a sheet that probes it, shows the observed fingerprint grouped into
+4-character blocks, and offers a field to paste an expectation to compare against. Trust is disabled
+until either nothing has been pasted or the pasted value matches the observed fingerprint byte-for-byte
+— a typed mismatch is called out in red and blocks the button, so the comparison happens in software
+rather than by eye. The probe runs off the main thread, so the window stays responsive while an
+unreachable host times out.
+
+**This does not remove the out-of-band requirement below — it only moves where you type the
+comparison.** The sheet shows you what the daemon presented *over the same connection you are
+pairing*; it cannot tell you what the daemon actually generated. Whether you run `clowder remote
+trust --fingerprint` by hand or paste into the sheet's compare field, the value you compare against
+must still come from a channel the pairing connection isn't also carrying — the daemon's own console
+or `clowder remote-token` run on the daemon's own machine, never a copy relayed back over the same
+network path you're trying to verify.
+
+**Pairing only closes the MITM window if the fingerprint is compared out-of-band** — that is, through
+a channel the network path you're pairing over isn't also carrying. Don't compare the fingerprint
+`probe` (or the app's Pair sheet) just showed you against itself; compare it against a source that
+didn't come over that same wire:
+
+- `clowder remote-token`, run **on the daemon host itself** (SSH in, or a local terminal there), or
+- the daemon's own startup log line (`remote TLS enabled — token: … cert fingerprint (sha256): …`).
+
+Without that out-of-band check, `probe` → `trust` is trust-on-first-use with extra clicks: a MITM
+sitting on the connection at probe time can hand you its own certificate, and you'd dutifully pin it.
+`--verify` closes the *probe-to-trust* TOCTOU window (a cert swapped in the moment between the two
+commands) but does nothing for a MITM that was there for both.
 
 ## Threat model
 

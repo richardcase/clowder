@@ -22,7 +22,7 @@ socket drives the app's sidebar, spawning, and splits.
 | `crates/clowder-hook` | Sends exactly one `HookEvent` to the daemon's hook socket (agent lifecycle shim) | **`clowder-hook`** |
 | `crates/clowder-vt` | Headless scanner for terminal attention signals (BEL, OSC 9, OSC 777) via `vte` — signal detection only, no cell grid | lib |
 | `crates/clowder-workspace` | Per-agent worktree provisioning: `WorkspaceDriver` (`GitWorktreeDriver` / jj), `WorkspaceKind {Git, Jj}`, provision/land/discard; `WorktreeLayout` owns where worktrees go (outside the project) | lib |
-| `macos/` | SwiftPM package: `ClowderCore` (lib, libghostty-free, unit-tested) + `clowder-app` (exe, links vendored libghostty via `GhosttyKit`) | — |
+| `macos/` | SwiftPM package: `ClowderCore` (lib, libghostty-free, unit-tested) + `clowder-app` (exe, links vendored libghostty via `GhosttyKit`). The Settings window (⌘,) is `SettingsView` → `HostsSettingsView` (list + editor split) → `HostEditorView` (per-host form) → `PairingSheet` (probe/compare/trust), all in `clowder-app`; they render only — every decision (validation, add/edit/remove/pair) lives in `ClowderCore`'s `HostsViewModel`, since `clowder-app` has no test target | — |
 | `scripts/` | `build-app.sh`, `build-libghostty.sh`, `set-version.sh`, `gen-icon.swift` | — |
 | `docs/` | `superpowers/` (design specs + plans), `versioning.md`, `building-libghostty.md`, `code-signing.md` | — |
 
@@ -39,10 +39,21 @@ source "$HOME/.cargo/env" && cargo test --workspace      # CI runs this with --l
 **Swift** (run inside `macos/`):
 
 ```sh
-cd macos && swift test         # ClowderCore unit tests — fast, does NOT need libghostty
-cd macos && swift build        # builds clowder-app — REQUIRES the vendored libghostty (see gotchas)
+cd macos && swift test         # ClowderCore unit tests — fast; COMPILES clowder-app too (see below)
+cd macos && swift build        # builds + LINKS clowder-app — REQUIRES the vendored libghostty
 cd macos && swift build -c release
 ```
+
+**`swift test` compiles `ClowderApp`, it just doesn't link it.** Only `ClowderCoreTests` runs, but
+SwiftPM builds the whole package graph first, so **a compile error anywhere in `ClowderApp` aborts
+`swift test` before a single test runs** — you get a compiler error, not a test failure. The
+practical consequence: a change to a `ClowderCore` signature that breaks a `ClowderApp` call site
+must fix that call site in the *same* commit, or the commit neither tests nor builds.
+
+`swift test` still does **not** need the vendored libghostty, because linking is what pulls in
+`ghostty-internal.a` and `swift test` never links the executable. Both halves verified 2026-08-08:
+moving the archive aside leaves 188 tests passing, and a deliberate syntax error in `ClowderApp`
+makes `swift test` fail to compile.
 
 **Scripts** (`scripts/`):
 
@@ -77,14 +88,40 @@ the daemon resumes from the absolute path in `agents.json`. The app runs `clowde
 libghostty surface. **Adapters:** `claude` (Claude Code), `codex` (OpenAI Codex), `shell` (plain shell,
 no hooks). The `clowder` CLI: `clowder spawn <project> <task> [adapter]` and `clowder attach <pane-id>`.
 An optional remote TCP listener (`[remote] listen`/`host`) can be hardened with `[remote] tls`/`token`
-(bearer-token auth + TOFU-pinned TLS) — see `docs/remote-tls.md` for setup and the threat model.
+(bearer-token auth + TOFU-pinned TLS) — see `docs/remote-tls.md` for setup and the threat model. Remote
+daemons the client knows about are managed as a nicknamed registry
+(`clowder remote add|list|show|set|rm|probe|trust|untrust`) in `$XDG_STATE_HOME/clowder/hosts.json`
+(`CLOWDER_HOSTS_FILE` overrides), a file kept `0600` because it holds bearer tokens; `[remote] host` in `config.toml` still works and appears in
+the registry as a read-only entry (`source: config`).
+
+**The macOS app supervises one backend per host** (`AppDelegate.supervisors: [BackendID: DaemonSupervisor]`)
+and switches which one is active — from the sidebar connection chip, the menu bar, or the command
+palette (⌘K). Switching *away* from Local **detaches** its supervisor rather than terminating it:
+local agents are PTY children of the local `clowder-daemon`, and they do not survive that process
+dying, so the daemon is left running unsupervised and switching back **re-adopts the same daemon**
+(`resume()`) instead of relaunching it. Switching away from a *remote* host instead **stops and drops**
+its supervisor, since a `clowder connect` forwarder holds no state of its own. **Quitting the app always
+terminates every backend it launched, including a detached local daemon** — `applicationWillTerminate`
+calls `stop()` on every supervisor it holds, detached or not, so a switch-and-quit never leaves an
+orphaned daemon behind. `DaemonSupervisor` also treats `clowder connect`'s exit code 4 ("the first dial
+never landed") as terminal: instead of relaunching forever, it enters `.failed` and waits for the user to
+retry.
+
+For a remote backend, the app launches `clowder connect <host> --socket-dir <dir>` with
+`dir = <runtime_dir>/clowder/remote/<host>` (`forwarderSocketDir` in
+`macos/Sources/ClowderCore/BackendPlan.swift`), so each host's forwarder gets its own socket directory
+and two hosts' forwarders never collide. `ClowderCore/RemotePaths.swift` is gone — it used to duplicate
+that path rule in Swift alongside the Rust forwarder's own (flat, non-per-host) default; `BackendPlan`
+is now the one place that computes it, and the app is the only caller that passes `--socket-dir` at all.
 
 ## Gotchas
 
 - **Cargo:** always `source "$HOME/.cargo/env" && cargo …`.
 - **libghostty:** `clowder-app` links a gitignored 189 MB `macos/vendor/libghostty/ghostty-internal.a`.
   Build it with `scripts/build-libghostty.sh` — needs **zig 0.16.0** and **full Xcode** (Metal shader
-  compiler; not in CLT). `ClowderCore`/`swift test` do **not** need it.
+  compiler; not in CLT). `swift test` does **not** need the archive (it never links the executable),
+  but it **does compile `ClowderApp`** — so a compile error there breaks `swift test` even though no
+  app code is under test. See the Swift section under Build & test.
 - **Dev run:** an unbundled build (`swift run clowder-app`) does **not** auto-spawn the daemon — run
   `cargo run -p clowder-daemon` yourself and set `CLOWDER_BIN` to the `clowder` binary
   (`CLOWDER_BIN="$PWD/../target/debug/clowder"`). The packaged `.app` auto-spawns + supervises its bundled

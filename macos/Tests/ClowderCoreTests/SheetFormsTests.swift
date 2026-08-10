@@ -51,3 +51,80 @@ final class SheetFormsTests: XCTestCase {
         XCTAssertTrue(e?.contains("letters") == true, "unhelpful: \(e ?? "nil")")
     }
 }
+
+final class HostDraftTests: XCTestCase {
+    private func fixtureCases(_ name: String, file: StaticString = #filePath) throws -> [(String, Bool)] {
+        struct Case: Decodable { let name: String; let valid: Bool }
+        let here = URL(fileURLWithPath: "\(file)")
+        let repo = here.deletingLastPathComponent()   // ClowderCoreTests
+            .deletingLastPathComponent()              // Tests
+            .deletingLastPathComponent()              // macos
+            .deletingLastPathComponent()              // repo root
+        let data = try Data(contentsOf: repo.appendingPathComponent("docs/protocol/fixtures/\(name)"))
+        return try JSONDecoder().decode([Case].self, from: data).map { ($0.name, $0.valid) }
+    }
+
+    func testNameAgreesWithTheSharedFixture() throws {
+        let cases = try fixtureCases("host-names.json")
+        XCTAssertFalse(cases.isEmpty, "fixture must not be empty")
+        for (name, valid) in cases {
+            var draft = HostDraft()
+            draft.name = name
+            XCTAssertEqual(draft.nameError == nil, valid,
+                           "disagreed on \(name.debugDescription) — if you changed a rule, update the "
+                           + "shared cases AND clowder_config::hosts::validate_name")
+        }
+    }
+
+    func testHostNamesAreNotValidatedLikeWorktreeNames() {
+        // The two validators are deliberately different. `...` and `a..b` are fine host names but are
+        // rejected as worktree names; conflating them would break hosts the CLI accepts.
+        for good in ["...", "a..b"] {
+            var draft = HostDraft(); draft.name = good
+            XCTAssertNil(draft.nameError, "\(good) is a valid HOST name")
+            XCTAssertNotNil(NewWorktreeForm(projectPath: "/p", name: good, adapter: "claude").nameError,
+                            "\(good) should still be an invalid WORKTREE name")
+        }
+    }
+
+    func testNameErrorNamesTheProblem() {
+        var draft = HostDraft(); draft.name = "has space"
+        XCTAssertTrue(draft.nameError?.contains("letters") == true, "unhelpful: \(draft.nameError ?? "nil")")
+        draft.name = ".."
+        XCTAssertTrue(draft.nameError?.contains("'..'") == true, "unhelpful: \(draft.nameError ?? "nil")")
+    }
+
+    func testAddressRequiresAHostAndAPort() {
+        for good in ["h:7777", "10.0.0.5:1", "studio.tail1234.ts.net:7777", "[::1]:7777", "[fd7a::1]:22"] {
+            var draft = HostDraft(); draft.address = good
+            XCTAssertNil(draft.addressError, "\(good) should be valid")
+        }
+        for bad in ["", "h", "h:", ":7777", "h:0", "h:70000", "h:abc", "::1:7777", "[::1]7777", "a b:7777"] {
+            var draft = HostDraft(); draft.address = bad
+            XCTAssertNotNil(draft.addressError, "\(bad) should be invalid")
+        }
+    }
+
+    func testIsValidRequiresBothFields() {
+        var draft = HostDraft()
+        XCTAssertFalse(draft.isValid, "an empty draft is not valid")
+        draft.name = "studio"
+        XCTAssertFalse(draft.isValid, "a name alone is not valid")
+        draft.address = "s:7777"
+        XCTAssertTrue(draft.isValid)
+        draft.name = "bad name"
+        XCTAssertFalse(draft.isValid)
+    }
+
+    func testATokenImpliesTLSIsRequired() {
+        // The CLI refuses a token without TLS at add/set time; say so before the user submits.
+        var draft = HostDraft()
+        draft.name = "studio"; draft.address = "s:7777"
+        draft.token = "s3cr3t"; draft.tls = false
+        XCTAssertFalse(draft.isValid)
+        XCTAssertNotNil(draft.tlsError)
+        draft.tls = true
+        XCTAssertTrue(draft.isValid)
+        XCTAssertNil(draft.tlsError)
+    }
+}

@@ -13,6 +13,14 @@ pub fn known_hosts_path() -> PathBuf {
 
 /// Record-or-verify `fp` for `host`. Ok = trusted (recorded on first sight); Err(msg) = refuse.
 pub fn check(path: &Path, host: &str, fp: &str) -> Result<(), String> {
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    // Hold the lock across read-modify-write: two clients recording different hosts on first
+    // sight would otherwise interleave and drop one another's line, losing trust for a host
+    // neither of them was touching.
+    let _guard = clowder_config::hosts::FileLock::acquire(&lock_path(path))
+        .map_err(|e| format!("lock known_hosts: {e}"))?;
     let existing = match std::fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -34,28 +42,64 @@ pub fn check(path: &Path, host: &str, fp: &str) -> Result<(), String> {
             }
         }
     }
-    // First sight: record and accept.
-    if let Some(dir) = path.parent() { let _ = std::fs::create_dir_all(dir); }
     let mut content = existing;
-    if !content.is_empty() && !content.ends_with('\n') { content.push('\n'); }
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
     content.push_str(&format!("{host} {fp}\n"));
-    std::fs::write(path, content).map_err(|e| format!("write known_hosts: {e}"))?;
-    Ok(())
+    clowder_config::hosts::write_atomic_0600(path, content.as_bytes())
+        .map_err(|e| format!("write known_hosts: {e}"))
+}
+
+/// The lock file guarding `remote_known_hosts`. Separate from the data file because the data file
+/// is replaced by `rename`, so a lock on its inode would not be seen by the next writer.
+fn lock_path(path: &Path) -> std::path::PathBuf {
+    let mut s = path.as_os_str().to_os_string();
+    s.push(".lock");
+    std::path::PathBuf::from(s)
+}
+
+/// How to decide whether a presented server certificate is the daemon we meant to reach.
+#[derive(Debug, Clone)]
+pub enum Trust {
+    /// The host entry carries a pinned fingerprint: strict compare, no recording, and
+    /// `remote_known_hosts` is never consulted. This is what pairing produces.
+    Pinned(String),
+    /// No pin yet (or a legacy config-only host): today's record-on-first-sight behavior.
+    /// `host` is the key written into `known_hosts` — it must be the DIAL ADDRESS, so entries
+    /// recorded by earlier versions keep matching.
+    Tofu { host: String, known_hosts: PathBuf },
+    /// Probe only: accept whatever is presented, publish its fingerprint, persist nothing.
+    Capture(Arc<std::sync::Mutex<Option<String>>>),
 }
 
 #[derive(Debug)]
-pub struct TofuVerifier {
-    pub host: String,
-    pub known_hosts_path: PathBuf,
+pub struct RemoteVerifier {
+    pub trust: Trust,
     pub provider: Arc<tokio_rustls::rustls::crypto::CryptoProvider>,
 }
 
-impl ServerCertVerifier for TofuVerifier {
+impl ServerCertVerifier for RemoteVerifier {
     fn verify_server_cert(&self, end_entity: &CertificateDer, _i: &[CertificateDer], _n: &ServerName, _o: &[u8], _t: UnixTime) -> Result<ServerCertVerified, Error> {
         let fp = clowder_proto::cert_fingerprint_hex(end_entity);
-        check(&self.known_hosts_path, &self.host, &fp)
-            .map(|_| ServerCertVerified::assertion())
-            .map_err(|msg| Error::General(msg))
+        let result = match &self.trust {
+            Trust::Pinned(expected) => {
+                if fp == *expected {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "REMOTE DAEMON IDENTIFICATION HAS CHANGED: pinned {expected}, got {fp}. \
+                         If you rotated the daemon cert, re-pair this host; otherwise this may be a MITM."
+                    ))
+                }
+            }
+            Trust::Tofu { host, known_hosts } => check(known_hosts, host, &fp),
+            Trust::Capture(sink) => {
+                *sink.lock().unwrap_or_else(|e| e.into_inner()) = Some(fp);
+                Ok(())
+            }
+        };
+        result.map(|_| ServerCertVerified::assertion()).map_err(Error::General)
     }
     // Fingerprint pinning above proves identity (the peer presented the expected cert), but
     // that alone isn't enough — an active MITM can also hold a copy of that (public) cert. These
@@ -72,14 +116,10 @@ impl ServerCertVerifier for TofuVerifier {
     }
 }
 
-/// Build a TLS connector that verifies `host` via TOFU.
-pub fn connector(host: &str) -> Arc<tokio_rustls::rustls::ClientConfig> {
+/// Build a TLS connector that verifies the daemon under `trust`.
+pub fn connector(trust: Trust) -> Arc<tokio_rustls::rustls::ClientConfig> {
     let provider = Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
-    let verifier = TofuVerifier {
-        host: host.to_string(),
-        known_hosts_path: known_hosts_path(),
-        provider: provider.clone(),
-    };
+    let verifier = RemoteVerifier { trust, provider: provider.clone() };
     Arc::new(
         tokio_rustls::rustls::ClientConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions().unwrap()
@@ -113,9 +153,10 @@ mod tests {
     /// accept loop, so the full-stack e2e round-trip lives here rather than in clowder-daemon
     /// (which would need a new dev-dependency on this crate purely for its private `tofu`
     /// module — see task-5 report for the cross-crate direction rationale). Guards the process-
-    /// global `XDG_STATE_HOME` env var against races with any other env-mutating test that might
-    /// later land in this crate's test binary.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// global `XDG_STATE_HOME` env var against races with any other env-mutating test — including
+    /// `probe`'s — that might touch it in this crate's test binary; see `crate::ENV_LOCK` for why
+    /// this must be one lock shared crate-wide rather than a lock per module.
+    use crate::ENV_LOCK;
 
     #[tokio::test]
     async fn e2e_tls_tofu_records_then_refuses_on_cert_change() {
@@ -144,7 +185,10 @@ mod tests {
         tokio::spawn(test_daemon().serve_remote(listener, Some(tls)));
 
         // Client connects with the REAL TOFU connector → first sight records the fingerprint + succeeds.
-        let tls_connector = tokio_rustls::TlsConnector::from(connector(TOFU_HOST_LABEL));
+        let tls_connector = tokio_rustls::TlsConnector::from(connector(Trust::Tofu {
+            host: TOFU_HOST_LABEL.to_string(),
+            known_hosts: known_hosts_path(),
+        }));
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
         let name = tokio_rustls::rustls::pki_types::ServerName::try_from("clowder").unwrap();
         let mut s = tls_connector.connect(name, tcp).await.expect("first connect (TOFU record) ok");
@@ -162,7 +206,10 @@ mod tests {
 
         // Client re-connects under the SAME TOFU host label → the recorded fingerprint no longer
         // matches the (rotated) cert presented by daemon #2 → handshake refused.
-        let tls_connector2 = tokio_rustls::TlsConnector::from(connector(TOFU_HOST_LABEL));
+        let tls_connector2 = tokio_rustls::TlsConnector::from(connector(Trust::Tofu {
+            host: TOFU_HOST_LABEL.to_string(),
+            known_hosts: known_hosts_path(),
+        }));
         let tcp2 = tokio::net::TcpStream::connect(addr2).await.unwrap();
         let name2 = tokio_rustls::rustls::pki_types::ServerName::try_from("clowder").unwrap();
         let err = tls_connector2.connect(name2, tcp2).await.expect_err("changed cert must be refused");
@@ -173,5 +220,146 @@ mod tests {
         );
 
         std::env::remove_var("XDG_STATE_HOME");
+    }
+
+    use std::sync::Mutex;
+
+    /// Build a real self-signed cert so the verifier sees a genuine DER, not a fabricated one.
+    fn a_cert() -> (Vec<u8>, String) {
+        let c = rcgen::generate_simple_self_signed(vec!["clowder".to_string()]).unwrap();
+        let der = c.cert.der().to_vec();
+        let fp = clowder_proto::cert_fingerprint_hex(&der);
+        (der, fp)
+    }
+
+    fn verify(trust: Trust, der: &[u8]) -> Result<(), String> {
+        use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+        let v = RemoteVerifier {
+            trust,
+            provider: Arc::new(tokio_rustls::rustls::crypto::ring::default_provider()),
+        };
+        v.verify_server_cert(
+            &CertificateDer::from(der.to_vec()),
+            &[],
+            &ServerName::try_from("clowder").unwrap(),
+            &[],
+            UnixTime::now(),
+        )
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn pinned_accepts_the_matching_fingerprint_and_refuses_any_other() {
+        let (der, fp) = a_cert();
+        assert!(verify(Trust::Pinned(fp.clone()), &der).is_ok());
+        let err = verify(Trust::Pinned("deadbeef".into()), &der).unwrap_err();
+        assert!(err.to_lowercase().contains("changed"), "loud refuse: {err}");
+    }
+
+    #[test]
+    fn pinned_never_touches_known_hosts() {
+        // This is the whole point of pairing: a pinned entry must not consult, and must not
+        // silently record into, the TOFU file. `Trust::Pinned` carries no path field, so a
+        // "does some made-up path exist" assertion can never fail — it wouldn't catch a
+        // regression that mistakenly called `check(&known_hosts_path(), ...)` from the Pinned
+        // arm. Route `known_hosts_path()` itself into a scratch dir via `XDG_STATE_HOME`,
+        // pre-populate it with known content, and assert that content survives byte-for-byte.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_STATE_HOME", dir.path());
+
+        // The pre-populated path and the resolved `known_hosts_path()` are the same path under
+        // this XDG_STATE_HOME setup, so one write-target and one assertion cover both.
+        let kh = known_hosts_path();
+        std::fs::create_dir_all(kh.parent().unwrap()).unwrap();
+        let sentinel = "sentinel-host aa11\n";
+        std::fs::write(&kh, sentinel).unwrap();
+
+        let (der, fp) = a_cert();
+        assert!(verify(Trust::Pinned(fp), &der).is_ok());
+
+        assert_eq!(
+            std::fs::read_to_string(&kh).unwrap(),
+            sentinel,
+            "Pinned must not write known_hosts"
+        );
+        std::env::remove_var("XDG_STATE_HOME");
+    }
+
+    #[test]
+    fn capture_accepts_anything_and_publishes_the_fingerprint_without_persisting() {
+        // Same rationale as `pinned_never_touches_known_hosts`: `Trust::Capture` carries no path
+        // field either, so route `known_hosts_path()` into a scratch dir and prove pre-existing
+        // content survives untouched, rather than asserting a made-up path stays absent.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_STATE_HOME", dir.path());
+
+        // Same path as `known_hosts_path()` under this XDG_STATE_HOME setup — see comment above.
+        let kh = known_hosts_path();
+        std::fs::create_dir_all(kh.parent().unwrap()).unwrap();
+        let sentinel = "sentinel-host aa11\n";
+        std::fs::write(&kh, sentinel).unwrap();
+
+        let (der, fp) = a_cert();
+        let sink: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        assert!(verify(Trust::Capture(sink.clone()), &der).is_ok());
+        assert_eq!(sink.lock().unwrap().as_deref(), Some(fp.as_str()));
+
+        assert_eq!(
+            std::fs::read_to_string(&kh).unwrap(),
+            sentinel,
+            "a probe must persist nothing"
+        );
+        std::env::remove_var("XDG_STATE_HOME");
+    }
+
+    #[test]
+    fn tofu_arm_still_records_then_refuses_on_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let kh = dir.path().join("known_hosts");
+        let (der, _) = a_cert();
+        let t = || Trust::Tofu { host: "h:7777".into(), known_hosts: kh.clone() };
+        assert!(verify(t(), &der).is_ok(), "first sight records");
+        assert!(verify(t(), &der).is_ok(), "same cert accepts");
+        let (other_der, _) = a_cert();
+        assert!(verify(t(), &other_der).is_err(), "changed cert refuses");
+    }
+
+    #[test]
+    fn concurrent_first_sight_records_do_not_lose_lines() {
+        // Each thread records a DIFFERENT host into the same file. Without a lock, two
+        // read-all/filter/write cycles interleave and one host's line is lost.
+        let dir = tempfile::tempdir().unwrap();
+        let kh = dir.path().join("known_hosts");
+        let handles: Vec<_> = (0..16u32)
+            .map(|i| {
+                let kh = kh.clone();
+                std::thread::spawn(move || {
+                    check(&kh, &format!("host{i}:7777"), "aa11").unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let text = std::fs::read_to_string(&kh).unwrap();
+        for i in 0..16u32 {
+            assert!(
+                text.lines().any(|l| l.split_whitespace().next() == Some(&format!("host{i}:7777"))),
+                "host{i} lost from known_hosts:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn known_hosts_is_written_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let kh = dir.path().join("known_hosts");
+        check(&kh, "h:7777", "aa11").unwrap();
+        let mode = std::fs::metadata(&kh).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "known_hosts records who you trust; it should not be world-readable");
     }
 }

@@ -47,13 +47,55 @@ async fn main() -> Result<()> {
         }
         Some("connect") => {
             let cfg = clowder_config::Config::load();
-            let host = args.get(2).cloned()
-                .or(cfg.remote_host.clone())
-                .ok_or_else(|| anyhow!("usage: clowder connect <host:port>  (or set [remote] host / CLOWDER_REMOTE_HOST)"))?;
-            let dir = cfg.control_sock.parent()
-                .ok_or_else(|| anyhow!("cannot derive forwarder socket dir"))?
-                .join("remote");
-            clowder_client::forward::forward(host, dir, cfg.remote_token).await
+            let flags = clowder_client::remote_cli::parse_flags(&args[2..]).map_err(anyhow::Error::msg)?;
+            flags.reject_unknown(&["socket-dir"]).map_err(anyhow::Error::msg)?;
+            let hosts = clowder_config::hosts::merged_hosts(
+                clowder_config::hosts::HostsStore::default_store().load(),
+                &cfg,
+            );
+            let target = clowder_client::target::resolve_target(flags.positional(0), &hosts, &cfg)
+                .map_err(anyhow::Error::msg)?;
+
+            // The caller owns the forwarder's socket path. --socket-dir is used verbatim; the
+            // default is deliberately FLAT (`<control parent>/remote`, no per-host segment),
+            // because it is a compatibility guarantee for SHELL users, who run `clowder connect`
+            // with no flag and already have that path in their env and scripts. A caller that
+            // wants per-host isolation asks for it with --socket-dir rather than having the
+            // layout changed underneath it — which is exactly what the macOS app does, passing
+            // `<control parent>/remote/<host>`. The app is the only caller that passes the flag,
+            // so nothing mirrors this default in Swift any more.
+            let dir = match flags.str("socket-dir") {
+                Some(d) => std::path::PathBuf::from(d),
+                None => cfg
+                    .control_sock
+                    .parent()
+                    .ok_or_else(|| anyhow!("cannot derive forwarder socket dir"))?
+                    .join("remote"),
+            };
+
+            // Fail fast when the very first dial never lands. Without this the forwarder binds
+            // its sockets and lives on, and the app's supervisor relaunches it forever behind a
+            // permanent "Reconnecting…" with no way to tell a typo from a daemon that is down.
+            // Exit 4 is the signal to stop and show the user (see DaemonSupervisor in M11b).
+            const FIRST_DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+            if tokio::time::timeout(
+                FIRST_DIAL_TIMEOUT,
+                tokio::net::TcpStream::connect(&target.address),
+            )
+            .await
+            .map_err(|_| ())
+            .and_then(|r| r.map_err(|_| ()))
+            .is_err()
+            {
+                eprintln!(
+                    "clowder connect: cannot reach {} at {} — check the address, and that the daemon \
+                     is running with [remote] listen set",
+                    target.label, target.address
+                );
+                std::process::exit(4);
+            }
+
+            clowder_client::forward::forward(target, dir).await
         }
         Some("remote-host") => {
             // Print the resolved [remote] host (or an empty line) so the macOS app can decide
@@ -74,8 +116,9 @@ async fn main() -> Result<()> {
             println!("fingerprint: {}", clowder_proto::cert_fingerprint_hex(&der));
             Ok(())
         }
+        Some("remote") => clowder_client::remote_cli::run(&args[2..]).await,
         // Legacy: `clowder <pane-id>` still attaches.
         Some(other) if other.parse::<u64>().is_ok() => attach(other.parse().unwrap()).await,
-        _ => Err(anyhow!("usage: clowder <spawn|project|attach|connect|remote-host|remote-token> ...")),
+        _ => Err(anyhow!("usage: clowder <spawn|project|attach|connect|remote|remote-host|remote-token> ...")),
     }
 }

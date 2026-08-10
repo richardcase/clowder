@@ -5,11 +5,12 @@ import XCTest
 @MainActor
 final class FakeDaemonProcess: DaemonProcess {
     private(set) var terminated = false
+    /// Simulates a live child. `exit(_:)` clears it, mirroring a real process.
+    var isRunning = true
     private var onExit: ((Int32) -> Void)?
-    func terminate() { terminated = true }
+    func terminate() { terminated = true; isRunning = false }
     func setOnExit(_ handler: @escaping (Int32) -> Void) { onExit = handler }
-    /// Test helper: simulate the process exiting with `code`.
-    func exit(_ code: Int32) { onExit?(code) }
+    func exit(_ code: Int32) { isRunning = false; onExit?(code) }
 }
 
 @MainActor
@@ -114,5 +115,93 @@ final class DaemonSupervisorTests: XCTestCase {
         XCTAssertTrue(live)
         XCTAssertEqual(spawned.count, 2)
         sup.stop()
+    }
+
+    func testDetachDoesNotTerminateTheProcess() {
+        var spawned: [FakeDaemonProcess] = []
+        let sup = DaemonSupervisor(spawn: { let p = FakeDaemonProcess(); spawned.append(p); return p })
+        sup.start()
+        sup.detach()
+        XCTAssertEqual(sup.state, .detached)
+        // The whole point: local agents are PTY children of this process and do not survive a
+        // restart, so switching away must not kill it.
+        XCTAssertFalse(spawned[0].terminated, "detach must not SIGTERM the daemon")
+    }
+
+    func testResumeReadoptsAStillLiveProcessWithoutRespawning() {
+        var spawned: [FakeDaemonProcess] = []
+        let sup = DaemonSupervisor(spawn: { let p = FakeDaemonProcess(); spawned.append(p); return p })
+        sup.start()
+        sup.detach()
+        sup.resume()
+        XCTAssertEqual(sup.state, .running)
+        XCTAssertEqual(spawned.count, 1, "a live daemon must be re-adopted, not respawned")
+    }
+
+    func testResumeRelaunchesWhenTheProcessDiedWhileDetached() {
+        var spawned: [FakeDaemonProcess] = []
+        let sup = DaemonSupervisor(spawn: { let p = FakeDaemonProcess(); spawned.append(p); return p })
+        sup.start()
+        sup.detach()
+        spawned[0].isRunning = false        // died on its own while nobody was supervising
+        sup.resume()
+        XCTAssertEqual(sup.state, .running)
+        XCTAssertEqual(spawned.count, 2, "a dead daemon must be relaunched on resume")
+    }
+
+    func testAnExitWhileDetachedDoesNotRelaunch() async {
+        let controller = SleepController()
+        var spawned: [FakeDaemonProcess] = []
+        let sup = DaemonSupervisor(
+            spawn: { let p = FakeDaemonProcess(); spawned.append(p); return p },
+            sleep: { await controller.sleep($0) }
+        )
+        sup.start()
+        sup.detach()
+        spawned[0].exit(139)                // crashed while detached
+        XCTAssertEqual(sup.state, .detached, "a detached supervisor must not resurrect the process")
+        // The relaunch runs in a Task, so the assertions below are only meaningful AFTER a
+        // suspension point — without one they would pass however the supervisor behaved.
+        for _ in 0..<20 { await Task.yield() }
+        XCTAssertEqual(controller.parkedCount, 0, "no relaunch may be scheduled while detached")
+        XCTAssertEqual(spawned.count, 1)
+    }
+
+    func testExitCode4EntersFailedAndDoesNotRelaunch() async {
+        let controller = SleepController()
+        var spawned: [FakeDaemonProcess] = []
+        let sup = DaemonSupervisor(
+            spawn: { let p = FakeDaemonProcess(); spawned.append(p); return p },
+            sleep: { await controller.sleep($0) }
+        )
+        sup.start()
+        spawned[0].exit(4)                  // `clowder connect`: the first dial never landed
+        guard case let .failed(reason) = sup.state else {
+            return XCTFail("expected .failed, got \(sup.state)")
+        }
+        XCTAssertFalse(reason.isEmpty, "the chip shows this reason to the user")
+        // Same as the detached case: yield first, so a relaunch would have had the chance to run.
+        for _ in 0..<20 { await Task.yield() }
+        XCTAssertEqual(controller.parkedCount, 0, "an unreachable host must not relaunch forever")
+        XCTAssertEqual(spawned.count, 1)
+    }
+
+    func testExitCode3StillYields() {
+        var spawned: [FakeDaemonProcess] = []
+        let sup = DaemonSupervisor(spawn: { let p = FakeDaemonProcess(); spawned.append(p); return p })
+        sup.start()
+        spawned[0].exit(3)
+        XCTAssertEqual(sup.state, .yielded, "exit 3 (lost the single-instance flock) must not change")
+    }
+
+    func testStartAfterFailedRetries() {
+        // The chip offers a Retry; it must actually spawn again.
+        var spawned: [FakeDaemonProcess] = []
+        let sup = DaemonSupervisor(spawn: { let p = FakeDaemonProcess(); spawned.append(p); return p })
+        sup.start()
+        spawned[0].exit(4)
+        sup.start()
+        XCTAssertEqual(sup.state, .running)
+        XCTAssertEqual(spawned.count, 2)
     }
 }

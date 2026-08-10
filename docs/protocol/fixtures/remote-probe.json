@@ -1,0 +1,13 @@
+{
+  "probe": {
+    "name": "studio",
+    "address": "studio.tailnet:7777",
+    "reachable": true,
+    "tls": true,
+    "fingerprint": "a1b2",
+    "pinnedFingerprint": null,
+    "fingerprintMatch": "new",
+    "authenticated": true,
+    "error": null
+  }
+}

@@ -8,6 +8,7 @@ clowder-proto = { path = "../clowder-proto" }
 clowder-config = { path = "../clowder-config" }
 tokio = { workspace = true }
 anyhow = { workspace = true }
+serde = { workspace = true }
 serde_json = "1"
 rustls-pemfile = "2"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
@@ -22,6 +23,7 @@ clowder-daemon = { path = "../clowder-daemon" }
 clowder-workspace = { path = "../clowder-workspace" }
 tempfile = "3"
 tokio = { workspace = true, features = ["test-util"] }
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 
 [[bin]]
 name = "clowder"

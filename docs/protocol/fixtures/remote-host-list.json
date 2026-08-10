@@ -1,0 +1,22 @@
+{
+  "hosts": [
+    {
+      "name": "studio",
+      "address": "studio.tailnet:7777",
+      "tls": true,
+      "hasToken": true,
+      "fingerprint": "a1b2",
+      "trusted": true,
+      "source": "registry"
+    },
+    {
+      "name": "config",
+      "address": "10.0.0.5:7777",
+      "tls": false,
+      "hasToken": false,
+      "fingerprint": null,
+      "trusted": false,
+      "source": "config"
+    }
+  ]
+}

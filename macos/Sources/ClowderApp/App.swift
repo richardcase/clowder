@@ -12,16 +12,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // applicationDidFinishLaunching on some macOS versions, so nothing may force-unwrap these.
     private(set) var appModel: AppModel?
     private(set) var surfaceHost: SurfaceHost?
+    /// Backs the Settings window's Hosts pane. Built once in `bootstrap()` (idempotent), alongside
+    /// `hostRegistry` — the two are always created together.
+    private(set) var hostsModel: HostsViewModel?
     private var mainWindow: NSWindow?
     private var windowCloseDelegate: HideOnCloseDelegate?
     private var statusBar: StatusBarController?
-    private var daemonSupervisor: DaemonSupervisor?
-    /// The remote host the app is currently pointed at (nil = local daemon). Drives the tray label.
-    private(set) var currentRemoteHost: String?
-    /// The remote host from config (resolved once at startup), so a local session can still offer
-    /// "Connect to <host>". nil = no `[remote] host` configured. Read (not just set) from
-    /// `ClowderApp.body` too, to decide whether `ContentView` runs in remote mode.
-    private(set) var configuredRemoteHost: String?
+    /// One supervisor per backend the app has launched. Local's outlives a switch away from it (it
+    /// is detached, not stopped) so its agents — PTY children of that daemon — survive; a forwarder
+    /// is stopped and dropped, since it holds no state.
+    private var supervisors: [BackendID: DaemonSupervisor] = [:]
+    private var hostRegistry: HostRegistry?
+    private(set) var hosts: [RemoteHost] = []
+    private(set) var activeBackend: BackendID = .local
+    private var sockets = SocketPaths(client: "", control: "", hook: "")
 
     /// One-time libghostty + model initialization. Idempotent and main-thread-only; runs on
     /// whichever fires first — the SwiftUI scene body or `applicationDidFinishLaunching` — so
@@ -29,32 +33,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// startup). Creating the ghostty app object here is run-loop-independent; the wakeup tick
     /// is queued via DispatchQueue.main and serviced once the run loop is up.
     @discardableResult
-    func bootstrap() -> (appModel: AppModel, surfaceHost: SurfaceHost) {
-        if let appModel, let surfaceHost { return (appModel, surfaceHost) }
+    func bootstrap() -> (appModel: AppModel, surfaceHost: SurfaceHost, hostsModel: HostsViewModel?) {
+        if let appModel, let surfaceHost { return (appModel, surfaceHost, hostsModel) }
 
         // Bundled binary + per-user sockets (dev overrides via env/CLOWDER_BIN still honored).
         let socks = ClowderPaths.socketPaths()
+        sockets = SocketPaths(client: socks.client, control: socks.control, hook: socks.hook)
         let clowderBinary = ProcessInfo.processInfo.environment["CLOWDER_BIN"]
             ?? ClowderPaths.bundledBin("clowder")
             ?? FileManager.default.currentDirectoryPath + "/../target/debug/clowder"
 
-        // Config-driven backend: ask the clowder binary for the resolved [remote] host (it owns
-        // config.toml/env parsing). Non-nil → remote mode (supervise `clowder connect <host>` and
-        // connect to the forwarder's sockets); nil → local daemon. Default to the local socket paths;
-        // makeBackendSupervisor returns the mode's actual control/render sockets when bundled.
-        let remoteHost = resolveRemoteHost(clowderBinary: clowderBinary)
-        configuredRemoteHost = remoteHost
-        var socketPath = socks.client
-        var controlPath = socks.control
-        if let backend = makeBackendSupervisor(remoteHost: remoteHost) {
-            daemonSupervisor = backend.supervisor
-            controlPath = backend.control
-            socketPath = backend.render
-            // Only claim "Remote" once a remote backend is actually running — otherwise the tray
-            // label could contradict the (local) sockets we wired up (e.g. unbundled dev).
-            currentRemoteHost = remoteHost
-            backend.supervisor.start()
+        // The CLI owns config.toml + hosts.json parsing, so the app reads the host list through it
+        // rather than parsing either itself.
+        let registry = HostRegistry(runner: ProcessCommandRunner(executablePath: clowderBinary))
+        hostRegistry = registry
+        hostsModel = HostsViewModel(
+            registry: registry,
+            activeBackend: { [weak self] in self?.activeBackend ?? .local },
+            // The Settings-added/removed host must reach the sidebar chip, the menu bar and the
+            // command palette — all three read `hosts` off this delegate via `refreshHosts()`.
+            onHostsChanged: { [weak self] in self?.refreshHosts() }
+        )
+        refreshHosts()
+
+        // Always start Local. Unlike pre-M11b, a configured `[remote] host` no longer changes what
+        // the app connects to at launch — the user picks a backend, and the chip says which it is.
+        let plan = backendPlan(target: .local, sockets: sockets)
+        let controlPath = plan.controlPath
+        let socketPath = plan.renderPath
+        if let supervisor = makeBackendSupervisor(plan: plan) {
+            supervisors[.local] = supervisor
+            supervisor.start()
         }
+        // Unbundled dev (no supervisor): the local plan's sockets are the default ones, which is
+        // exactly where a hand-run `cargo run -p clowder-daemon` binds. Nothing to adjust.
 
         // --- libghostty init (unchanged sequence, relocated from main.swift) ---
         guard ghostty_init(UInt(CommandLine.argc), CommandLine.unsafeArgv) == GHOSTTY_SUCCESS else {
@@ -86,53 +98,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let model = AppModel(makeTransport: { try UnixSocketConnection(path: controlPath) })
         surfaceHost = host
         appModel = model
+        model.backends = self
+        model.setHosts(hosts)
         model.connect()
         statusBar = StatusBarController(appModel: model,
-                                        showWindow: { [weak self] in self?.showWindow() },
-                                        remoteHost: { [weak self] in self?.currentRemoteHost },
-                                        configuredRemoteHost: { [weak self] in self?.configuredRemoteHost },
-                                        switchBackend: { [weak self] host in self?.switchBackend(to: host) })
-        return (model, host)
-    }
-
-    /// Live backend swap (menu "Use local" / "Connect to remote"): stop the current backend, start the
-    /// other, and reconfigure the SAME AppModel + SurfaceHost in place (SwiftUI keeps their references).
-    /// The menu only ever toggles to the OPPOSITE mode, so this is never a same-backend restart (which
-    /// could race the local daemon's single-instance flock).
-    func switchBackend(to remoteHost: String?) {
-        // Build the new backend first: if we can't (unbundled dev), leave the current one untouched
-        // rather than stopping it and stranding the tray label.
-        guard let backend = makeBackendSupervisor(remoteHost: remoteHost) else { return }
-        daemonSupervisor?.stop()
-        daemonSupervisor = backend.supervisor
-        currentRemoteHost = remoteHost
-        backend.supervisor.start()
-        appModel?.reconnect(makeTransport: { try UnixSocketConnection(path: backend.control) })
-        surfaceHost?.retarget(socketPath: backend.render)
-    }
-
-    /// Ask the clowder binary for the resolved `[remote] host` (it owns config.toml/env parsing, which
-    /// the app can't do itself). Returns the trimmed host, or nil when empty / the query fails.
-    private func resolveRemoteHost(clowderBinary: String) -> String? {
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: clowderBinary)
-        proc.arguments = ["remote-host"]
-        let pipe = Pipe()
-        proc.standardOutput = pipe
-        proc.standardError = FileHandle.nullDevice
-        let data: Data
-        do {
-            try proc.run()
-            // Read BEFORE waiting: draining after waitUntilExit() can deadlock if the child fills the
-            // pipe buffer (output is one line today, but read-before-wait is the safe order).
-            data = pipe.fileHandleForReading.readDataToEndOfFile()
-            proc.waitUntilExit()
-        } catch {
-            return nil
-        }
-        guard proc.terminationStatus == 0 else { return nil }
-        let host = (String(data: data, encoding: .utf8) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        return host.isEmpty ? nil : host
+                                        backends: self,
+                                        showWindow: { [weak self] in self?.showWindow() })
+        return (model, host, hostsModel)
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -146,8 +118,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        appModel?.shutdown()          // F1: explicit disconnect
-        daemonSupervisor?.stop()      // terminate the child daemon we spawned
+        appModel?.shutdown()                          // F1: explicit disconnect
+        // Quit means quit: every backend we spawned, including a DETACHED local daemon we left
+        // running across a switch, gets terminated. `stop()` clears the detached flag first, so the
+        // retained handle is actually signalled rather than orphaned.
+        for (_, supervisor) in supervisors { supervisor.stop() }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
@@ -175,6 +150,118 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+extension AppDelegate: BackendSwitching {
+    /// Read the registry. Cheap enough to do on demand (menu/palette/settings open); there is
+    /// deliberately no file watcher.
+    ///
+    /// Never throws into the UI: no registry at all is the normal state before the user adds a
+    /// host, so a failure logs and leaves the list as it was.
+    func refreshHosts() {
+        guard let hostRegistry else { return }
+        do {
+            hosts = try hostRegistry.list()
+            appModel?.setHosts(hosts)
+        } catch {
+            DaemonLog.note("could not read the host registry: \(error.localizedDescription)")
+        }
+    }
+
+    /// Live backend swap. Reconfigures the SAME AppModel + SurfaceHost in place, so SwiftUI keeps
+    /// its bindings.
+    ///
+    /// Local is DETACHED rather than stopped: its agents are PTY children that do not survive a
+    /// restart, and switching back re-adopts the same daemon. A forwarder is STOPPED — it holds no
+    /// state, and leaving one bound would collide when we reconnect to that host.
+    func switchBackend(to backend: BackendID) {
+        guard backend != activeBackend else { return }
+        let target: BackendTarget
+        switch backend {
+        case .local:
+            target = .local
+        case let .remote(id):
+            guard let host = hosts.first(where: { $0.id == id }) else {
+                appModel?.reportBackendError("No host named \(id.rawValue) is configured.")
+                return
+            }
+            // Probe first: switching to a host that cannot serve us tears down a healthy session
+            // and leaves the user with a red chip and nothing running. `backendSwitchRefusal` also
+            // catches the two failures that are still "reachable" — a rotated certificate and a
+            // rejected token — which otherwise get past this gate and reconnect forever.
+            //
+            // `--timeout 1`, not the CLI's 3s default: the CLI bounds the connect, the handshake
+            // and the read-line each by that value, so the worst case is ~3x it, and this runs
+            // SYNCHRONOUSLY on the main thread from a click. ~3s of beachball is the ceiling we
+            // accept; ~9s is not. (Moving the probe off the main thread is the real fix, tracked
+            // as a follow-up.)
+            //
+            // A THROWN probe deliberately does not block the switch: that means the CLI itself
+            // failed (missing binary, unreadable registry), which says nothing about the host.
+            if let probe = try? hostRegistry?.probe(name: host.name, timeoutSeconds: 1),
+               let refusal = backendSwitchRefusal(probe) {
+                appModel?.reportBackendError(refusal)
+                return
+            }
+            target = .remote(host)
+        }
+
+        let plan = backendPlan(target: target, sockets: sockets)
+        // Build (or recover) the new supervisor BEFORE touching the current one: if we can't
+        // (unbundled dev has no bundled binaries), the running backend must be left alone.
+        guard let supervisor = supervisors[backend] ?? makeBackendSupervisor(plan: plan) else {
+            DaemonLog.note("no bundled binary to run backend \(backend); staying on \(activeBackend)")
+            return
+        }
+
+        if activeBackend == .local {
+            supervisors[.local]?.detach()
+        } else {
+            supervisors[activeBackend]?.stop()
+            supervisors[activeBackend] = nil
+        }
+
+        supervisors[backend] = supervisor
+        if supervisor.state == .detached { supervisor.resume() } else { supervisor.start() }
+        activeBackend = backend
+        appModel?.reconnect(to: backend, makeTransport: {
+            try UnixSocketConnection(path: plan.controlPath)
+        })
+        surfaceHost?.retarget(socketPath: plan.renderPath)
+    }
+
+    /// The active backend's supervisor state, read fresh on every call. Exposed as a method (not a
+    /// stored/published property) because neither `DaemonSupervisor` nor `AppDelegate` publish —
+    /// see `ConnectionChipView`'s doc comment for how the sidebar chip gets liveness out of that.
+    func activeSupervisorState() -> DaemonSupervisor.State {
+        supervisors[activeBackend]?.state ?? .stopped
+    }
+
+    /// Retry the ACTIVE backend after the chip surfaced `canRetry` (a `.failed` supervisor, or a
+    /// send failure that closed the control channel). Unlike `switchBackend`, this never tears
+    /// down or swaps backends — the active backend stays active; only its supervisor (if it needs
+    /// one) and its control connection get a fresh attempt.
+    func retryActiveBackend() {
+        let target: BackendTarget
+        switch activeBackend {
+        case .local:
+            target = .local
+        case let .remote(id):
+            guard let host = hosts.first(where: { $0.id == id }) else {
+                appModel?.reportBackendError("No host named \(id.rawValue) is configured.")
+                return
+            }
+            target = .remote(host)
+        }
+        let plan = backendPlan(target: target, sockets: sockets)
+        // `.start()` is a no-op while a process/relaunch is already in flight (guarded on
+        // `process == nil, relaunchTask == nil`), so calling it unconditionally is safe — it only
+        // does something when the supervisor actually needs restarting (e.g. `.failed`/`.stopped`).
+        supervisors[activeBackend]?.start()
+        appModel?.reconnect(to: activeBackend, makeTransport: {
+            try UnixSocketConnection(path: plan.controlPath)
+        })
+    }
+}
+
 /// Hides the window on close instead of destroying it, so the app stays alive in the menu bar.
 final class HideOnCloseDelegate: NSObject, NSWindowDelegate {
     func windowShouldClose(_ sender: NSWindow) -> Bool {
@@ -193,7 +280,9 @@ struct ClowderApp: App {
             // Bootstrap on first body evaluation if the launch callback hasn't run yet;
             // idempotent, so a later applicationDidFinishLaunching is a no-op.
             let boot = delegate.bootstrap()
-            ContentView(surfaceHost: boot.surfaceHost, isRemote: delegate.configuredRemoteHost != nil)
+            ContentView(surfaceHost: boot.surfaceHost,
+                        supervisorState: { [weak d = delegate] in d?.activeSupervisorState() ?? .stopped },
+                        onRetry: { [weak d = delegate] in d?.retryActiveBackend() })
                 .environmentObject(boot.appModel)
                 .frame(minWidth: 900, minHeight: 560)
                 .background(WindowAccessor { [weak d = delegate] window in d?.adoptWindow(window) })
@@ -221,6 +310,14 @@ struct ClowderApp: App {
                 menuItem("Land Agent", .landAgent)
                 Button("Discard Agent…") { delegate.appModel?.run(.discardAgent) }
             }
+        }
+
+        Settings {
+            // bootstrap() is idempotent, so calling it here makes a Settings-first launch (⌘,
+            // before the WindowGroup has ever rendered) safe too. The Settings scene body cannot
+            // see the WindowGroup's @EnvironmentObject, so the model is passed explicitly.
+            SettingsView(hosts: delegate.bootstrap().hostsModel)
+                .frame(width: 680, height: 460)
         }
     }
 
