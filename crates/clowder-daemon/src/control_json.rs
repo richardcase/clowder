@@ -174,7 +174,7 @@ impl Daemon {
 
     fn spawn_from_control(self: &Arc<Self>, project: &str, name: &str, adapter: &str) -> Result<PaneId> {
         let project_path = Path::new(project);
-        let a = build_adapter(adapter).ok_or_else(|| anyhow!("unknown adapter: {adapter}"))?;
+        let a = build_adapter(adapter, &self.shell).ok_or_else(|| anyhow!("unknown adapter: {adapter}"))?;
         self.spawn_agent(project_path, a.as_ref(), name)
     }
 }
