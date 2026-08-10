@@ -48,9 +48,9 @@ struct ConnectionChipView: View {
 
             Divider()
             if model.hosts.isEmpty {
-                // Not a dead end: name the command that fixes it. (The next milestone replaces
-                // this hint — and the removed "Manage Hosts…" item — with a real Settings pane.)
-                Text("No remote hosts. Add one: clowder remote add <name> <host:port>")
+                // Not a dead end: pair the fact with a way forward.
+                Text("No remote hosts.")
+                SettingsLink { Text("Manage Hosts…") }
             } else {
                 ForEach(model.hosts) { host in
                     Button {
@@ -64,9 +64,7 @@ struct ConnectionChipView: View {
                     .disabled(host.backend == model.activeBackend)
                 }
                 Divider()
-                // Same reason as above: the only way to add a host today is the CLI, so say so
-                // rather than offering a `SettingsLink` to a Settings scene that does not exist.
-                Text("Add a host: clowder remote add <name> <host:port>")
+                SettingsLink { Text("Manage Hosts…") }
             }
 
             if chip.canRetry {
