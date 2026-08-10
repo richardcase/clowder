@@ -23,7 +23,16 @@ pub struct Config {
     pub remote_token: Option<String>,
     /// Directory that agent worktrees are provisioned under. See `default_worktree_base_from`.
     pub worktree_base: PathBuf,
+    /// Whether the daemon captures the user's login environment at startup and uses it as the base
+    /// environment for every PTY child. On by default; see `clowder_daemon::login_env`.
+    pub capture_login_env: bool,
+    /// How long the daemon waits for that capture before giving up and inheriting its own
+    /// environment. Clamped to `1000..=30_000` so a typo cannot wedge startup.
+    pub login_env_timeout_ms: u64,
 }
+
+const DEFAULT_LOGIN_ENV_TIMEOUT_MS: u64 = 3000;
+const LOGIN_ENV_TIMEOUT_BOUNDS: std::ops::RangeInclusive<u64> = 1000..=30_000;
 
 #[derive(Debug, Default, Deserialize)]
 struct FileConfig {
@@ -31,6 +40,7 @@ struct FileConfig {
     pane: Option<PaneCfg>,
     remote: Option<Remote>,
     worktrees: Option<Worktrees>,
+    env: Option<EnvCfg>,
 }
 #[derive(Debug, Default, Deserialize)]
 struct Sockets { client: Option<PathBuf>, control: Option<PathBuf>, hook: Option<PathBuf> }
@@ -40,6 +50,8 @@ struct PaneCfg { backlog_cap: Option<usize>, shell: Option<String>, cols: Option
 struct Remote { listen: Option<String>, host: Option<String>, tls: Option<bool>, token: Option<String> }
 #[derive(Debug, Default, Deserialize)]
 struct Worktrees { base: Option<PathBuf> }
+#[derive(Debug, Default, Deserialize)]
+struct EnvCfg { capture_login: Option<bool>, timeout_ms: Option<u64> }
 
 impl Config {
     /// Load `$XDG_CONFIG_HOME/clowder/config.toml` (else `$HOME/.config/clowder/config.toml`), then apply
@@ -68,6 +80,7 @@ impl Config {
         let p = f.pane.unwrap_or_default();
         let r = f.remote.unwrap_or_default();
         let w = f.worktrees.unwrap_or_default();
+        let e = f.env.unwrap_or_default();
 
         // Per-user runtime dir for sockets: $XDG_RUNTIME_DIR › $TMPDIR › /tmp (mirrors the daemon's
         // single-instance PID lock dir). Env socket vars still override below.
@@ -109,6 +122,15 @@ impl Config {
                 .map(PathBuf::from)
                 .or(w.base.filter(|p| !p.as_os_str().is_empty()))
                 .unwrap_or_else(|| default_worktree_base_from(get_env)),
+            capture_login_env: env_bool("CLOWDER_CAPTURE_LOGIN_ENV")
+                .unwrap_or_else(|| e.capture_login.unwrap_or(true)),
+            // Clamped, not rejected: a wild value here would either stall every daemon start or
+            // guarantee the capture never completes, and both look like the daemon hanging.
+            login_env_timeout_ms: get_env("CLOWDER_LOGIN_ENV_TIMEOUT_MS")
+                .and_then(|v| v.trim().parse().ok())
+                .or(e.timeout_ms)
+                .unwrap_or(DEFAULT_LOGIN_ENV_TIMEOUT_MS)
+                .clamp(*LOGIN_ENV_TIMEOUT_BOUNDS.start(), *LOGIN_ENV_TIMEOUT_BOUNDS.end()),
         }
     }
 }
@@ -148,10 +170,19 @@ pub fn login_shell() -> String {
 /// *program* the daemon runs, which portable-pty's copy cannot give us. `None` on any doubt — a
 /// null entry, a non-UTF-8 or empty `pw_shell`, or one that isn't executable — so the caller falls
 /// through to `/bin/sh` rather than failing to spawn.
+/// Memoized: `getpwuid` is not thread-safe (it returns a pointer into a shared static buffer), and
+/// `Daemon::new_with_paths` reaches this from every daemon a test suite builds, in parallel. The
+/// passwd entry for our own uid does not change under us, so one lookup for the process is both
+/// safer and cheaper than one per call.
 pub fn passwd_shell() -> Option<String> {
+    static CACHED: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    CACHED.get_or_init(passwd_shell_uncached).clone()
+}
+
+fn passwd_shell_uncached() -> Option<String> {
     // SAFETY: `getpwuid` returns a pointer into a static buffer owned by libc, valid until the next
     // passwd call on this thread. We copy the string out immediately and never retain the pointer.
-    // Not thread-safe in general, hence the "call this once at startup" contract on `login_shell`.
+    // `OnceLock` above serializes this, so there is no concurrent call to invalidate the buffer.
     let shell = unsafe {
         let ent = libc::getpwuid(libc::getuid());
         if ent.is_null() {
@@ -486,6 +517,60 @@ mod tests {
         let c = Config::resolve(f, &env);
         assert!(c.remote_tls);
         assert_eq!(c.remote_token.as_deref(), Some("envtok"));
+    }
+
+    #[test]
+    fn login_env_capture_resolves_env_over_file_then_on() {
+        // default: on
+        let c = Config::resolve(FileConfig::default(), &no_env);
+        assert!(c.capture_login_env);
+        assert_eq!(c.login_env_timeout_ms, 3000);
+
+        // file turns it off
+        let f: FileConfig = toml::from_str("[env]\ncapture_login = false\ntimeout_ms = 5000\n").unwrap();
+        let c = Config::resolve(f, &no_env);
+        assert!(!c.capture_login_env);
+        assert_eq!(c.login_env_timeout_ms, 5000);
+
+        // env wins over file, in both directions
+        let f2: FileConfig = toml::from_str("[env]\ncapture_login = false\ntimeout_ms = 5000\n").unwrap();
+        let env = |k: &str| match k {
+            "CLOWDER_CAPTURE_LOGIN_ENV" => Some("1".to_string()),
+            "CLOWDER_LOGIN_ENV_TIMEOUT_MS" => Some("2000".to_string()),
+            _ => None,
+        };
+        let c = Config::resolve(f2, &env);
+        assert!(c.capture_login_env);
+        assert_eq!(c.login_env_timeout_ms, 2000);
+
+        let off = |k: &str| (k == "CLOWDER_CAPTURE_LOGIN_ENV").then(|| "0".to_string());
+        assert!(!Config::resolve(FileConfig::default(), &off).capture_login_env);
+    }
+
+    #[test]
+    fn unparseable_login_env_settings_fall_through_to_the_file() {
+        let f: FileConfig = toml::from_str("[env]\ncapture_login = false\ntimeout_ms = 5000\n").unwrap();
+        let junk = |k: &str| match k {
+            "CLOWDER_CAPTURE_LOGIN_ENV" => Some("yes-please".to_string()),
+            "CLOWDER_LOGIN_ENV_TIMEOUT_MS" => Some("soon".to_string()),
+            _ => None,
+        };
+        let c = Config::resolve(f, &junk);
+        assert!(!c.capture_login_env);
+        assert_eq!(c.login_env_timeout_ms, 5000);
+    }
+
+    #[test]
+    fn login_env_timeout_is_clamped() {
+        let low = |k: &str| (k == "CLOWDER_LOGIN_ENV_TIMEOUT_MS").then(|| "1".to_string());
+        assert_eq!(Config::resolve(FileConfig::default(), &low).login_env_timeout_ms, 1000);
+
+        let high = |k: &str| (k == "CLOWDER_LOGIN_ENV_TIMEOUT_MS").then(|| "600000".to_string());
+        assert_eq!(Config::resolve(FileConfig::default(), &high).login_env_timeout_ms, 30_000);
+
+        // and from the file too, not just the env
+        let f: FileConfig = toml::from_str("[env]\ntimeout_ms = 0\n").unwrap();
+        assert_eq!(Config::resolve(f, &no_env).login_env_timeout_ms, 1000);
     }
 
     #[test]

@@ -10,10 +10,10 @@ async fn main() -> Result<()> {
     let config = clowder_config::Config::load();
     let sock_path = config.client_sock.clone();
     let control_path = config.control_sock.clone();
+    let hook_path = config.hook_sock.clone();
     let remote_listen = config.remote_listen.clone();
     let config_remote_tls = config.remote_tls;
-    let daemon = Arc::new(Daemon::new_from_config(config));
-    let hook_path = daemon.hook_sock().to_path_buf();
+    // The daemon itself is built AFTER the sockets are bound — see the login-env capture below.
 
     // Sockets may live in a per-user dir that doesn't exist yet; create each parent. A failure here
     // is not fatal by itself (the dir may already exist and be fine) but it IS the cause of the
@@ -54,6 +54,16 @@ async fn main() -> Result<()> {
         pid_lock = %lock.path().display(),
         "clowder-daemon listening"
     );
+
+    // Only NOW work out what environment panes get. This runs the user's login shell, which can
+    // take the better part of a second (or hang on a bad rc file), and it must not delay the binds
+    // above: a client that connects meanwhile waits in the accept backlog instead of getting
+    // ECONNREFUSED and entering the app's reconnect ramp.
+    //
+    // It must, however, finish before `reconcile()` — that respawns the whole fleet, and a
+    // respawned agent with the wrong PATH is exactly the bug being fixed.
+    let pane_env = resolve_pane_env(&config).await;
+    let daemon = Arc::new(Daemon::new_from_config(config).with_pane_env(pane_env));
 
     // Agents don't survive their daemon's PTYs dying with it; re-spawn every agent still
     // recorded in the durable registry (pruning any whose worktree/adapter is gone) before
@@ -126,6 +136,57 @@ async fn main() -> Result<()> {
     remove_files(&[&sock_path, &hook_path, &control_path, &lock_path]);
     drop(lock); // release the advisory flock
     result
+}
+
+/// The environment every PTY child will start from.
+///
+/// A GUI-launched app's daemon inherits launchd's `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, in which
+/// `claude` does not exist — so it asks the user's login shell what the environment should be. A
+/// failure here is never fatal: panes fall back to inheriting the daemon's own environment, which
+/// is exactly the pre-#76 behaviour.
+async fn resolve_pane_env(config: &clowder_config::Config) -> clowder_daemon::PaneEnv {
+    use clowder_daemon::login_env;
+
+    let fallback = || login_env::PaneEnv::inherited(&config.shell);
+    if !config.capture_login_env {
+        tracing::info!("login-env capture disabled; panes inherit the daemon's environment");
+        return fallback();
+    }
+
+    let spec = login_env::CaptureSpec {
+        shell: config.shell.clone(),
+        timeout: std::time::Duration::from_millis(config.login_env_timeout_ms),
+        cwd: std::env::var_os("HOME").map(std::path::PathBuf::from),
+    };
+    let started = std::time::Instant::now();
+    match login_env::capture(&spec).await {
+        Ok(captured) => {
+            let env = login_env::PaneEnv::resolve(
+                Some(captured),
+                login_env::env_snapshot(),
+                login_env::exe_dir().as_deref(),
+                &config.shell,
+            );
+            // The one line that answers "why can't it find claude?" from daemon.log.
+            tracing::info!(
+                shell = %config.shell,
+                vars = env.len(),
+                took_ms = started.elapsed().as_millis() as u64,
+                "login-env captured"
+            );
+            tracing::debug!(path = env.get("PATH").unwrap_or(""), "login-env PATH");
+            env
+        }
+        Err(e) => {
+            tracing::warn!(
+                shell = %config.shell,
+                "login-env capture failed ({e:#}); panes inherit the daemon's environment, so an \
+                 agent binary that isn't on it will not be found (see issue #76). Set \
+                 CLOWDER_CAPTURE_LOGIN_ENV=0 to silence this."
+            );
+            fallback()
+        }
+    }
 }
 
 /// Resolve when the daemon receives SIGTERM or SIGINT.

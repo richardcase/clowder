@@ -118,3 +118,79 @@ async fn spawn_agent_tears_down_worktree_on_launch_failure() {
         .worktree_path(&repo.path().canonicalize().unwrap(), "task-fail");
     assert!(!ws_path.exists(), "worktree should be torn down after spawn_agent failure");
 }
+
+/// Issue #76. `ClaudeAdapter` launches `claude` by **bare name**, so whether an agent starts at all
+/// comes down to the PATH in the daemon's `PaneEnv` — not the PATH the daemon itself inherited.
+/// Under a GUI launch those differ completely, which is what broke.
+///
+/// The agent here is a fake binary reachable ONLY through the `PaneEnv`'s PATH, and the daemon's
+/// own PATH is left out of the environment entirely. Before this change `Pane::spawn` used the
+/// daemon's inherited environment and this could not resolve.
+#[tokio::test]
+async fn an_agent_launched_by_bare_name_resolves_against_the_pane_environment() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo = init_repo();
+    let hook_dir = tempfile::tempdir().unwrap();
+    let hook_sock = hook_dir.path().join("hook.sock");
+    let state = tempfile::tempdir().unwrap();
+
+    // The "agent CLI", installed somewhere only a login shell would know about. It records that it
+    // ran (a file, not stdout — no draining a PTY to find out whether exec even happened).
+    let bin_dir = tempfile::tempdir().unwrap();
+    let ran_marker = bin_dir.path().join("ran");
+    let bin = bin_dir.path().join("clowder-fake-agent");
+    // `: >` and `exec` are shell builtins: PATH here holds ONLY bin_dir, so the script must not
+    // depend on /usr/bin being reachable — that is the whole point of the test.
+    std::fs::write(
+        &bin,
+        format!("#!/bin/sh\n: > '{}'\nexec /bin/cat\n", ran_marker.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let pane_env = clowder_daemon::PaneEnv::resolve(
+        Some(
+            [("PATH".to_string(), bin_dir.path().to_string_lossy().into_owned())]
+                .into_iter()
+                .collect(),
+        ),
+        Default::default(), // no daemon environment at all — the capture is the only source
+        None,
+        "/bin/sh",
+    );
+
+    let daemon = Arc::new(
+        Daemon::new_with_paths(
+            Arc::new(FakeNotifier::new()),
+            hook_sock.clone(),
+            state.path().join("agents.json"),
+            state.path().join("projects.json"),
+            state.path().join("worktrees"),
+        )
+        .with_pane_env(pane_env),
+    );
+    daemon.add_project(repo.path()).unwrap();
+
+    let adapter = SyntheticAdapter {
+        command: PaneCommand {
+            program: "clowder-fake-agent".into(), // bare, exactly like `claude`
+            args: vec![],
+            cwd: None,
+            env: vec![],
+        },
+    };
+    let pane = daemon.spawn_agent(repo.path(), &adapter, "task-path").unwrap();
+
+    let mut ran = false;
+    for _ in 0..100 {
+        if ran_marker.exists() {
+            ran = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(ran, "the agent must resolve against the pane environment's PATH");
+
+    daemon.teardown_agent(pane).unwrap();
+}

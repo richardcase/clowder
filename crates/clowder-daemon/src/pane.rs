@@ -1,3 +1,4 @@
+use crate::login_env::PaneEnv;
 use anyhow::Result;
 use clowder_proto::PaneId;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
@@ -26,7 +27,18 @@ pub struct Pane {
 }
 
 impl Pane {
-    pub fn spawn(id: PaneId, cmd: PaneCommand, cols: u16, rows: u16, backlog_cap: usize) -> Result<Pane> {
+    /// `base` is the environment every child starts from — see `crate::login_env`. It is a
+    /// parameter rather than a field on `PaneCommand` on purpose: `PaneCommand` is built at a dozen
+    /// sites, and a field there would invite `env: vec![]`-style defaults that quietly reinstate
+    /// issue #76. Here the compiler enumerates the callers instead.
+    pub fn spawn(
+        id: PaneId,
+        cmd: PaneCommand,
+        cols: u16,
+        rows: u16,
+        backlog_cap: usize,
+        base: &PaneEnv,
+    ) -> Result<Pane> {
         let pty = native_pty_system();
         let pair = pty.openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })?;
 
@@ -35,6 +47,17 @@ impl Pane {
         if let Some(cwd) = &cmd.cwd {
             builder.cwd(cwd);
         }
+        // Discard portable-pty's own snapshot of the daemon's environment and state the child's
+        // outright. Without this the child would be "whatever the daemon inherited, plus whatever
+        // we remembered to override" — which under launchd is a PATH with no `claude` in it (#76).
+        //
+        // Note this also decides how the program is resolved: portable-pty searches THIS PATH, in
+        // the parent, before forking.
+        builder.env_clear();
+        for (k, v) in base.iter() {
+            builder.env(k, v);
+        }
+        // Per-pane vars last, so CLOWDER_AGENT_ID/CLOWDER_HOOK_SOCK beat anything else.
         for (k, v) in &cmd.env {
             builder.env(k, v);
         }
@@ -168,6 +191,11 @@ mod tests {
     use std::io::Read;
     use std::time::Duration;
 
+    /// The base environment these tests spawn against — the daemon's own, i.e. pre-#76 behaviour.
+    fn test_env() -> PaneEnv {
+        PaneEnv::inherited("/bin/sh")
+    }
+
     fn sh(script: &str) -> PaneCommand {
         PaneCommand {
             program: "/bin/sh".into(),
@@ -179,7 +207,7 @@ mod tests {
 
     #[tokio::test]
     async fn pane_captures_child_output_in_backlog() {
-        let pane = Pane::spawn(PaneId(1), sh("printf clowder-hello"), 80, 24, 256 * 1024).unwrap();
+        let pane = Pane::spawn(PaneId(1), sh("printf clowder-hello"), 80, 24, 256 * 1024, &test_env()).unwrap();
         // give the reader thread time to drain
         for _ in 0..50 {
             if pane.backlog().windows(13).any(|w| w == b"clowder-hello") {
@@ -198,7 +226,7 @@ mod tests {
     #[tokio::test]
     async fn pane_forwards_input_to_child() {
         // `cat` echoes stdin back to stdout
-        let pane = Pane::spawn(PaneId(2), sh("cat"), 80, 24, 256 * 1024).unwrap();
+        let pane = Pane::spawn(PaneId(2), sh("cat"), 80, 24, 256 * 1024, &test_env()).unwrap();
         let mut sub = pane.subscribe();
         pane.write_input(b"ping\n").unwrap();
         let mut seen = Vec::new();
@@ -218,7 +246,7 @@ mod tests {
     #[tokio::test]
     async fn snapshot_and_subscribe_is_atomic_with_reader_thread() {
         // `cat` echoes stdin back to stdout
-        let pane = Pane::spawn(PaneId(3), sh("cat"), 80, 24, 256 * 1024).unwrap();
+        let pane = Pane::spawn(PaneId(3), sh("cat"), 80, 24, 256 * 1024, &test_env()).unwrap();
         pane.write_input(b"before\n").unwrap();
 
         // Wait until "before" has landed in the backlog.
@@ -268,7 +296,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pidfile = dir.path().join("pid");
         let script = format!("echo $$ > {}; exec sleep 30", pidfile.display());
-        let pane = Pane::spawn(PaneId(9), sh(&script), 80, 24, 4096).unwrap();
+        let pane = Pane::spawn(PaneId(9), sh(&script), 80, 24, 4096, &test_env()).unwrap();
 
         // Wait for the child to write its PID.
         let mut pid = String::new();
@@ -295,5 +323,104 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(dead, "child process should be killed when its Pane is dropped");
+    }
+
+    /// Drain a pane's output until `needle` shows up, then return everything seen.
+    async fn wait_for(pane: &Pane, needle: &[u8]) -> Vec<u8> {
+        for _ in 0..100 {
+            let out = pane.backlog();
+            if out.windows(needle.len()).any(|w| w == needle) {
+                return out;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        pane.backlog()
+    }
+
+    #[tokio::test]
+    async fn a_child_sees_the_base_environment_and_nothing_else() {
+        // The regression guard for #76's other half: the child's environment must be exactly what
+        // the PaneEnv says, not "whatever the daemon happened to inherit". Without env_clear() this
+        // leaks every variable in the test process.
+        std::env::set_var("CLOWDER_PANE_LEAK_PROBE", "leaked");
+
+        let base = PaneEnv::resolve(
+            Some(
+                [("PATH".to_string(), "/usr/bin:/bin".to_string()), ("FROM_BASE".to_string(), "yes".to_string())]
+                    .into_iter()
+                    .collect(),
+            ),
+            Default::default(),
+            None,
+            "/bin/sh",
+        );
+        let cmd = PaneCommand {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), "printf 'base=%s leak=[%s]\\n' \"$FROM_BASE\" \"$CLOWDER_PANE_LEAK_PROBE\"".into()],
+            cwd: None,
+            env: vec![],
+        };
+        let pane = Pane::spawn(PaneId(11), cmd, 80, 24, 4096, &base).unwrap();
+        let out = wait_for(&pane, b"base=").await;
+        let out = String::from_utf8_lossy(&out);
+
+        std::env::remove_var("CLOWDER_PANE_LEAK_PROBE");
+        assert!(out.contains("base=yes"), "base env did not reach the child: {out:?}");
+        assert!(out.contains("leak=[]"), "the daemon's own environment leaked into the child: {out:?}");
+    }
+
+    #[tokio::test]
+    async fn per_pane_vars_win_over_the_base_environment() {
+        let base = PaneEnv::resolve(
+            Some([("CLOWDER_HOOK_SOCK".to_string(), "/from/base.sock".to_string())].into_iter().collect()),
+            Default::default(),
+            None,
+            "/bin/sh",
+        );
+        let cmd = PaneCommand {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), "printf 'sock=%s\\n' \"$CLOWDER_HOOK_SOCK\"".into()],
+            cwd: None,
+            env: vec![("CLOWDER_HOOK_SOCK".into(), "/per/pane.sock".into())],
+        };
+        let pane = Pane::spawn(PaneId(12), cmd, 80, 24, 4096, &base).unwrap();
+        let out = wait_for(&pane, b"sock=").await;
+        assert!(
+            String::from_utf8_lossy(&out).contains("sock=/per/pane.sock"),
+            "per-pane env must beat the base: {:?}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bare_program_name_resolves_against_the_base_path() {
+        // This is issue #76 in miniature: `claude` is launched by bare name, and the ONLY thing that
+        // decides whether it is found is the PATH in the PaneEnv.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("clowder-fake-agent");
+        std::fs::write(&bin, "#!/bin/sh\nprintf fake-agent-ran\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let base = PaneEnv::resolve(
+            Some([("PATH".to_string(), dir.path().to_string_lossy().into_owned())].into_iter().collect()),
+            Default::default(),
+            None,
+            "/bin/sh",
+        );
+        let cmd = PaneCommand {
+            program: "clowder-fake-agent".into(), // bare name, exactly like ClaudeAdapter
+            args: vec![],
+            // A cwd that does NOT contain the program, so PATH is genuinely what resolves it.
+            cwd: Some(std::env::temp_dir()),
+            env: vec![],
+        };
+        let pane = Pane::spawn(PaneId(13), cmd, 80, 24, 4096, &base).unwrap();
+        let out = wait_for(&pane, b"fake-agent-ran").await;
+        assert!(
+            out.windows(14).any(|w| w == b"fake-agent-ran"),
+            "a bare program name must resolve against the base PATH: {:?}",
+            String::from_utf8_lossy(&out)
+        );
     }
 }
