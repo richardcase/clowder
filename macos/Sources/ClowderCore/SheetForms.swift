@@ -44,3 +44,92 @@ public struct NewWorktreeForm: Equatable, Sendable {
         return nil
     }
 }
+
+/// The Hosts pane's editor state.
+///
+/// `nameError` mirrors `clowder_config::hosts::validate_name` and is checked against the same
+/// `docs/protocol/fixtures/host-names.json` the Rust validator is, so the two cannot drift. The CLI
+/// remains the authority — a value that slips through here still gets a clean error back.
+///
+/// NOTE: host names are validated **differently** from worktree names. `validate_name` allows `...`
+/// and `a..b` and has no `.lock` rule; `NewWorktreeForm.nameError` rejects all three. Do not merge them.
+public struct HostDraft: Equatable, Sendable {
+    public var name: String
+    public var address: String
+    public var tls: Bool
+    /// A token the user has typed. `nil` means "unchanged" for an existing host — the app never reads
+    /// a stored token back, only writes one.
+    public var token: String?
+    /// True when this draft creates a host rather than editing one.
+    public var isNew: Bool
+
+    public init(name: String = "", address: String = "", tls: Bool = false,
+                token: String? = nil, isNew: Bool = true) {
+        self.name = name
+        self.address = address
+        self.tls = tls
+        self.token = token
+        self.isNew = isNew
+    }
+
+    private static let maxName = 64
+
+    /// Nil when acceptable; otherwise a user-facing reason. Validates the value AS TYPED — no trimming
+    /// — so it agrees with the Rust validator, which also does not trim.
+    public var nameError: String? {
+        if name.isEmpty { return "Name must not be empty" }
+        // Count Unicode scalars, matching Rust's `chars().count()`. (For any name that passes the
+        // charset check below the two counts are identical, since it is ASCII by then — but matching
+        // the Rust rule exactly is cheaper than reasoning about when it matters.)
+        if name.unicodeScalars.count > Self.maxName {
+            return "Name must be \(Self.maxName) characters or fewer"
+        }
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "._-"))
+        if name.unicodeScalars.contains(where: { !allowed.contains($0) || !$0.isASCII }) {
+            return "Name may contain only letters, digits, '.', '_' or '-'"
+        }
+        // '.' is allowed above so "a.b" works, which lets these two through the charset check. The
+        // name becomes a socket directory (`<runtime>/clowder/remote/<name>/`), so '..' escapes it.
+        if name == "." || name == ".." { return "Name must not be '.' or '..'" }
+        return nil
+    }
+
+    /// Nil when acceptable. Requires an explicit port — there is no default to fall back on, since the
+    /// daemon's listen address is operator-chosen.
+    public var addressError: String? {
+        if address.isEmpty { return "Address must not be empty" }
+        if address.unicodeScalars.contains(where: { CharacterSet.whitespacesAndNewlines.contains($0) }) {
+            return "Address must not contain spaces"
+        }
+        guard let (host, port) = Self.splitHostPort(address), !host.isEmpty else {
+            return "Address must be host:port (or [ipv6]:port)"
+        }
+        guard let n = UInt16(port), n != 0 else { return "Address must end in a valid port" }
+        return nil
+    }
+
+    /// Nil when acceptable. A token is only ever sent over TLS — the CLI refuses the combination, so
+    /// say so before the user submits rather than after.
+    public var tlsError: String? {
+        let hasToken = !(token ?? "").isEmpty
+        return hasToken && !tls ? "A token requires TLS — turn on Use TLS, or clear the token" : nil
+    }
+
+    public var isValid: Bool { nameError == nil && addressError == nil && tlsError == nil }
+
+    /// Split `host:port` / `[v6]:port`. Nil when there is no port, or when a bare (unbracketed) IPv6
+    /// literal makes the split ambiguous.
+    private static func splitHostPort(_ s: String) -> (String, String)? {
+        if s.hasPrefix("[") {
+            guard let close = s.firstIndex(of: "]") else { return nil }
+            let host = String(s[s.index(after: s.startIndex)..<close])
+            let rest = s[s.index(after: close)...]
+            guard rest.hasPrefix(":") else { return nil }
+            return (host, String(rest.dropFirst()))
+        }
+        guard let colon = s.lastIndex(of: ":") else { return nil }
+        let host = String(s[s.startIndex..<colon])
+        if host.contains(":") { return nil }   // bare v6 literal — require brackets
+        return (host, String(s[s.index(after: colon)...]))
+    }
+}
