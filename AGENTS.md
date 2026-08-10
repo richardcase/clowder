@@ -39,21 +39,34 @@ source "$HOME/.cargo/env" && cargo test --workspace      # CI runs this with --l
 **Swift** (run inside `macos/`):
 
 ```sh
-cd macos && swift test         # ClowderCore unit tests — fast; COMPILES clowder-app too (see below)
+cd macos && swift test         # ClowderCore unit tests — builds the WHOLE graph first (see below)
 cd macos && swift build        # builds + LINKS clowder-app — REQUIRES the vendored libghostty
 cd macos && swift build -c release
 ```
 
-**`swift test` compiles `ClowderApp`, it just doesn't link it.** Only `ClowderCoreTests` runs, but
-SwiftPM builds the whole package graph first, so **a compile error anywhere in `ClowderApp` aborts
-`swift test` before a single test runs** — you get a compiler error, not a test failure. The
-practical consequence: a change to a `ClowderCore` signature that breaks a `ClowderApp` call site
-must fix that call site in the *same* commit, or the commit neither tests nor builds.
+**`swift test` builds the whole package graph, `ClowderApp` included.** Only `ClowderCoreTests`
+runs, but **a compile error anywhere in `ClowderApp` aborts `swift test` before a single test
+runs** — you get a compiler error, not a test failure. The practical consequence: a change to a
+`ClowderCore` signature that breaks a `ClowderApp` call site must fix that call site in the *same*
+commit, or the commit neither tests nor builds.
 
-`swift test` still does **not** need the vendored libghostty, because linking is what pulls in
-`ghostty-internal.a` and `swift test` never links the executable. Both halves verified 2026-08-08:
-moving the archive aside leaves 188 tests passing, and a deliberate syntax error in `ClowderApp`
-makes `swift test` fail to compile.
+**`swift test` also LINKS `clowder-app`, so it does need the vendored libghostty.** Verified
+2026-08-10 in a fresh worktree with no `macos/vendor/` and an empty `.build`: it fails at
+`[45/71] Linking clowder-app` with `no such file or directory: …/ghostty-internal.a`. (This
+supersedes an earlier note here claiming otherwise — that was measured against a warm `.build`,
+where the executable was already linked and SwiftPM had nothing to relink.)
+
+To compile-check Swift **without** the archive, build the targets individually — a `--target` build
+stops at the module, so there is no link step:
+
+```sh
+cd macos && swift build --target ClowderApp        # catches the ClowderApp break described above
+cd macos && swift build --target ClowderCoreTests  # + ClowderCore, transitively
+```
+
+Both verified 2026-08-10 with no `macos/vendor/`: they succeed, and a deliberate type error in
+`ClowderApp` makes the first one fail. They do **not** run any tests — for that you still need the
+archive.
 
 **Scripts** (`scripts/`):
 
@@ -78,7 +91,24 @@ The daemon owns the agent PTYs and binds three Unix sockets under `<runtime_dir>
 - `clowder-hook.sock` (agent hooks) — `CLOWDER_HOOK_SOCK`
 
 Config file: `$XDG_CONFIG_HOME/clowder/config.toml` (else `~/.config/clowder/config.toml`); other keys:
-`CLOWDER_BACKLOG_CAP` (default 262144), `SHELL`, default 80×24.
+`CLOWDER_BACKLOG_CAP` (default 262144), `SHELL`, `[env] capture_login` / `timeout_ms`, default 80×24.
+
+**Pane environment.** A GUI-launched `.app` is started by launchd, whose environment is
+`PATH=/usr/bin:/bin:/usr/sbin:/sbin` and *no* `SHELL` — useless to an agent. So after binding its
+sockets (and before `reconcile()`), the daemon runs `<login shell> -l -i -c` once, reads the result
+back as a NUL-delimited `env -0` dump framed by per-run nonce markers, and uses it as the base
+environment for **every** PTY child. Both flags matter: `-l` gets `/etc/zprofile` (`path_helper`) and
+`~/.zprofile` where Homebrew lands, `-i` gets `~/.zshrc` where nvm/mise and the Claude native
+installer land. The daemon still wins on `CLOWDER_*` and `TERM`, and prepends its own bin dir to
+`PATH`; `PWD`/`OLDPWD`/`SHLVL`/`_`/`COLUMNS`/`LINES` describe the capture rather than the pane and are
+stripped. Disable with `[env] capture_login = false` / `CLOWDER_CAPTURE_LOGIN_ENV=0`; timeout via
+`[env] timeout_ms` / `CLOWDER_LOGIN_ENV_TIMEOUT_MS` (3 s, clamped to 1–30 s). On failure or timeout
+the daemon warns to `daemon.log` and panes inherit its own environment (the pre-#76 behaviour).
+
+The **login shell** resolves `$SHELL` › `[pane] shell` › `getpwuid(getuid())->pw_shell` › `/bin/sh`.
+The passwd tier is not optional: launchd sets no `SHELL`, and a login `zsh` does not export one
+either, so capturing a login environment cannot supply it. See
+`docs/superpowers/specs/2026-08-10-clowder-login-env-capture-design.md`.
 
 **Worktrees live outside the project** (`[worktrees] base` / `CLOWDER_WORKTREE_BASE`), defaulting to
 `$XDG_DATA_HOME/clowder/worktrees` › `~/.local/share/clowder/worktrees`. The per-agent path is
@@ -141,6 +171,12 @@ is now the one place that computes it, and the app is the only caller that passe
   `$XDG_STATE_HOME/clowder/daemon.log` › `~/.local/state/clowder/daemon.log`. A GUI-launched `.app`
   has no terminal, so this is the *only* place startup failures are visible — check it first when the
   app can't reach the daemon. Appends across relaunches; truncated past 4 MB.
+- **Agent "command not found":** almost always the pane environment, not the adapter. `portable-pty`
+  resolves a bare program name (`claude`, `codex`) **in the parent, before forking**, against the
+  `CommandBuilder`'s *own* `PATH` — which `Pane::spawn` sets from the daemon's `PaneEnv` after an
+  `env_clear()`. So the answer is always the `login-env captured` line in `daemon.log`, never the
+  daemon's inherited environment. (It also tries `<cwd>/<program>` *before* `PATH` for a relative
+  name, so a file named `claude` in a worktree would win — pre-existing, not currently guarded.)
 
 ## CI
 
