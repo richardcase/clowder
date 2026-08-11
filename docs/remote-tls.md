@@ -249,6 +249,12 @@ commands) but does nothing for a MITM that was there for both.
   client. Credential files are written `0600` (owner-only); treat leakage the same as any other secret
   and rotate (see Rotation above — deleting `remote-token` and restarting also regenerates the cert, so
   clients will need to re-trust) if you suspect exposure.
+- **Agent profiles persist a remote client's influence.** Control-socket access already means a
+  remote client can spawn agents — that's arbitrary code execution, nothing new. What agent profiles
+  add is *durability*: a profile a remote session writes stays in `agent-profiles.json` after that
+  session ends, and can alter the argv of a `claude`/`codex`/`shell` run the *local* user starts later
+  (e.g. via an edited args template). Previously a remote session left no lasting influence over what
+  the local user's own agents run; now it can. Not a new capability, but worth naming plainly.
 
 **Deferred (not in this phase):** mutual TLS (client certs), QUIC transport, a pinned-pairing UX (e.g.
 QR/short-code exchange instead of manual fingerprint comparison), and OS Keychain storage for the token
