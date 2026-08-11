@@ -3,6 +3,8 @@
 
 use std::path::Path;
 
+use serde::{Deserialize, Serialize};
+
 /// Every token an argument template may use. One exact spelling each — `{{ x }}` and `{{X}}` are
 /// errors, not silently-accepted variants, so a typo can never reach an agent's argv as a literal.
 pub const TOKENS: &[&str] = &[
@@ -164,6 +166,100 @@ pub fn split_args(s: &str) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
+const MAX_DISPLAY_NAME: usize = 64;
+
+/// One agent profile, as stored in `agent-profiles.json` and as edited in the UI.
+///
+/// Evolved by ADDITIVE `#[serde(default)]` fields only — the mechanism proven by
+/// `AgentRecord::tree` and `HostRecord::fingerprint`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentProfile {
+    /// Stable, spawnable (`clowder spawn <project> <name> <id>`), and recorded on every agent
+    /// spawned from it.
+    pub id: String,
+    /// The built-in adapter this wraps: `claude`, `codex` or `shell`.
+    pub base: String,
+    pub display_name: String,
+    #[serde(default = "enabled_default")]
+    pub enabled: bool,
+    /// The argument template exactly as typed. Split and substituted at spawn.
+    #[serde(default)]
+    pub args: String,
+}
+
+fn enabled_default() -> bool {
+    true
+}
+
+/// A profile as the daemon presents it, after merging the stored rows over the built-in defaults.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveProfile {
+    pub profile: AgentProfile,
+    /// True for the adapters that ship with clowder. They can be edited and disabled, never removed.
+    pub builtin: bool,
+}
+
+/// Profile ids follow the host-name rule. Deliberately delegated rather than re-stated: one narrow,
+/// already-mirrored charset is worth more than a third bespoke validator.
+pub fn validate_id(id: &str) -> Result<(), String> {
+    crate::hosts::validate_name(id)
+}
+
+/// Full validation of a profile the user is trying to store. `builtins` is `(id, display_name)`.
+pub fn validate_profile(p: &AgentProfile, builtins: &[(&str, &str)]) -> Result<(), String> {
+    validate_id(&p.id)?;
+    if p.display_name.trim().is_empty() {
+        return Err("display name must not be empty".into());
+    }
+    if p.display_name.chars().count() > MAX_DISPLAY_NAME {
+        return Err(format!("display name must be at most {MAX_DISPLAY_NAME} characters"));
+    }
+    if !builtins.iter().any(|(id, _)| *id == p.base) {
+        return Err(format!(
+            "unknown agent {:?} — must be one of {}",
+            p.base,
+            builtins.iter().map(|(id, _)| *id).collect::<Vec<_>>().join(", ")
+        ));
+    }
+    validate_template(&p.args)
+}
+
+/// The effective profile list: the built-ins in descriptor order (each replaced wholesale by its
+/// stored row, if any), then the user-created rows in file order.
+///
+/// The file holds only DELTAS, so a built-in added in a future release appears automatically
+/// instead of being masked by a stale saved list, and "reset to default" is deleting a row.
+/// Rows naming an unknown `base` are dropped — a hand-edited file must never wedge the daemon.
+pub fn merged_profiles(rows: Vec<AgentProfile>, builtins: &[(&str, &str)]) -> Vec<EffectiveProfile> {
+    let mut out: Vec<EffectiveProfile> = builtins
+        .iter()
+        .map(|(id, label)| {
+            let profile = match rows.iter().find(|r| r.id == *id) {
+                // A built-in's base is fixed by its id: a hand-edited row cannot repoint `shell`
+                // at `claude` and change what a running agent resumes as.
+                Some(row) => AgentProfile { base: (*id).to_string(), ..row.clone() },
+                None => AgentProfile {
+                    id: (*id).to_string(),
+                    base: (*id).to_string(),
+                    display_name: (*label).to_string(),
+                    enabled: true,
+                    args: String::new(),
+                },
+            };
+            EffectiveProfile { profile, builtin: true }
+        })
+        .collect();
+
+    out.extend(
+        rows.into_iter()
+            .filter(|r| !builtins.iter().any(|(id, _)| *id == r.id))
+            .filter(|r| builtins.iter().any(|(id, _)| *id == r.base))
+            .map(|profile| EffectiveProfile { profile, builtin: false }),
+    );
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,5 +382,109 @@ mod tests {
     fn repeated_and_adjacent_tokens_all_substitute() {
         let argv = split_args("{{workspace_name}}-{{workspace_name}}").unwrap();
         assert_eq!(substitute(&argv, &ctx()), vec!["task-a-task-a"]);
+    }
+
+    const BUILTINS: &[(&str, &str)] = &[("claude", "Claude Code"), ("codex", "OpenAI Codex"), ("shell", "Shell")];
+
+    fn profile(id: &str, base: &str) -> AgentProfile {
+        AgentProfile {
+            id: id.into(),
+            base: base.into(),
+            display_name: format!("{id} label"),
+            enabled: true,
+            args: String::new(),
+        }
+    }
+
+    #[test]
+    fn merge_with_no_rows_is_exactly_the_builtins() {
+        let out = merged_profiles(vec![], BUILTINS);
+        assert_eq!(
+            out.iter().map(|e| e.profile.id.as_str()).collect::<Vec<_>>(),
+            vec!["claude", "codex", "shell"]
+        );
+        assert!(out.iter().all(|e| e.builtin && e.profile.enabled));
+        assert_eq!(out[0].profile.display_name, "Claude Code");
+        assert_eq!(out[0].profile.base, "claude");
+        assert_eq!(out[0].profile.args, "");
+    }
+
+    #[test]
+    fn a_row_overrides_its_builtin_in_place() {
+        let mut row = profile("codex", "codex");
+        row.enabled = false;
+        row.display_name = "Codex (off)".into();
+        let out = merged_profiles(vec![row], BUILTINS);
+        assert_eq!(out.len(), 3, "an override must not add a row");
+        let codex = out.iter().find(|e| e.profile.id == "codex").unwrap();
+        assert!(!codex.profile.enabled);
+        assert_eq!(codex.profile.display_name, "Codex (off)");
+        assert!(codex.builtin, "an overridden builtin is still a builtin");
+        assert_eq!(out[1].profile.id, "codex", "builtins keep descriptor order");
+    }
+
+    #[test]
+    fn user_rows_follow_the_builtins_in_file_order() {
+        let out = merged_profiles(vec![profile("opus", "claude"), profile("plan", "claude")], BUILTINS);
+        assert_eq!(
+            out.iter().map(|e| e.profile.id.as_str()).collect::<Vec<_>>(),
+            vec!["claude", "codex", "shell", "opus", "plan"]
+        );
+        assert!(!out[3].builtin && !out[4].builtin);
+    }
+
+    #[test]
+    fn rows_with_an_unknown_base_are_dropped_not_fatal() {
+        // A hand-edited file must never wedge the daemon; it just loses the bad row.
+        let out = merged_profiles(vec![profile("weird", "emacs")], BUILTINS);
+        assert_eq!(out.len(), 3);
+    }
+
+    #[test]
+    fn an_override_row_cannot_change_a_builtins_base() {
+        let mut row = profile("shell", "claude"); // hand-edited nonsense
+        row.display_name = "Shell".into();
+        let out = merged_profiles(vec![row], BUILTINS);
+        let shell = out.iter().find(|e| e.profile.id == "shell").unwrap();
+        assert_eq!(shell.profile.base, "shell", "a builtin's base is fixed by its id");
+    }
+
+    #[test]
+    fn validate_profile_rejects_bad_ids_names_and_bases() {
+        assert!(validate_profile(&profile("opus", "claude"), BUILTINS).is_ok());
+
+        let mut bad_id = profile("has space", "claude");
+        bad_id.display_name = "x".into();
+        assert!(validate_profile(&bad_id, BUILTINS).is_err());
+
+        let mut bad_base = profile("x", "emacs");
+        bad_base.display_name = "x".into();
+        let e = validate_profile(&bad_base, BUILTINS).unwrap_err();
+        assert!(e.contains("emacs") && e.contains("claude"), "must name the bad base and the valid ones: {e}");
+
+        let mut blank = profile("x", "claude");
+        blank.display_name = "  ".into();
+        assert!(validate_profile(&blank, BUILTINS).is_err(), "a blank display name is unusable in a picker");
+
+        let mut bad_args = profile("x", "claude");
+        bad_args.args = "--x {{nope}}".into();
+        assert!(validate_profile(&bad_args, BUILTINS).is_err());
+    }
+
+    #[test]
+    fn profile_json_is_camel_case_and_survives_a_round_trip() {
+        let p = profile("opus", "claude");
+        let s = serde_json::to_string(&p).unwrap();
+        assert!(s.contains(r#""displayName":"opus label""#), "{s}");
+        assert_eq!(serde_json::from_str::<AgentProfile>(&s).unwrap(), p);
+    }
+
+    #[test]
+    fn a_row_missing_optional_fields_still_loads() {
+        // Additive-field evolution, as with AgentRecord::tree: a minimal hand-written row works.
+        let p: AgentProfile =
+            serde_json::from_str(r#"{"id":"opus","base":"claude","displayName":"Opus"}"#).unwrap();
+        assert!(p.enabled, "a row without `enabled` defaults to enabled");
+        assert_eq!(p.args, "");
     }
 }
