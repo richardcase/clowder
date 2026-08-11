@@ -164,14 +164,19 @@ pub fn adapter_descriptors() -> &'static [AdapterDescriptor] {
 /// Accepts both the CLI-facing spawn id ("shell", the descriptor a client picks from
 /// `adapter_descriptors()`) and "synthetic" (what `SyntheticAdapter::id()` self-reports and
 /// therefore what `spawn_agent` persists into the registry for a shell-spawned agent) — both
-/// resolve to the same default env-`$SHELL` adapter, so `reconcile` can round-trip a shell
-/// agent's `adapter_id` back into a spawnable adapter after a restart.
-pub fn build_adapter(id: &str) -> Option<Box<dyn AgentAdapter>> {
+/// resolve to the same shell adapter, so `reconcile` can round-trip a shell agent's `adapter_id`
+/// back into a spawnable adapter after a restart.
+///
+/// `shell` is passed in rather than read from `$SHELL` here. That variable is unset under launchd,
+/// and this picks the *program* to run — so unlike everything else the pane environment fixes, no
+/// amount of environment repair would reach it: a GUI-launched app would silently run `/bin/sh` for
+/// every shell agent (#76). The daemon passes its own resolved `shell`.
+pub fn build_adapter(id: &str, shell: &str) -> Option<Box<dyn AgentAdapter>> {
     match id {
         "claude" => Some(Box::new(ClaudeAdapter)),
         "codex" => Some(Box::new(CodexAdapter)),
         "shell" | "synthetic" => {
-            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+            let shell = shell.to_string();
             Some(Box::new(SyntheticAdapter {
                 command: PaneCommand { program: shell, args: vec![], cwd: None, env: vec![] },
             }))
@@ -245,10 +250,20 @@ mod tests {
 
     #[test]
     fn registry_builds_known_adapters_and_rejects_unknown() {
-        assert_eq!(build_adapter("claude").unwrap().id(), "claude");
-        assert_eq!(build_adapter("codex").unwrap().id(), "codex");
-        assert_eq!(build_adapter("shell").unwrap().id(), "synthetic"); // shell → SyntheticAdapter
-        assert!(build_adapter("nope").is_none());
+        assert_eq!(build_adapter("claude", "/bin/sh").unwrap().id(), "claude");
+        assert_eq!(build_adapter("codex", "/bin/sh").unwrap().id(), "codex");
+        assert_eq!(build_adapter("shell", "/bin/sh").unwrap().id(), "synthetic"); // shell → SyntheticAdapter
+        assert!(build_adapter("nope", "/bin/sh").is_none());
+    }
+
+    #[test]
+    fn the_shell_adapter_runs_the_shell_it_was_given() {
+        // Not $SHELL: under launchd there isn't one, and this picks the program to exec (#76).
+        let a = build_adapter("shell", "/opt/homebrew/bin/fish").unwrap();
+        assert_eq!(a.launch_command(Path::new("/tmp/ws")).program, "/opt/homebrew/bin/fish");
+        // "synthetic" is the id the registry persists for a shell agent; it must round-trip too.
+        let a = build_adapter("synthetic", "/bin/zsh").unwrap();
+        assert_eq!(a.launch_command(Path::new("/tmp/ws")).program, "/bin/zsh");
     }
 
     #[test]

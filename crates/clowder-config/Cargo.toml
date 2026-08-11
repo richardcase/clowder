@@ -9,6 +9,9 @@ serde = { workspace = true }
 toml = "0.8"
 serde_json = "1"
 rustix = { version = "0.38", features = ["fs"] }
+# Only for getpwuid(): the passwd database is libc/NSS, not a syscall, so rustix has no binding.
+# Already in Cargo.lock transitively (portable-pty/nix), so this adds an edge, not a crate.
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

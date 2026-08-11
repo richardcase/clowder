@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod instance;
 pub mod logging;
+pub mod login_env;
 pub mod pane;
 pub mod server;
 pub mod notify;
@@ -18,6 +19,7 @@ pub use agent::{
     adapter_descriptors, build_adapter, AdapterDescriptor, AgentAdapter, ClaudeAdapter, CodexAdapter,
     SyntheticAdapter,
 };
+pub use login_env::{CaptureSpec, PaneEnv};
 pub use pane::{Pane, PaneCommand};
 pub use server::Daemon;
 pub use notify::{FakeNotifier, Notifier, OsNotifier};

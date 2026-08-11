@@ -72,6 +72,9 @@ pub struct Daemon {
     pub(crate) default_cols: u16,
     pub(crate) default_rows: u16,
     pub(crate) shell: String,
+    /// The environment every PTY child starts from. Resolved once at startup (see
+    /// `crate::login_env`) because a GUI-launched app's own environment is useless to an agent.
+    pane_env: Arc<crate::login_env::PaneEnv>,
     registry: Arc<crate::registry::Registry>,
     projects: Arc<crate::projects::ProjectStore>,
     /// Where worktrees are provisioned. The SAME value the `ProjectStore` holds (both are built
@@ -133,6 +136,10 @@ impl Daemon {
         let (removed_tx, _) = broadcast::channel(256);
         let (split_tx, _) = broadcast::channel(256);
         let (projects_tx, _) = broadcast::channel(256);
+        // `$SHELL` is unset under launchd, so this must consult the passwd database — otherwise
+        // every companion pane in the packaged app runs /bin/sh (#76).
+        let shell = clowder_config::login_shell();
+        let pane_env = Arc::new(crate::login_env::PaneEnv::inherited(&shell));
         Daemon {
             panes: Arc::new(Mutex::new(HashMap::new())),
             next_id: AtomicU64::new(1),
@@ -154,7 +161,8 @@ impl Daemon {
             backlog_cap: 256 * 1024,
             default_cols: 80,
             default_rows: 24,
-            shell: std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()),
+            shell,
+            pane_env,
             registry: Arc::new(crate::registry::Registry::new(registry_path)),
             projects: Arc::new(crate::projects::ProjectStore::new(projects_path, worktrees.clone())),
             worktrees,
@@ -184,7 +192,23 @@ impl Daemon {
         d.default_cols = config.default_cols;
         d.default_rows = config.default_rows;
         d.shell = config.shell;
+        d.pane_env = Arc::new(crate::login_env::PaneEnv::inherited(&d.shell));
         d
+    }
+
+    /// Install the environment every PTY child will start from, replacing the inherited default.
+    ///
+    /// A consuming builder rather than a `new_from_config` parameter because the capture is async
+    /// and must happen *after* the daemon's sockets are bound — see `main.rs`.
+    pub fn with_pane_env(mut self, env: crate::login_env::PaneEnv) -> Daemon {
+        self.pane_env = Arc::new(env);
+        self
+    }
+
+    /// The single door to `Pane::spawn`. Every pane the daemon creates goes through here, so the
+    /// three call sites cannot drift on which environment they hand the child.
+    fn spawn_pane_in_env(&self, id: PaneId, cmd: PaneCommand, cols: u16, rows: u16) -> anyhow::Result<Pane> {
+        Pane::spawn(id, cmd, cols, rows, self.backlog_cap, &self.pane_env)
     }
 
     pub fn subscribe_projects(&self) -> broadcast::Receiver<ProjectChange> {
@@ -418,7 +442,7 @@ impl Daemon {
         }
         let kind = clowder_workspace::WorkspaceKind::from_str(&rec.workspace_kind)
             .ok_or_else(|| anyhow::anyhow!("unknown workspace kind {:?}", rec.workspace_kind))?;
-        let adapter = crate::agent::build_adapter(&rec.adapter_id)
+        let adapter = crate::agent::build_adapter(&rec.adapter_id, &self.shell)
             .ok_or_else(|| anyhow::anyhow!("unknown adapter {:?}", rec.adapter_id))?;
         let ws = Workspace {
             path: rec.worktree_path.clone(),
@@ -431,7 +455,7 @@ impl Daemon {
         cmd.cwd = Some(ws.path.clone());
         cmd.env.push(("CLOWDER_AGENT_ID".into(), id.0.to_string()));
         cmd.env.push(("CLOWDER_HOOK_SOCK".into(), self.hook_sock.to_string_lossy().to_string()));
-        let pane = Pane::spawn(id, cmd, rec.cols, rec.rows, self.backlog_cap)?;
+        let pane = self.spawn_pane_in_env(id, cmd, rec.cols, rec.rows)?;
         let restore_cwd = ws.path.clone();
         self.finalize_agent(id, pane, ws, &rec.task, adapter.as_ref());
         if let Some(tree) = rec.tree.clone() {
@@ -507,7 +531,7 @@ impl Daemon {
 
     pub fn spawn_pane(&self, cmd: PaneCommand, cols: u16, rows: u16) -> Result<PaneId> {
         let id = self.alloc_id();
-        let pane = Pane::spawn(id, cmd, cols, rows, self.backlog_cap)?;
+        let pane = self.spawn_pane_in_env(id, cmd, cols, rows)?;
         self.register_pane(id, pane);
         Ok(id)
     }
@@ -557,7 +581,7 @@ impl Daemon {
             cmd.env.push(("CLOWDER_AGENT_ID".into(), id.0.to_string()));
             cmd.env.push(("CLOWDER_HOOK_SOCK".into(), self.hook_sock.to_string_lossy().to_string()));
 
-            Pane::spawn(id, cmd, self.default_cols, self.default_rows, self.backlog_cap)
+            self.spawn_pane_in_env(id, cmd, self.default_cols, self.default_rows)
         })() {
             Ok(p) => p,
             Err(e) => {

@@ -151,6 +151,10 @@ func makeBackendSupervisor(plan: BackendPlan) -> DaemonSupervisor? {
     for (k, v) in plan.envOverlay { env[k] = v }
     // The forwarder shells out to nothing, but the daemon spawns agent adapters — keep the bundled
     // binaries first on PATH so `clowder-hook` resolves.
+    //
+    // Belt-and-braces only, since #76: this PATH is launchd's when the app is opened from Finder,
+    // and the daemon no longer trusts it for panes — it captures the user's login environment and
+    // re-prepends its own bin dir itself. Nothing here reaches an agent's PATH any more.
     let binDir = (execPath as NSString).deletingLastPathComponent
     env["PATH"] = binDir + ":" + (env["PATH"] ?? "/usr/bin:/bin")
 
