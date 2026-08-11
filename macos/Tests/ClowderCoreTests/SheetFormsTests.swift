@@ -160,4 +160,28 @@ final class AgentProfileDraftTests: XCTestCase {
         XCTAssertNotNil(d.argsError)
         XCTAssertFalse(d.isValid)
     }
+
+    func testNewlineOnlyDisplayNameIsBlank() {
+        // Mirrors clowder_config::agents::validate_profile, which uses `trim()` (strips newlines) —
+        // not just `.whitespaces`, which in Foundation does NOT include newlines. A "\n" name must
+        // be rejected here exactly as the daemon would reject it.
+        let d = AgentProfileDraft(id: "opus", base: "claude", displayName: "\n", enabled: true,
+                                  args: "", isNew: true)
+        XCTAssertNotNil(d.displayNameError, "a newline-only name must count as blank")
+        XCTAssertFalse(d.isValid)
+    }
+
+    func testArgsAtTheLengthLimitIsAccepted() {
+        let d = AgentProfileDraft(id: "opus", base: "claude", displayName: "Opus", enabled: true,
+                                  args: String(repeating: "a", count: 4096), isNew: true)
+        XCTAssertNil(d.argsError, "4096 chars is the boundary, still valid")
+        XCTAssertTrue(d.isValid)
+    }
+
+    func testArgsOverTheLengthLimitIsRejected() {
+        let d = AgentProfileDraft(id: "opus", base: "claude", displayName: "Opus", enabled: true,
+                                  args: String(repeating: "a", count: 4097), isNew: true)
+        XCTAssertNotNil(d.argsError, "4097 chars exceeds the args limit")
+        XCTAssertFalse(d.isValid)
+    }
 }

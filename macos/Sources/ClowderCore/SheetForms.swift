@@ -168,6 +168,8 @@ public struct AgentProfileDraft: Equatable, Sendable {
     public static let bases = ["claude", "codex", "shell"]
 
     private static let maxDisplayName = 64
+    /// Mirrors `clowder_config::agents::MAX_ARGS` — see `argsError`.
+    private static let maxArgs = 4096
 
     /// Nil when acceptable. Same rule as a host name — see `HostDraft.nameError`.
     public var idError: String? {
@@ -177,14 +179,22 @@ public struct AgentProfileDraft: Equatable, Sendable {
     }
 
     public var displayNameError: String? {
-        if displayName.trimmingCharacters(in: .whitespaces).isEmpty { return "Name must not be empty" }
+        if displayName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return "Name must not be empty" }
         if displayName.unicodeScalars.count > Self.maxDisplayName {
             return "Name must be \(Self.maxDisplayName) characters or fewer"
         }
         return nil
     }
 
-    public var argsError: String? { AgentArgs.templateError(args) }
+    /// Nil when acceptable. The length bound mirrors `validate_profile`'s `MAX_ARGS` check — same
+    /// threshold, counted the same way (Unicode scalars, matching Rust's `chars().count()`) — so the
+    /// editor refuses an over-long template before the daemon does.
+    public var argsError: String? {
+        if args.unicodeScalars.count > Self.maxArgs {
+            return "Args must be \(Self.maxArgs) characters or fewer"
+        }
+        return AgentArgs.templateError(args)
+    }
 
     public var isValid: Bool { idError == nil && displayNameError == nil && argsError == nil }
 }

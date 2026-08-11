@@ -28,6 +28,12 @@ pub struct AgentProfileStore {
 }
 
 impl AgentProfileStore {
+    /// Caps the stored-row count so a control client (including a remote one) cannot make every
+    /// mutation rewrite an ever-growing file and re-broadcast an ever-growing list to every
+    /// connected client. Counts stored rows (built-in overrides + user profiles), not the
+    /// effective list, since that is what actually gets persisted and broadcast.
+    const MAX_STORED_PROFILES: usize = 200;
+
     pub fn new(path: PathBuf) -> Self {
         Self { store: JsonStore::new(path) }
     }
@@ -77,6 +83,12 @@ impl AgentProfileStore {
             .try_mutate(move |all| {
                 if Self::contains_id(all, &profile.id) {
                     return Err(format!("an agent named {} already exists", profile.id));
+                }
+                if all.len() >= Self::MAX_STORED_PROFILES {
+                    return Err(format!(
+                        "cannot store more than {} agent profiles — remove one first",
+                        Self::MAX_STORED_PROFILES
+                    ));
                 }
                 all.push(profile);
                 Ok(())
@@ -287,6 +299,18 @@ mod tests {
         assert_eq!(p.file_name().unwrap(), "agent-profiles.json");
         assert_ne!(p, crate::registry::Registry::default_path(), "must not collide with the agent registry");
         assert_ne!(p, crate::projects::ProjectStore::default_path(), "must not collide with the project store");
+    }
+
+    #[test]
+    fn add_refuses_past_the_stored_profile_cap() {
+        let (_d, s) = store();
+        for i in 0..AgentProfileStore::MAX_STORED_PROFILES {
+            let mut p = opus();
+            p.id = format!("opus-{i}");
+            s.add(p).unwrap();
+        }
+        let e = s.add(opus()).unwrap_err().to_string();
+        assert!(e.contains("200"), "must name the limit: {e}");
     }
 
     #[test]

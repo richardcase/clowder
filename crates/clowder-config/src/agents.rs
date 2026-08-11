@@ -167,6 +167,7 @@ pub fn split_args(s: &str) -> Result<Vec<String>, String> {
 }
 
 const MAX_DISPLAY_NAME: usize = 64;
+const MAX_ARGS: usize = 4096;
 
 /// One agent profile, as stored in `agent-profiles.json` and as edited in the UI.
 ///
@@ -231,6 +232,9 @@ pub fn validate_profile(p: &AgentProfile, builtins: &[(&str, &str)]) -> Result<(
             "{} is a built-in agent — its base must be {:?}, not {:?}",
             p.id, p.id, p.base
         ));
+    }
+    if p.args.chars().count() > MAX_ARGS {
+        return Err(format!("args must be at most {MAX_ARGS} characters"));
     }
     validate_template(&p.args)
 }
@@ -524,6 +528,26 @@ mod tests {
         let mut bad_args = profile("x", "claude");
         bad_args.args = "--x {{nope}}".into();
         assert!(validate_profile(&bad_args, BUILTINS).is_err());
+
+        let mut newline_name = profile("x", "claude");
+        newline_name.display_name = "\n".into();
+        assert!(
+            validate_profile(&newline_name, BUILTINS).is_err(),
+            "a newline-only display name must count as blank, matching the Swift editor"
+        );
+    }
+
+    #[test]
+    fn validate_profile_bounds_args_length() {
+        let mut at_limit = profile("x", "claude");
+        at_limit.args = "a".repeat(MAX_ARGS);
+        assert_eq!(at_limit.args.chars().count(), MAX_ARGS);
+        assert!(validate_profile(&at_limit, BUILTINS).is_ok(), "4096 chars is the boundary, still valid");
+
+        let mut over_limit = profile("x", "claude");
+        over_limit.args = "a".repeat(MAX_ARGS + 1);
+        let e = validate_profile(&over_limit, BUILTINS).unwrap_err();
+        assert!(e.contains("4096"), "must name the limit: {e}");
     }
 
     #[test]
