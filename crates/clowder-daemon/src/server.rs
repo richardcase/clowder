@@ -3780,34 +3780,45 @@ mod tests {
         d1.add_project(repo.path()).unwrap();
 
         // A real profile in the store, so there is something to edit/delete "out from under" the
-        // agent below — not just a `profile_id` string with nothing backing it.
+        // agent below — not just a `profile_id` string with nothing backing it. Its template is a
+        // `-c '<command>'` pair: `resume_agent` rebuilds the adapter from `rec.adapter_id`
+        // ("synthetic", since that's all `SyntheticAdapter::id()` ever reports) via
+        // `build_adapter`, which for "shell"/"synthetic" launches the test host's real `$SHELL`
+        // with no memory of our custom launch command — so the RESUMED process is genuinely
+        // `$SHELL -c "echo RESUME-OK:clowder/demo"`. Every POSIX-ish shell (bash/zsh/dash/sh)
+        // understands `-c`, so this observes the real recorded ARGUMENTS through the real,
+        // unmodified `$SHELL` — no faked binary, no `set_var`, no global lock. The `RESUME-OK:`
+        // prefix matters: a bare branch name is NOT a safe thing to search for on its own — an
+        // interactive shell with no `-c` (i.e. the args-dropped regression this test exists to
+        // catch) still starts a real login shell rooted in the worktree, and a git-aware prompt
+        // (oh-my-zsh, powerlevel10k, etc.) may print the current branch name in its OWN prompt,
+        // which would make a bare `"clowder/demo"` search pass for the wrong reason. No prompt
+        // theme prints `RESUME-OK:<branch>` as one token.
         d1.add_agent_profile(clowder_proto::AgentProfileInfo {
             id: "echoer".into(),
             base: "shell".into(),
             display_name: "Echoer".into(),
             enabled: true,
-            args: "--tag {{branch}}".into(),
+            args: "-c 'echo RESUME-OK:{{branch}}'".into(),
             builtin: false,
         })
         .unwrap();
 
-        // Spawned directly against a `SyntheticAdapter` (not through `resolve_profile` +
-        // `build_adapter("shell")`, which would launch the test host's real `$SHELL` — fine for
-        // the INITIAL spawn but not what we're resuming into, see below) — but recorded with the
-        // same `profile_id`/substituted `arg_template` a real `spawn_from_control("echoer")` would
-        // have produced.
+        // Spawned directly against a `SyntheticAdapter` (its launch command is never used for the
+        // resume below — see the comment above) but recorded with the same `profile_id`/
+        // substituted `arg_template` a real `spawn_from_control("echoer")` would have produced.
         let adapter = SyntheticAdapter {
             command: PaneCommand { program: "/bin/sh".into(), args: vec!["-c".into(), "true".into()], cwd: None, env: vec![] },
         };
         let spec = SpawnSpec {
             adapter: &adapter,
             profile_id: Some("echoer".into()),
-            arg_template: clowder_config::agents::split_args("--tag {{branch}}").unwrap(),
+            arg_template: clowder_config::agents::split_args("-c 'echo RESUME-OK:{{branch}}'").unwrap(),
         };
         let pane = d1.spawn_agent(repo.path(), spec, "demo").unwrap();
 
         let rec = d1.registry_for_test().load().into_iter().find(|r| r.agent_id == pane.0).unwrap();
-        assert_eq!(rec.extra_args, vec!["--tag", "clowder/demo"], "substituted once, at spawn");
+        assert_eq!(rec.extra_args, vec!["-c", "echo RESUME-OK:clowder/demo"], "substituted once, at spawn");
 
         // Change the profile out from under the (about-to-be-resumed) agent: edit its args to
         // something clearly different, then remove it outright — the stronger guarantee.
@@ -3816,7 +3827,7 @@ mod tests {
             base: "shell".into(),
             display_name: "Echoer".into(),
             enabled: true,
-            args: "--tag SOMETHING-ELSE-ENTIRELY".into(),
+            args: "-c 'echo SOMETHING-ELSE-ENTIRELY'".into(),
             builtin: false,
         })
         .unwrap();
@@ -3824,48 +3835,27 @@ mod tests {
         assert!(d1.resolve_profile("echoer").is_err(), "profile is genuinely gone");
         d1.shutdown();
 
-        // `resume_agent` (shared by `reconcile` and `restart_worktree`) rebuilds the adapter from
-        // `rec.adapter_id` — "synthetic", since that's all `SyntheticAdapter::id()` ever reports —
-        // via `build_adapter`, which for "shell"/"synthetic" always launches whatever `$SHELL`
-        // currently is; the daemon has no memory of our custom launch command. So the RESUMED
-        // process is `$SHELL --tag clowder/demo`. To observe that process's real argv
-        // deterministically — without depending on the test host's login shell's own argv
-        // handling, or requiring a `claude`/`codex` binary CI does not have — point `$SHELL` at a
-        // tiny script we control that just echoes its argv. `SHELL_ENV_LOCK` brackets the whole
-        // span `build_adapter` can read it in.
-        let script_path = state.path().join("fake_shell.sh");
-        std::fs::write(&script_path, "#!/bin/sh\necho \"ARGV:$@\"\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-
-        let _shell_lock = crate::SHELL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev_shell = std::env::var("SHELL").ok();
-        std::env::set_var("SHELL", &script_path);
-
+        // Fresh daemon, same registry + worktree base: the daemon-restart path.
         let d2 = test_daemon_in(state.path());
         d2.reconcile();
 
         let resumed = d2.get(pane).unwrap();
+        // Content-based predicate (matches the spawn-side test's pattern), not just "non-empty" —
+        // a partial first PTY read (e.g. just a shell prompt) would otherwise break the loop
+        // before the real output lands, making the assertions below pass or fail for the wrong
+        // reason.
         let mut out = Vec::new();
         for _ in 0..50 {
             out = resumed.backlog();
-            if !out.is_empty() {
+            if String::from_utf8_lossy(&out).contains("RESUME-OK:clowder/demo") {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        match prev_shell {
-            Some(s) => std::env::set_var("SHELL", s),
-            None => std::env::remove_var("SHELL"),
-        }
-        drop(_shell_lock);
 
         let out_str = String::from_utf8_lossy(&out);
         assert!(
-            out_str.contains("clowder/demo"),
+            out_str.contains("RESUME-OK:clowder/demo"),
             "resume must replay the ORIGINAL recorded args verbatim, unaffected by the profile \
              having been edited then deleted: {out_str:?}"
         );
