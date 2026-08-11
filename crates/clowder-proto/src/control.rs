@@ -39,6 +39,19 @@ pub struct ProjectInfo {
     pub kind: String,
 }
 
+/// One agent profile on the wire. The storage form is `clowder_config::agents::AgentProfile`;
+/// this adds `builtin` so a client can disable Remove without knowing the adapter registry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentProfileInfo {
+    pub id: String,
+    pub base: String,
+    pub display_name: String,
+    pub enabled: bool,
+    pub args: String,
+    pub builtin: bool,
+}
+
 /// GUI/CLI → daemon, over the JSON-lines control socket.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
@@ -57,6 +70,10 @@ pub enum ControlRequest {
     RemoveProject { path: String },
     OpenProjectTerminal { path: String },
     RestartWorktree { pane: PaneId },
+    ListAgentProfiles,
+    AddAgentProfile { profile: AgentProfileInfo },
+    UpdateAgentProfile { profile: AgentProfileInfo },
+    RemoveAgentProfile { id: String },
 }
 
 /// daemon → GUI/CLI.
@@ -77,6 +94,7 @@ pub enum ControlEvent {
     /// The terminal's root pane went away — the user closed it or the shell exited. Clients
     /// drop their `path -> pane` mapping so the next select respawns.
     ProjectTerminalClosed { path: String },
+    AgentProfileList { profiles: Vec<AgentProfileInfo> },
 }
 
 #[cfg(test)]
@@ -272,6 +290,48 @@ mod tests {
         std::fs::read_to_string(&p)
             .unwrap_or_else(|e| panic!("missing fixture {}: {e}", p.display()))
             .trim().to_string()
+    }
+
+    #[test]
+    fn agent_profile_list_event_round_trips_with_camelcase() {
+        let ev = ControlEvent::AgentProfileList {
+            profiles: vec![AgentProfileInfo {
+                id: "opus".into(),
+                base: "claude".into(),
+                display_name: "Claude (Opus)".into(),
+                enabled: true,
+                args: "--model opus".into(),
+                builtin: false,
+            }],
+        };
+        let s = serde_json::to_string(&ev).unwrap();
+        assert!(s.contains(r#""type":"agentProfileList""#), "{s}");
+        assert!(s.contains(r#""displayName":"Claude (Opus)""#), "{s}");
+        assert!(s.contains(r#""builtin":false"#), "{s}");
+        assert_eq!(ev, serde_json::from_str::<ControlEvent>(&s).unwrap());
+    }
+
+    #[test]
+    fn agent_profile_requests_round_trip() {
+        let list = ControlRequest::ListAgentProfiles;
+        assert_eq!(serde_json::to_string(&list).unwrap(), r#"{"type":"listAgentProfiles"}"#);
+
+        let p = AgentProfileInfo {
+            id: "opus".into(),
+            base: "claude".into(),
+            display_name: "Claude (Opus)".into(),
+            enabled: false,
+            args: "--model opus".into(),
+            builtin: false,
+        };
+        for r in [
+            ControlRequest::AddAgentProfile { profile: p.clone() },
+            ControlRequest::UpdateAgentProfile { profile: p },
+            ControlRequest::RemoveAgentProfile { id: "opus".into() },
+        ] {
+            let s = serde_json::to_string(&r).unwrap();
+            assert_eq!(r, serde_json::from_str::<ControlRequest>(&s).unwrap(), "{s}");
+        }
     }
 
     #[test]
