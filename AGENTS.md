@@ -17,7 +17,7 @@ socket drives the app's sidebar, spawning, and splits.
 |---|---|---|
 | `crates/clowder-proto` | Wire protocol: `ClientToDaemon`/`DaemonToClient`, `HookEvent`, `PaneId`, `MsgStream` (postcard), and control types (`ControlRequest`/`ControlEvent`, `PaneTree`, splits) | lib |
 | `crates/clowder-config` | Fully-resolved `Config` (sockets, backlog cap, shell, pane size, worktree base); loads `config.toml` then env overrides (**env › file › default**) | lib |
-| `crates/clowder-daemon` | Headless daemon: agent PTYs in panes, attention routing/notify, control-JSON + hook servers, split-tree, single-instance lock | **`clowder-daemon`** |
+| `crates/clowder-daemon` | Headless daemon: agent PTYs in panes, attention routing/notify, control-JSON + hook servers, split-tree, single-instance lock, `agent_profiles.rs` (the agent-profile store served over the control socket) | **`clowder-daemon`** |
 | `crates/clowder-client` | Client library + interactive attach (raw-mode terminal); the `clowder` CLI | **`clowder`** |
 | `crates/clowder-hook` | Sends exactly one `HookEvent` to the daemon's hook socket (agent lifecycle shim) | **`clowder-hook`** |
 | `crates/clowder-vt` | Headless scanner for terminal attention signals (BEL, OSC 9, OSC 777) via `vte` — signal detection only, no cell grid | lib |
@@ -133,6 +133,17 @@ worktrees at `<project>/.clowder/worktrees/<name>` are **not migrated** — they
 the daemon resumes from the absolute path in `agents.json`. The app runs `clowder attach <pane>` in a
 libghostty surface. **Adapters:** `claude` (Claude Code), `codex` (OpenAI Codex), `shell` (plain shell,
 no hooks). The `clowder` CLI: `clowder spawn <project> <task> [adapter]` and `clowder attach <pane-id>`.
+
+The spawnable list is **not** the adapter list: it is the set of enabled **agent profiles** — named
+wrappers around those adapters, each with an argument template appended to the adapter's own args —
+stored per-daemon in `$XDG_STATE_HOME/clowder/agent-profiles.json` (`CLOWDER_AGENT_PROFILES_FILE`
+overrides) and managed with `clowder agent add|list|set|enable|disable|rm` or the Settings window's
+Agents tab. The file holds only deltas: built-ins always exist (disable-able, not deletable) and
+appear even if the file is empty. Template tokens (`{{project_name}}`, `{{project_path}}`,
+`{{workspace_name}}`, `{{workspace_path}}`, `{{branch}}`) are substituted **per already-split
+argument** at spawn, and the resolved arguments are recorded on the agent, so editing or deleting a
+profile never changes what a running agent resumes with.
+
 An optional remote TCP listener (`[remote] listen`/`host`) can be hardened with `[remote] tls`/`token`
 (bearer-token auth + TOFU-pinned TLS) — see `docs/remote-tls.md` for setup and the threat model. Remote
 daemons the client knows about are managed as a nicknamed registry

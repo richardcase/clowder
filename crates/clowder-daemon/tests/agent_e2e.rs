@@ -1,5 +1,5 @@
 use clowder_daemon::server::Daemon;
-use clowder_daemon::{FakeNotifier, PaneCommand, SyntheticAdapter};
+use clowder_daemon::{FakeNotifier, PaneCommand, SpawnSpec, SyntheticAdapter};
 use clowder_proto::{AttentionState, HookEvent, HookKind, MsgStream, PaneId};
 use clowder_workspace::WorktreeLayout;
 use std::process::Command;
@@ -53,7 +53,7 @@ async fn provision_spawn_hook_teardown_end_to_end() {
             env: vec![],
         },
     };
-    let pane = daemon.spawn_agent(repo.path(), &adapter, "task-e2e").unwrap();
+    let pane = daemon.spawn_agent(repo.path(), SpawnSpec::adapter_only(&adapter), "task-e2e").unwrap();
 
     // Worktree created on a fresh branch, agent's marker + cwd isolation present.
     let ws_path = WorktreeLayout::new(state.path().join("worktrees"))
@@ -113,7 +113,7 @@ async fn spawn_agent_tears_down_worktree_on_launch_failure() {
             env: vec![],
         },
     };
-    let result = daemon.spawn_agent(repo.path(), &adapter, "task-fail");
+    let result = daemon.spawn_agent(repo.path(), SpawnSpec::adapter_only(&adapter), "task-fail");
     assert!(result.is_err(), "spawn_agent should fail when the agent binary is missing");
 
     let ws_path = WorktreeLayout::new(state.path().join("worktrees"))
@@ -183,7 +183,7 @@ async fn an_agent_launched_by_bare_name_resolves_against_the_pane_environment() 
             env: vec![],
         },
     };
-    let pane = daemon.spawn_agent(repo.path(), &adapter, "task-path").unwrap();
+    let pane = daemon.spawn_agent(repo.path(), SpawnSpec::adapter_only(&adapter), "task-path").unwrap();
 
     let mut ran = false;
     for _ in 0..100 {

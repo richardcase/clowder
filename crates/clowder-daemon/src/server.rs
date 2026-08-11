@@ -1,6 +1,6 @@
 use crate::agent::AgentAdapter;
 use crate::notify::{Notifier, OsNotifier};
-use crate::{Pane, PaneCommand};
+use crate::{Pane, PaneCommand, SpawnSpec};
 use anyhow::{bail, Context, Result};
 use clowder_proto::AttentionState;
 use clowder_proto::{ClientToDaemon, DaemonToClient, MsgStream, PaneId};
@@ -337,6 +337,11 @@ impl Daemon {
         self.profiles.resolve(id)
     }
 
+    #[cfg(test)]
+    pub(crate) fn registry_for_test(&self) -> std::sync::Arc<crate::registry::Registry> {
+        std::sync::Arc::clone(&self.registry)
+    }
+
     /// The shell pane rooted at a project. Lazy and idempotent: a second caller attaches to the
     /// same shell. Not persisted — a daemon restart drops it and the next select respawns.
     pub fn open_project_terminal(self: &Arc<Self>, path: &Path) -> Result<PaneId> {
@@ -517,6 +522,7 @@ impl Daemon {
         };
         adapter.provision_hooks(&ws.path, id, &self.hook_sock)?;
         let mut cmd = adapter.resume_command(&ws.path);
+        cmd.args.extend(rec.extra_args.iter().cloned());
         cmd.cwd = Some(ws.path.clone());
         cmd.env.push(("CLOWDER_AGENT_ID".into(), id.0.to_string()));
         cmd.env.push(("CLOWDER_HOOK_SOCK".into(), self.hook_sock.to_string_lossy().to_string()));
@@ -602,7 +608,7 @@ impl Daemon {
     }
 
     /// Provision an isolated worktree, inject the adapter's hooks, and spawn the agent in it.
-    pub fn spawn_agent(self: &Arc<Self>, project: &Path, adapter: &dyn AgentAdapter, name: &str) -> Result<PaneId> {
+    pub fn spawn_agent(self: &Arc<Self>, project: &Path, spec: SpawnSpec<'_>, name: &str) -> Result<PaneId> {
         let _mutation = self.project_mutation.lock();
         // Canonicalize first — the registered-project check compares canonical paths, and on
         // macOS /tmp resolves to /private/tmp.
@@ -635,6 +641,19 @@ impl Daemon {
         let driver = driver_for(&project);
         let ws = driver.provision(&self.worktrees, &project, task)?;
 
+        let adapter = spec.adapter;
+        // Substitute per already-split argument, so a value containing whitespace stays one argv
+        // element and cannot inject arguments of its own.
+        let extra_args = clowder_config::agents::substitute(
+            &spec.arg_template,
+            &clowder_config::agents::TokenContext {
+                project_path: &project,
+                workspace_path: &ws.path,
+                workspace_name: task,
+                branch: &ws.branch,
+            },
+        );
+
         // If any post-provision step fails (e.g. the agent binary isn't on PATH), tear down
         // the freshly-provisioned worktree/branch instead of leaking it — otherwise a retry
         // with the same task name fails at `git worktree add`.
@@ -642,6 +661,7 @@ impl Daemon {
             adapter.provision_hooks(&ws.path, id, &self.hook_sock)?;
 
             let mut cmd = adapter.launch_command(&ws.path);
+            cmd.args.extend(extra_args.iter().cloned());
             cmd.cwd = Some(ws.path.clone());
             cmd.env.push(("CLOWDER_AGENT_ID".into(), id.0.to_string()));
             cmd.env.push(("CLOWDER_HOOK_SOCK".into(), self.hook_sock.to_string_lossy().to_string()));
@@ -671,6 +691,8 @@ impl Daemon {
             cols: self.default_cols,
             rows: self.default_rows,
             tree: None,
+            profile_id: spec.profile_id.clone(),
+            extra_args: extra_args.clone(),
         });
         self.finalize_agent(id, pane, ws, task, adapter);
 
@@ -1625,7 +1647,7 @@ mod tests {
                 env: vec![],
             },
         };
-        let pane = daemon.spawn_agent(repo.path(), &adapter, "task-a").unwrap();
+        let pane = daemon.spawn_agent(repo.path(), SpawnSpec::adapter_only(&adapter), "task-a").unwrap();
         daemon.set_attention(pane, AttentionState::NeedsInput);
 
         let list = daemon.list_worktrees();
@@ -1680,7 +1702,7 @@ mod tests {
                 env: vec![],
             },
         };
-        let id = daemon.spawn_agent(repo.path(), &adapter, "demo").unwrap();
+        let id = daemon.spawn_agent(repo.path(), SpawnSpec::adapter_only(&adapter), "demo").unwrap();
 
         let recs = crate::registry::Registry::new(statedir.path().join("agents.json")).load();
         assert_eq!(recs.iter().filter(|r| r.agent_id == id.0).count(), 1);
@@ -1733,7 +1755,7 @@ mod tests {
                 env: vec![],
             },
         };
-        let id = daemon.spawn_agent(repo.path(), &adapter, "demo").unwrap();
+        let id = daemon.spawn_agent(repo.path(), SpawnSpec::adapter_only(&adapter), "demo").unwrap();
         let worktree_path = daemon.workspace_of(id).unwrap().path;
 
         // Simulate a fresh daemon (e.g. after a restart): a NEW Daemon on the same state file,
@@ -1754,7 +1776,7 @@ mod tests {
         assert_eq!(list[0].name, "demo");
 
         // New spawns on d2 must not collide with the restored id.
-        let fresh = d2.spawn_agent(repo.path(), &adapter, "fresh").unwrap();
+        let fresh = d2.spawn_agent(repo.path(), SpawnSpec::adapter_only(&adapter), "fresh").unwrap();
         assert_ne!(fresh, id, "next_id must be bumped above restored ids");
         d2.shutdown();
 
@@ -1821,7 +1843,7 @@ mod tests {
                 cwd: None, env: vec![],
             },
         };
-        let id = d1.spawn_agent(repo.path(), &adapter, "demo").unwrap();
+        let id = d1.spawn_agent(repo.path(), SpawnSpec::adapter_only(&adapter), "demo").unwrap();
         d1.split_pane(id, SplitDirection::Right).unwrap();
         // set + flush a non-default ratio so we can assert it round-trips.
         let sid = match d1.split_tree_of(id).unwrap() { PaneTree::Split { id, .. } => id, _ => panic!() };
@@ -1891,7 +1913,7 @@ mod tests {
                 cwd: None, env: vec![],
             },
         };
-        let id = daemon.spawn_agent(repo.path(), &adapter, "demo").unwrap();
+        let id = daemon.spawn_agent(repo.path(), SpawnSpec::adapter_only(&adapter), "demo").unwrap();
 
         // After a split, the record's tree is a 2-leaf split.
         let companion = daemon.split_pane(id, SplitDirection::Right).unwrap();
@@ -1945,7 +1967,7 @@ mod tests {
                 env: vec![],
             },
         };
-        let pane = daemon.spawn_agent(repo.path(), &adapter, "task-a").unwrap();
+        let pane = daemon.spawn_agent(repo.path(), SpawnSpec::adapter_only(&adapter), "task-a").unwrap();
 
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let d = daemon.clone();
@@ -2016,7 +2038,7 @@ mod tests {
                 env: vec![],
             },
         };
-        let pane = daemon.spawn_agent(repo.path(), &adapter, "task-x").unwrap();
+        let pane = daemon.spawn_agent(repo.path(), SpawnSpec::adapter_only(&adapter), "task-x").unwrap();
 
         // No client attached: the daemon-side watcher must still flip attention to Exited.
         let mut exited = false;
@@ -2068,7 +2090,7 @@ mod tests {
                 env: vec![],
             },
         };
-        let pane = daemon.spawn_agent(repo.path(), &adapter, "task-r").unwrap();
+        let pane = daemon.spawn_agent(repo.path(), SpawnSpec::adapter_only(&adapter), "task-r").unwrap();
 
         // Tear down while still running (kills the child).
         daemon.teardown_agent(pane).unwrap();
@@ -2115,7 +2137,7 @@ mod tests {
                 env: vec![],
             },
         };
-        let pane = daemon.spawn_agent(repo.path(), &adapter, "task-a").unwrap();
+        let pane = daemon.spawn_agent(repo.path(), SpawnSpec::adapter_only(&adapter), "task-a").unwrap();
 
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let d = daemon.clone();
@@ -2178,16 +2200,15 @@ mod tests {
         let agent = daemon
             .spawn_agent(
                 repo.path(),
-                &crate::agent::SyntheticAdapter {
+                SpawnSpec::adapter_only(&crate::agent::SyntheticAdapter {
                     command: PaneCommand {
                         program: "/bin/sh".into(),
                         args: vec!["-c".into(), "sleep 30".into()],
                         cwd: None,
                         env: vec![],
                     },
-                },
-                "task",
-            )
+                }),
+                "task")
             .unwrap();
 
         // fresh tree is a lone leaf
@@ -2225,16 +2246,15 @@ mod tests {
         let agent = daemon
             .spawn_agent(
                 repo.path(),
-                &crate::agent::SyntheticAdapter {
+                SpawnSpec::adapter_only(&crate::agent::SyntheticAdapter {
                     command: PaneCommand {
                         program: "/bin/sh".into(),
                         args: vec!["-c".into(), "sleep 30".into()],
                         cwd: None,
                         env: vec![],
                     },
-                },
-                "task",
-            )
+                }),
+                "task")
             .unwrap();
 
         // Two companions, BOTH live at teardown (neither closed first).
@@ -2268,7 +2288,7 @@ mod tests {
     #[tokio::test]
     async fn hookless_agent_bell_sets_needs_input() {
         let (daemon, repo, _state) = daemon_with_repo();
-        let agent = daemon.spawn_agent(repo.path(), &crate::agent::SyntheticAdapter { command: bell_then_sleep() }, "t").unwrap();
+        let agent = daemon.spawn_agent(repo.path(), SpawnSpec::adapter_only(&crate::agent::SyntheticAdapter { command: bell_then_sleep() }), "t").unwrap();
         let mut ok = false;
         for _ in 0..100 {
             if daemon.attention_of(agent) == Some(AttentionState::NeedsInput) { ok = true; break; }
@@ -2280,7 +2300,7 @@ mod tests {
     #[tokio::test]
     async fn hooked_agent_bell_is_ignored() {
         let (daemon, repo, _state) = daemon_with_repo();
-        let agent = daemon.spawn_agent(repo.path(), &HookedTestAdapter { cmd: bell_then_sleep() }, "t").unwrap();
+        let agent = daemon.spawn_agent(repo.path(), SpawnSpec::adapter_only(&HookedTestAdapter { cmd: bell_then_sleep() }), "t").unwrap();
         // give the BEL time to be produced; attention must stay Working (no scanner).
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         assert_eq!(daemon.attention_of(agent), Some(AttentionState::Working));
@@ -2289,7 +2309,7 @@ mod tests {
     #[tokio::test]
     async fn input_clears_hookless_needs_input_to_working() {
         let (daemon, repo, _state) = daemon_with_repo();
-        let agent = daemon.spawn_agent(repo.path(), &crate::agent::SyntheticAdapter { command: bell_then_sleep() }, "t").unwrap();
+        let agent = daemon.spawn_agent(repo.path(), SpawnSpec::adapter_only(&crate::agent::SyntheticAdapter { command: bell_then_sleep() }), "t").unwrap();
         // wait for NeedsInput
         for _ in 0..100 {
             if daemon.attention_of(agent) == Some(AttentionState::NeedsInput) { break; }
@@ -2323,16 +2343,15 @@ mod tests {
         let agent = daemon
             .spawn_agent(
                 repo.path(),
-                &HookedTestAdapter {
+                SpawnSpec::adapter_only(&HookedTestAdapter {
                     cmd: PaneCommand {
                         program: "/bin/sh".into(),
                         args: vec!["-c".into(), "sleep 30".into()],
                         cwd: None,
                         env: vec![],
                     },
-                },
-                "task-a",
-            )
+                }),
+                "task-a")
             .unwrap();
         // A hook'd agent is NOT in `hookless`.
         daemon.set_attention(agent, AttentionState::Completed);
@@ -2367,9 +2386,9 @@ mod tests {
     #[tokio::test]
     async fn land_agent_keeps_branch_and_removes_agent() {
         let (daemon, repo, _state) = daemon_with_repo();
-        let agent = daemon.spawn_agent(repo.path(), &crate::agent::SyntheticAdapter {
+        let agent = daemon.spawn_agent(repo.path(), SpawnSpec::adapter_only(&crate::agent::SyntheticAdapter {
             command: PaneCommand { program: "/bin/sh".into(), args: vec!["-c".into(), "sleep 30".into()], cwd: None, env: vec![] },
-        }, "task-a").unwrap();
+        }), "task-a").unwrap();
         // write some work into the worktree
         let ws = daemon.workspace_of(agent).unwrap();
         std::fs::write(ws.path.join("out.txt"), b"work").unwrap();
@@ -2383,9 +2402,9 @@ mod tests {
     #[tokio::test]
     async fn discard_agent_deletes_branch_and_removes_agent() {
         let (daemon, repo, _state) = daemon_with_repo();
-        let agent = daemon.spawn_agent(repo.path(), &crate::agent::SyntheticAdapter {
+        let agent = daemon.spawn_agent(repo.path(), SpawnSpec::adapter_only(&crate::agent::SyntheticAdapter {
             command: PaneCommand { program: "/bin/sh".into(), args: vec!["-c".into(), "sleep 30".into()], cwd: None, env: vec![] },
-        }, "task-b").unwrap();
+        }), "task-b").unwrap();
         daemon.discard_agent(agent).unwrap();
         assert!(daemon.workspace_of(agent).is_none());
         assert!(daemon.get(agent).is_none());
@@ -2446,7 +2465,7 @@ mod tests {
                 env: vec![],
             },
         };
-        let pane = daemon.spawn_agent(repo.path(), &adapter, "task-a").unwrap();
+        let pane = daemon.spawn_agent(repo.path(), SpawnSpec::adapter_only(&adapter), "task-a").unwrap();
         assert_eq!(daemon.workspace_of(pane).unwrap().kind, clowder_workspace::WorkspaceKind::Jj);
         daemon.land_agent(pane).unwrap();
         assert!(daemon.list_worktrees().is_empty());
@@ -2459,16 +2478,15 @@ mod tests {
         let agent = daemon
             .spawn_agent(
                 repo.path(),
-                &crate::agent::SyntheticAdapter {
+                SpawnSpec::adapter_only(&crate::agent::SyntheticAdapter {
                     command: PaneCommand {
                         program: "/bin/sh".into(),
                         args: vec!["-c".into(), "sleep 30".into()],
                         cwd: None,
                         env: vec![],
                     },
-                },
-                "t",
-            )
+                }),
+                "t")
             .unwrap();
         let _comp = daemon.split_pane(agent, SplitDirection::Right).unwrap();
         // the split created has id 1 (first split allocated)
@@ -2487,16 +2505,15 @@ mod tests {
         let agent = daemon
             .spawn_agent(
                 repo.path(),
-                &crate::agent::SyntheticAdapter {
+                SpawnSpec::adapter_only(&crate::agent::SyntheticAdapter {
                     command: PaneCommand {
                         program: "/bin/sh".into(),
                         args: vec!["-c".into(), "sleep 30".into()],
                         cwd: None,
                         env: vec![],
                     },
-                },
-                "task",
-            )
+                }),
+                "task")
             .unwrap();
 
         let mut rx = daemon.subscribe_splits();
@@ -2543,16 +2560,15 @@ mod tests {
         let agent = daemon
             .spawn_agent(
                 repo.path(),
-                &crate::agent::SyntheticAdapter {
+                SpawnSpec::adapter_only(&crate::agent::SyntheticAdapter {
                     command: PaneCommand {
                         program: "/bin/sh".into(),
                         args: vec!["-c".into(), "sleep 30".into()],
                         cwd: None,
                         env: vec![],
                     },
-                },
-                "task",
-            )
+                }),
+                "task")
             .unwrap();
         let comp = daemon.split_pane(agent, SplitDirection::Right).unwrap();
 
@@ -2654,7 +2670,7 @@ mod tests {
                 cwd: None, env: vec![],
             },
         };
-        let id = daemon.spawn_agent(repo.path(), &adapter, "demo").unwrap();
+        let id = daemon.spawn_agent(repo.path(), SpawnSpec::adapter_only(&adapter), "demo").unwrap();
         daemon.split_pane(id, SplitDirection::Right).unwrap();
 
         // Find the split id, move its divider, then flush explicitly (no wall-clock dependence).
@@ -2716,9 +2732,9 @@ mod tests {
             },
         };
         // Agent A (low id) with a companion, then agent B (higher id).
-        let a = d1.spawn_agent(repo.path(), &adapter, "aaa").unwrap();
+        let a = d1.spawn_agent(repo.path(), SpawnSpec::adapter_only(&adapter), "aaa").unwrap();
         d1.split_pane(a, SplitDirection::Right).unwrap();
-        let b = d1.spawn_agent(repo.path(), &adapter, "bbb").unwrap();
+        let b = d1.spawn_agent(repo.path(), SpawnSpec::adapter_only(&adapter), "bbb").unwrap();
 
         // Fresh daemon reconciles A (with layout) then B. Without the early next_id bump, A's
         // restored companion could grab B's id.
@@ -2784,7 +2800,7 @@ mod tests {
             },
         };
         // A plain agent, never split → its record's tree is None (the M9a shape).
-        let id = d1.spawn_agent(repo.path(), &adapter, "demo").unwrap();
+        let id = d1.spawn_agent(repo.path(), SpawnSpec::adapter_only(&adapter), "demo").unwrap();
 
         let d2 = Arc::new(Daemon::new_with_paths(
             Arc::new(FakeNotifier::new()),
@@ -2810,7 +2826,7 @@ mod tests {
         // An agent that exits immediately.
         let adapter = SyntheticAdapter { command: crate::PaneCommand {
             program: "/bin/sh".into(), args: vec!["-c".into(), "exit 0".into()], cwd: None, env: vec![] } };
-        let pane = d.spawn_agent(repo.path(), &adapter, "feat").unwrap();
+        let pane = d.spawn_agent(repo.path(), SpawnSpec::adapter_only(&adapter), "feat").unwrap();
 
         // Wait for the exit watcher to mark it Exited.
         for _ in 0..100 {
@@ -2836,7 +2852,7 @@ mod tests {
         d.add_project(repo.path()).unwrap();
         let adapter = SyntheticAdapter { command: crate::PaneCommand {
             program: "/bin/sh".into(), args: vec!["-c".into(), "sleep 30".into()], cwd: None, env: vec![] } };
-        let pane = d.spawn_agent(repo.path(), &adapter, "feat").unwrap();
+        let pane = d.spawn_agent(repo.path(), SpawnSpec::adapter_only(&adapter), "feat").unwrap();
         let e = d.restart_worktree(pane).unwrap_err().to_string();
         assert!(e.contains("still running"), "unhelpful message: {e}");
         d.teardown_agent(pane).unwrap();
@@ -2861,7 +2877,7 @@ mod tests {
         // An agent that exits immediately; its companion (a plain shell) stays alive.
         let adapter = SyntheticAdapter { command: crate::PaneCommand {
             program: "/bin/sh".into(), args: vec!["-c".into(), "exit 0".into()], cwd: None, env: vec![] } };
-        let pane = d.spawn_agent(repo.path(), &adapter, "feat").unwrap();
+        let pane = d.spawn_agent(repo.path(), SpawnSpec::adapter_only(&adapter), "feat").unwrap();
         let companion = d.split_pane(pane, SplitDirection::Right).unwrap();
 
         // Wait for the agent's own process to exit.
@@ -2925,7 +2941,7 @@ mod tests {
                 cwd: None, env: vec![],
             },
         };
-        let id = daemon.spawn_agent(repo.path(), &adapter, "demo").unwrap();
+        let id = daemon.spawn_agent(repo.path(), SpawnSpec::adapter_only(&adapter), "demo").unwrap();
 
         // Poll up to ~3s for the content-attention escalation.
         let mut got = false;
@@ -2981,7 +2997,7 @@ mod tests {
                 cwd: None, env: vec![],
             },
         };
-        let id = daemon.spawn_agent(repo.path(), &adapter, "demo").unwrap();
+        let id = daemon.spawn_agent(repo.path(), SpawnSpec::adapter_only(&adapter), "demo").unwrap();
         (daemon, id, repo, statedir, lock)
     }
 
@@ -3079,7 +3095,7 @@ mod tests {
         let repo = crate::test_support::init_empty_repo();
         let d = test_daemon_in(state.path());
         d.add_project(repo.path()).unwrap();
-        let pane = d.spawn_agent(repo.path(), &sleeping_adapter(), "feat").unwrap();
+        let pane = d.spawn_agent(repo.path(), SpawnSpec::adapter_only(&sleeping_adapter()), "feat").unwrap();
 
         d.discard_agent(pane).unwrap();
         assert!(d.list_worktrees().is_empty(), "the row must be gone");
@@ -3096,7 +3112,7 @@ mod tests {
         crate::test_support::install_failing_precommit_hook(repo.path());
         let d = test_daemon_in(state.path());
         d.add_project(repo.path()).unwrap();
-        let pane = d.spawn_agent(repo.path(), &sleeping_adapter(), "feat").unwrap();
+        let pane = d.spawn_agent(repo.path(), SpawnSpec::adapter_only(&sleeping_adapter()), "feat").unwrap();
 
         let ws = d.workspace_of(pane).expect("workspace");
         std::fs::write(ws.path.join("work.txt"), b"uncommitted work").unwrap();
@@ -3132,7 +3148,7 @@ mod tests {
                 env: vec![],
             },
         };
-        let pane = d.spawn_agent(repo.path(), &adapter, "feat").unwrap();
+        let pane = d.spawn_agent(repo.path(), SpawnSpec::adapter_only(&adapter), "feat").unwrap();
 
         let e = d.remove_project(repo.path()).unwrap_err().to_string();
         assert!(e.contains("1"), "message should say how many: {e}");
@@ -3168,7 +3184,7 @@ mod tests {
         let path = repo.path().to_path_buf();
         let spawner = std::thread::spawn(move || {
             let _guard = rt.enter();
-            d2.spawn_agent(&path, &adapter, "racy")
+            d2.spawn_agent(&path, SpawnSpec::adapter_only(&adapter), "racy")
         });
 
         let mut removed_while_spawning = false;
@@ -3268,7 +3284,7 @@ mod tests {
         let adapter = SyntheticAdapter { command: crate::PaneCommand {
             program: "/bin/sh".into(), args: vec!["-c".into(), "sleep 30".into()], cwd: None, env: vec![] } };
 
-        let e = d.spawn_agent(repo.path(), &adapter, "feat").unwrap_err().to_string();
+        let e = d.spawn_agent(repo.path(), SpawnSpec::adapter_only(&adapter), "feat").unwrap_err().to_string();
         assert!(e.contains("unknown project"), "unhelpful message: {e}");
         assert!(!wt_path(&d, &repo, "feat").exists(), "must not leave a worktree");
         assert!(!repo.path().join(".clowder").exists(), "must not touch the project");
@@ -3287,7 +3303,7 @@ mod tests {
         d.add_project(repo.path()).unwrap();
         let adapter = SyntheticAdapter { command: crate::PaneCommand {
             program: "/bin/sh".into(), args: vec!["-c".into(), "sleep 30".into()], cwd: None, env: vec![] } };
-        let e = d.spawn_agent(repo.path(), &adapter, "my feature").unwrap_err().to_string();
+        let e = d.spawn_agent(repo.path(), SpawnSpec::adapter_only(&adapter), "my feature").unwrap_err().to_string();
         assert!(e.contains("letters"), "should be the name-validation message: {e}");
         assert!(!d.worktrees.project_dir(&repo.path().canonicalize().unwrap()).exists());
         assert!(!repo.path().join(".clowder").exists());
@@ -3308,7 +3324,7 @@ mod tests {
         std::fs::create_dir_all(wt_path(&d, &repo, "feat")).unwrap();
         let adapter = SyntheticAdapter { command: crate::PaneCommand {
             program: "/bin/sh".into(), args: vec!["-c".into(), "sleep 30".into()], cwd: None, env: vec![] } };
-        let e = d.spawn_agent(repo.path(), &adapter, "feat").unwrap_err().to_string();
+        let e = d.spawn_agent(repo.path(), SpawnSpec::adapter_only(&adapter), "feat").unwrap_err().to_string();
         assert!(e.contains("already exists"), "should name the collision, not a raw git error: {e}");
         assert!(!e.contains("fatal:"), "must not surface a raw git error: {e}");
     }
@@ -3323,7 +3339,7 @@ mod tests {
         let adapter = SyntheticAdapter { command: crate::PaneCommand {
             program: "/bin/sh".into(), args: vec!["-c".into(), "sleep 30".into()], cwd: None, env: vec![] } };
 
-        let pane = d.spawn_agent(repo.path(), &adapter, "feat").unwrap();
+        let pane = d.spawn_agent(repo.path(), SpawnSpec::adapter_only(&adapter), "feat").unwrap();
         let ws = d.workspace_of(pane).unwrap();
 
         assert_eq!(ws.path, wt_path(&d, &repo, "feat"));
@@ -3350,8 +3366,8 @@ mod tests {
         let adapter = SyntheticAdapter { command: crate::PaneCommand {
             program: "/bin/sh".into(), args: vec!["-c".into(), "sleep 30".into()], cwd: None, env: vec![] } };
 
-        let pa = d.spawn_agent(&a, &adapter, "feat").unwrap();
-        let pb = d.spawn_agent(&b, &adapter, "feat").unwrap();      // same task name, other project
+        let pa = d.spawn_agent(&a, SpawnSpec::adapter_only(&adapter), "feat").unwrap();
+        let pb = d.spawn_agent(&b, SpawnSpec::adapter_only(&adapter), "feat").unwrap();      // same task name, other project
         let (wa, wb) = (d.workspace_of(pa).unwrap().path, d.workspace_of(pb).unwrap().path);
 
         assert_ne!(wa, wb, "same-named projects must not share a worktree dir");
@@ -3377,7 +3393,7 @@ mod tests {
         let adapter = SyntheticAdapter { command: crate::PaneCommand {
             program: "/bin/sh".into(), args: vec!["-c".into(), "sleep 30".into()], cwd: None, env: vec![] } };
 
-        let pane = d.spawn_agent(repo.path(), &adapter, "feat").unwrap();
+        let pane = d.spawn_agent(repo.path(), SpawnSpec::adapter_only(&adapter), "feat").unwrap();
         let ws = d.workspace_of(pane).unwrap();
         let e = d.add_project(&ws.path).unwrap_err().to_string();
         assert!(e.contains("worktree"), "unhelpful message: {e}");
@@ -3395,8 +3411,8 @@ mod tests {
             program: "/bin/sh".into(), args: vec!["-c".into(), "sleep 30".into()], cwd: None, env: vec![] } };
         let canonical = repo.path().canonicalize().unwrap();
 
-        let p1 = d.spawn_agent(repo.path(), &adapter, "one").unwrap();
-        let p2 = d.spawn_agent(repo.path(), &adapter, "two").unwrap();
+        let p1 = d.spawn_agent(repo.path(), SpawnSpec::adapter_only(&adapter), "one").unwrap();
+        let p2 = d.spawn_agent(repo.path(), SpawnSpec::adapter_only(&adapter), "two").unwrap();
         let project_dir = d.worktrees.project_dir(&canonical);
         assert!(project_dir.is_dir());
 
@@ -3418,7 +3434,7 @@ mod tests {
         d.add_project(repo.path()).unwrap();
         let adapter = SyntheticAdapter { command: crate::PaneCommand {
             program: "/bin/sh".into(), args: vec!["-c".into(), "sleep 30".into()], cwd: None, env: vec![] } };
-        let pane = d.spawn_agent(repo.path(), &adapter, "feat").unwrap();
+        let pane = d.spawn_agent(repo.path(), SpawnSpec::adapter_only(&adapter), "feat").unwrap();
         let listed = d.list_worktrees();
         assert_eq!(listed[0].project, repo.path().canonicalize().unwrap().to_string_lossy());
         d.teardown_agent(pane).unwrap();
@@ -3638,5 +3654,85 @@ mod tests {
         let mut rx = daemon.subscribe_agent_profiles();
         assert!(daemon.remove_agent_profile("claude").is_err());
         assert!(rx.try_recv().is_err(), "a refused mutation must not broadcast");
+    }
+
+    #[tokio::test]
+    async fn spawn_appends_substituted_profile_args_to_the_adapter_args() {
+        // #[tokio::test], not #[test]: SyntheticAdapter has no native hooks, so `finalize_agent`
+        // spawns the VT-scanner fallback task via `tokio::spawn`, which needs a running runtime.
+        use crate::{FakeNotifier, SpawnSpec, SyntheticAdapter};
+        let state = tempfile::tempdir().unwrap();
+        let repo = crate::test_support::init_repo();
+        let daemon = std::sync::Arc::new(Daemon::new_with_paths(
+            std::sync::Arc::new(FakeNotifier::new()),
+            std::path::PathBuf::from("/tmp/unused-spawnargs.sock"),
+            state.path().join("agents.json"),
+            state.path().join("projects.json"),
+            state.path().join("agent-profiles.json"),
+            state.path().join("worktrees"),
+        ));
+        daemon.add_project(repo.path()).unwrap();
+
+        // /bin/echo takes any arguments and exits — a real process, no agent binary needed.
+        let adapter = SyntheticAdapter {
+            command: PaneCommand { program: "/bin/echo".into(), args: vec!["base".into()], cwd: None, env: vec![] },
+        };
+        let spec = SpawnSpec {
+            adapter: &adapter,
+            profile_id: Some("echoer".into()),
+            arg_template: clowder_config::agents::split_args("--w {{workspace_name}} --b {{branch}}").unwrap(),
+        };
+        let pane = daemon.spawn_agent(repo.path(), spec, "task-a").unwrap();
+
+        let rec = daemon.registry_for_test().load().into_iter().find(|r| r.agent_id == pane.0).unwrap();
+        assert_eq!(rec.profile_id.as_deref(), Some("echoer"));
+        assert_eq!(rec.extra_args, vec!["--w", "task-a", "--b", "clowder/task-a"],
+                   "tokens are substituted once, at spawn");
+        assert_eq!(rec.adapter_id, "synthetic", "adapter_id still names the BASE adapter");
+    }
+
+    #[tokio::test]
+    async fn spawn_spec_adapter_only_records_no_profile_and_no_args() {
+        use crate::{FakeNotifier, SpawnSpec, SyntheticAdapter};
+        let state = tempfile::tempdir().unwrap();
+        let repo = crate::test_support::init_repo();
+        let daemon = std::sync::Arc::new(Daemon::new_with_paths(
+            std::sync::Arc::new(FakeNotifier::new()),
+            std::path::PathBuf::from("/tmp/unused-spawnplain.sock"),
+            state.path().join("agents.json"),
+            state.path().join("projects.json"),
+            state.path().join("agent-profiles.json"),
+            state.path().join("worktrees"),
+        ));
+        daemon.add_project(repo.path()).unwrap();
+        let adapter = SyntheticAdapter {
+            command: PaneCommand { program: "/bin/echo".into(), args: vec![], cwd: None, env: vec![] },
+        };
+        let pane = daemon.spawn_agent(repo.path(), SpawnSpec::adapter_only(&adapter), "task-b").unwrap();
+        let rec = daemon.registry_for_test().load().into_iter().find(|r| r.agent_id == pane.0).unwrap();
+        assert_eq!(rec.profile_id, None);
+        assert!(rec.extra_args.is_empty());
+    }
+
+    #[test]
+    fn a_pre_m12_record_loads_with_no_profile_and_no_args() {
+        // Additive-field evolution: records written before M12 must keep resuming.
+        let rec: crate::registry::AgentRecord = serde_json::from_str(
+            r#"{"agent_id":1,"project":"/p","task":"t","adapter_id":"claude","worktree_path":"/w",
+                "branch":"clowder/t","workspace_kind":"git","cols":80,"rows":24}"#,
+        )
+        .unwrap();
+        assert_eq!(rec.profile_id, None);
+        assert!(rec.extra_args.is_empty());
+    }
+
+    #[test]
+    fn resume_argv_is_the_resume_command_plus_the_recorded_args() {
+        use crate::ClaudeAdapter;
+        // The unit the reconcile path relies on: recorded args are replayed verbatim, never
+        // re-substituted, so a deleted or edited profile cannot change a running agent's argv.
+        let mut cmd = ClaudeAdapter.resume_command(std::path::Path::new("/w"));
+        cmd.args.extend(vec!["--model".to_string(), "opus".to_string()]);
+        assert_eq!(cmd.args, vec!["--continue", "--model", "opus"]);
     }
 }

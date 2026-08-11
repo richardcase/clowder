@@ -18,7 +18,7 @@ mod split_tree;
 pub(crate) mod test_support;
 pub use agent::{
     adapter_descriptors, build_adapter, AdapterDescriptor, AgentAdapter, ClaudeAdapter, CodexAdapter,
-    SyntheticAdapter,
+    SpawnSpec, SyntheticAdapter,
 };
 pub use login_env::{CaptureSpec, PaneEnv};
 pub use pane::{Pane, PaneCommand};

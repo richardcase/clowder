@@ -204,10 +204,22 @@ impl Daemon {
         Ok(())
     }
 
-    fn spawn_from_control(self: &Arc<Self>, project: &str, name: &str, adapter: &str) -> Result<PaneId> {
+    fn spawn_from_control(self: &Arc<Self>, project: &str, name: &str, profile: &str) -> Result<PaneId> {
         let project_path = Path::new(project);
-        let a = build_adapter(adapter, &self.shell).ok_or_else(|| anyhow!("unknown adapter: {adapter}"))?;
-        self.spawn_agent(project_path, a.as_ref(), name)
+        // `adapter` on the wire is a PROFILE id now. Built-in ids (claude/codex/shell) still
+        // resolve, so `clowder spawn <project> <name> claude` is unchanged.
+        let resolved = self.resolve_profile(profile)?;
+        let a = build_adapter(&resolved.base, &self.shell)
+            .ok_or_else(|| anyhow!("unknown adapter: {}", resolved.base))?;
+        self.spawn_agent(
+            project_path,
+            crate::SpawnSpec {
+                adapter: a.as_ref(),
+                profile_id: Some(resolved.profile_id),
+                arg_template: resolved.arg_template,
+            },
+            name,
+        )
     }
 }
 
