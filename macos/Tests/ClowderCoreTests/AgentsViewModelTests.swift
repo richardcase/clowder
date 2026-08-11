@@ -197,6 +197,22 @@ final class AgentsViewModelTests: XCTestCase {
         XCTAssertFalse(vm.isDirty)
     }
 
+    func testSaveIgnoresAMutatedDraftIdForAnExistingProfile() {
+        // The editor offers no UI to change `id` on a non-new draft, but `save()` must not simply
+        // trust that: it sends the baseline's id, not whatever the draft happens to hold, so a
+        // mutated draft id can never reach the wire and force the daemon to reject it instead.
+        let (vm, rec) = model()
+        vm.select("opus")
+        vm.draft?.id = "not-opus"
+        vm.draft?.args = "--model opus --verbose"
+        vm.save()
+        guard case let .updateAgentProfile(p)? = rec.sent.last else {
+            return XCTFail("expected updateAgentProfile, got \(rec.sent)")
+        }
+        XCTAssertEqual(p.id, "opus", "the baseline id must be sent, not the mutated draft id")
+        XCTAssertEqual(p.args, "--model opus --verbose", "other edited fields still go through")
+    }
+
     func testApplyKeepsALocalEditWhenTheProfileAlsoChangedRemotely() {
         let (vm, _) = model()
         vm.select("opus")

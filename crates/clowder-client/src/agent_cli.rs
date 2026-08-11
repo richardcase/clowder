@@ -35,12 +35,13 @@ fn builtin_ids(existing: &[AgentProfileInfo]) -> Vec<&str> {
 /// Decide what `args` means against the daemon's current profiles. Pure.
 pub fn plan(args: &[String], existing: &[AgentProfileInfo]) -> Result<Action, String> {
     let sub = args.first().map(|s| s.as_str()).ok_or_else(|| USAGE.to_string())?;
-    if sub == "list" {
-        return Ok(Action::List);
-    }
     // Parse the whole tail: `parse_flags` consumes each value flag's value, so the id is simply
     // the first positional — and `agent add --base claude plan` works as well as the usual order.
     let flags = crate::remote_cli::parse_flags(&args[1..])?;
+    if sub == "list" {
+        flags.reject_unknown(&[])?;
+        return Ok(Action::List);
+    }
     let id = flags
         .positional(0)
         .map(str::to_string)
@@ -285,6 +286,12 @@ mod tests {
     #[test]
     fn list_needs_no_id() {
         assert!(matches!(plan(&args("list"), &existing()).unwrap(), Action::List));
+    }
+
+    #[test]
+    fn list_rejects_an_unknown_flag_instead_of_ignoring_it() {
+        let e = plan(&args("list --typo"), &existing()).unwrap_err();
+        assert!(e.contains("unknown flag"), "{e}");
     }
 
     #[test]

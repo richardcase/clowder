@@ -135,7 +135,13 @@ public final class AgentsViewModel: ObservableObject {
             lastError = draft.idError ?? draft.displayNameError ?? draft.argsError
             return
         }
-        let wire = AgentProfileInfo(id: draft.id, base: draft.base, displayName: draft.displayName,
+        // For an existing profile, the id sent on the wire is the baseline's — not the draft's.
+        // Nothing in the editor UI lets `id` be edited on a non-new draft, but trusting the view for
+        // that would mean a mutated draft id reaches `updateAgentProfile` and relies on the daemon to
+        // reject it. Using the baseline's id keeps that immutability true no matter what the draft
+        // holds.
+        let wireID = draft.isNew ? draft.id : (baseline?.id ?? draft.id)
+        let wire = AgentProfileInfo(id: wireID, base: draft.base, displayName: draft.displayName,
                                     enabled: draft.enabled, args: draft.args, builtin: false)
         if draft.isNew {
             // Remembered so `apply(profiles:)` can adopt the pane once the broadcast confirms it —
