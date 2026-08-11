@@ -133,3 +133,51 @@ public struct HostDraft: Equatable, Sendable {
         return (host, String(s[s.index(after: colon)...]))
     }
 }
+
+/// The Agents pane's editor state.
+///
+/// `idError` mirrors `clowder_config::agents::validate_id`, which delegates to the host-name rule —
+/// so it is checked against the same `docs/protocol/fixtures/host-names.json`. `argsError` mirrors
+/// `split_args` + `validate_template` via `AgentArgs`, pinned to `agent-args.json`. The daemon
+/// remains the authority.
+public struct AgentProfileDraft: Equatable, Sendable {
+    /// Immutable once created: the id is recorded on every agent spawned from this profile.
+    public var id: String
+    public var base: String
+    public var displayName: String
+    public var enabled: Bool
+    public var args: String
+    /// True when this draft creates a profile rather than editing one.
+    public var isNew: Bool
+
+    public init(id: String = "", base: String = "claude", displayName: String = "",
+                enabled: Bool = true, args: String = "", isNew: Bool = true) {
+        self.id = id
+        self.base = base
+        self.displayName = displayName
+        self.enabled = enabled
+        self.args = args
+        self.isNew = isNew
+    }
+
+    private static let maxDisplayName = 64
+
+    /// Nil when acceptable. Same rule as a host name — see `HostDraft.nameError`.
+    public var idError: String? {
+        var host = HostDraft()
+        host.name = id
+        return host.nameError
+    }
+
+    public var displayNameError: String? {
+        if displayName.trimmingCharacters(in: .whitespaces).isEmpty { return "Name must not be empty" }
+        if displayName.unicodeScalars.count > Self.maxDisplayName {
+            return "Name must be \(Self.maxDisplayName) characters or fewer"
+        }
+        return nil
+    }
+
+    public var argsError: String? { AgentArgs.templateError(args) }
+
+    public var isValid: Bool { idError == nil && displayNameError == nil && argsError == nil }
+}

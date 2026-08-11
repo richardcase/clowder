@@ -128,3 +128,36 @@ final class HostDraftTests: XCTestCase {
         XCTAssertNil(draft.tlsError)
     }
 }
+
+final class AgentProfileDraftTests: XCTestCase {
+    func testValidDraftIsValid() {
+        let d = AgentProfileDraft(id: "opus", base: "claude", displayName: "Claude (Opus)",
+                                  enabled: true, args: "--model opus", isNew: true)
+        XCTAssertNil(d.idError)
+        XCTAssertNil(d.displayNameError)
+        XCTAssertNil(d.argsError)
+        XCTAssertTrue(d.isValid)
+    }
+
+    func testIdFollowsTheHostNameRule() throws {
+        var d = AgentProfileDraft(id: "has space", base: "claude", displayName: "x", enabled: true,
+                                  args: "", isNew: true)
+        XCTAssertNotNil(d.idError)
+        d.id = ""
+        XCTAssertNotNil(d.idError)
+        d.id = "a.b-c_1"
+        XCTAssertNil(d.idError)
+    }
+
+    func testBlankDisplayNameAndBadArgsAreRejected() {
+        var d = AgentProfileDraft(id: "opus", base: "claude", displayName: "  ", enabled: true,
+                                  args: "", isNew: true)
+        XCTAssertNotNil(d.displayNameError)
+        XCTAssertFalse(d.isValid)
+
+        d.displayName = "Opus"
+        d.args = "--x {{nope}}"
+        XCTAssertNotNil(d.argsError)
+        XCTAssertFalse(d.isValid)
+    }
+}
