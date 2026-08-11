@@ -61,4 +61,21 @@ final class AgentArgsTests: XCTestCase {
     func testPreviewOfABadTemplateIsEmptyRatherThanMisleading() {
         XCTAssertEqual(AgentArgs.preview("\"unterminated"), "")
     }
+
+    /// Regression for a divergence the fixture cannot express without changing the cross-language
+    /// contract: Rust's `split_args` iterates `chars()` (Unicode scalars), so a combining mark right
+    /// after a closing `"` is just the next ordinary character. A naive Swift `Character` walk instead
+    /// groups that combining mark onto the quote it follows into ONE extended grapheme cluster — so
+    /// the scan never sees a bare `"` there, the quote never closes, and Swift would wrongly report an
+    /// unterminated double quote where Rust accepts the input. `\u{0301}` (combining acute) is used
+    /// explicitly so the divergence is visible in the test itself.
+    func testSplitWalksUnicodeScalarsLikeRustNotGraphemeClusters() throws {
+        let input = "\"x\"\u{0301}"
+        XCTAssertEqual(try AgentArgs.split(input), ["x\u{0301}"])
+    }
+
+    func testPreviewEscapesAnApostropheInsideAQuotedElement() {
+        let out = AgentArgs.preview("--note \"it's mine\"")
+        XCTAssertEqual(out, "--note 'it'\\''s mine'")
+    }
 }

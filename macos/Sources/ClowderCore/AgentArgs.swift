@@ -13,48 +13,59 @@ public enum AgentArgs {
 
     /// Split a template the way `split_args` does: whitespace separates; `'…'` is fully literal;
     /// `"…"` honours `\"` and `\\`; `\` escapes outside quotes. No shell, no globbing, no `$VAR`.
+    ///
+    /// Walks `unicodeScalars`, not `Character`s: Rust's `split_args` iterates `chars()` (Unicode
+    /// scalars), and Swift's `Character` groups a trailing combining mark onto whatever precedes it
+    /// — even a delimiter like `"` — into one extended grapheme cluster. Iterating `Character`s would
+    /// let a combining mark glued to a closing quote hide that quote from this scan, so the two
+    /// implementations could disagree about whether input is even valid. Scalars keep them in lockstep.
     public static func split(_ s: String) throws -> [String] {
         var out: [String] = []
         var cur = ""
         var hasCur = false          // distinguishes `""` (an empty arg) from a gap between args
-        var it = Array(s)
+        let scalars = Array(s.unicodeScalars)
         var i = 0
-        while i < it.count {
-            let c = it[i]
+        while i < scalars.count {
+            let c = scalars[i]
             i += 1
-            if c.isWhitespace {
+            if c.properties.isWhitespace {
                 if hasCur { out.append(cur); cur = ""; hasCur = false }
             } else if c == "'" {
                 hasCur = true
                 var closed = false
-                while i < it.count {
-                    let n = it[i]; i += 1
+                while i < scalars.count {
+                    let n = scalars[i]; i += 1
                     if n == "'" { closed = true; break }
-                    cur.append(n)
+                    cur.unicodeScalars.append(n)
                 }
                 if !closed { throw SplitError(message: "unterminated single quote (') in arguments") }
             } else if c == "\"" {
                 hasCur = true
                 var closed = false
-                while i < it.count {
-                    let n = it[i]; i += 1
+                while i < scalars.count {
+                    let n = scalars[i]; i += 1
                     if n == "\"" { closed = true; break }
                     if n == "\\" {
-                        guard i < it.count else { break }
-                        let e = it[i]; i += 1
-                        if e == "\"" || e == "\\" { cur.append(e) } else { cur.append("\\"); cur.append(e) }
+                        guard i < scalars.count else { break }
+                        let e = scalars[i]; i += 1
+                        if e == "\"" || e == "\\" {
+                            cur.unicodeScalars.append(e)
+                        } else {
+                            cur.unicodeScalars.append("\\")
+                            cur.unicodeScalars.append(e)
+                        }
                     } else {
-                        cur.append(n)
+                        cur.unicodeScalars.append(n)
                     }
                 }
                 if !closed { throw SplitError(message: "unterminated double quote (\") in arguments") }
             } else if c == "\\" {
                 hasCur = true
-                guard i < it.count else { throw SplitError(message: "trailing backslash (\\) in arguments") }
-                cur.append(it[i]); i += 1
+                guard i < scalars.count else { throw SplitError(message: "trailing backslash (\\) in arguments") }
+                cur.unicodeScalars.append(scalars[i]); i += 1
             } else {
                 hasCur = true
-                cur.append(c)
+                cur.unicodeScalars.append(c)
             }
         }
         if hasCur { out.append(cur) }
@@ -97,7 +108,14 @@ public enum AgentArgs {
             .map { arg -> String in
                 var out = arg
                 for (t, v) in example { out = out.replacingOccurrences(of: "{{\(t)}}", with: v) }
-                return out.contains(where: { $0.isWhitespace }) ? "'\(out)'" : out
+                guard out.contains(where: { $0.isWhitespace }) else { return out }
+                // POSIX-safe single quoting: a literal `'` cannot appear inside a single-quoted
+                // string, so close the quote, emit an escaped apostrophe, and reopen it. Naively
+                // wrapping `it's mine` as `'it's mine'` is not valid quoting — a value with both a
+                // space and an apostrophe would render as something that does not parse the way the
+                // preview implies.
+                let escaped = out.replacingOccurrences(of: "'", with: "'\\''")
+                return "'\(escaped)'"
             }
             .joined(separator: " ")
     }
