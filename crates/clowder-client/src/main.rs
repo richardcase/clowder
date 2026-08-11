@@ -117,8 +117,9 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Some("remote") => clowder_client::remote_cli::run(&args[2..]).await,
+        Some("agent") => clowder_client::agent_cli::run(&args[2..]).await,
         // Legacy: `clowder <pane-id>` still attaches.
         Some(other) if other.parse::<u64>().is_ok() => attach(other.parse().unwrap()).await,
-        _ => Err(anyhow!("usage: clowder <spawn|project|attach|connect|remote|remote-host|remote-token> ...")),
+        _ => Err(anyhow!("usage: clowder <spawn|project|agent|attach|connect|remote|remote-host|remote-token> ...")),
     }
 }

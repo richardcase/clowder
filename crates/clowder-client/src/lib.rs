@@ -22,6 +22,7 @@ async fn next_control_line<R: AsyncRead + Unpin>(
         .map_err(anyhow::Error::from)
 }
 
+pub mod agent_cli;
 pub mod forward;
 pub mod probe;
 pub mod remote_cli;

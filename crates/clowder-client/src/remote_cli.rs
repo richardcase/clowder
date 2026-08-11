@@ -6,7 +6,7 @@ use std::collections::HashMap;
 /// The complete set of `--flags` that take a value. Everything else is a boolean, so
 /// `--tls studio` leaves `studio` as a positional instead of swallowing it.
 const VALUE_FLAGS: &[&str] = &[
-    "address", "token", "rename", "fingerprint", "timeout", "socket-dir",
+    "address", "token", "rename", "fingerprint", "timeout", "socket-dir", "base", "name", "args",
 ];
 
 /// Parsed `--flag`/positional arguments. Deliberately tiny: this repo's CLI is hand-rolled

@@ -137,7 +137,7 @@ no hooks). The `clowder` CLI: `clowder spawn <project> <task> [adapter]` and `cl
 The spawnable list is **not** the adapter list: it is the set of enabled **agent profiles** — named
 wrappers around those adapters, each with an argument template appended to the adapter's own args —
 stored per-daemon in `$XDG_STATE_HOME/clowder/agent-profiles.json` (`CLOWDER_AGENT_PROFILES_FILE`
-overrides) and managed with `clowder agent add|list|set|enable|disable|rm` or the Settings window's
+overrides) and managed with `clowder agent list|add|set|enable|disable|rm` or the Settings window's
 Agents tab. The file holds only deltas: built-ins always exist (disable-able, not deletable) and
 appear even if the file is empty. Template tokens (`{{project_name}}`, `{{project_path}}`,
 `{{workspace_name}}`, `{{workspace_path}}`, `{{branch}}`) are substituted **per already-split
