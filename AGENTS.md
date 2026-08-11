@@ -110,6 +110,22 @@ The passwd tier is not optional: launchd sets no `SHELL`, and a login `zsh` does
 either, so capturing a login environment cannot supply it. See
 `docs/superpowers/specs/2026-08-10-clowder-login-env-capture-design.md`.
 
+**The clipboard is libghostty's, routed through the app.** libghostty owns no clipboard — it calls
+back into the app for every read and write, and each callback is handed the *surface's* userdata
+(which `SurfaceView` sets to itself), so there is no app-level surface registry. Consequences worth
+knowing: **copy-on-select is libghostty's own** (`copy-on-select` is default-true on macOS) and only
+works because `supports_selection_clipboard = true`; both clipboard kinds land on
+`NSPasteboard.general` since macOS has no primary selection. **Paste protection is on**, so a
+multi-line paste outside bracketed-paste mode prompts — a paste that "does nothing" is usually a
+missed confirmation, not a broken callback. **OSC 52** follows ghostty's defaults: writes allowed,
+reads prompt. Declining any prompt completes the request with empty text but `confirmed: true` on
+purpose: completing an OSC 52 read with `false` re-raises `UnauthorizedPaste` and loops the prompt
+forever. Copy/Paste/Select All ride AppKit's **stock** Edit menu via `copy:`/`paste:`/`selectAll:` on
+`SurfaceView`; Cut is greyed out because `cut:` is deliberately not implemented (scrollback is not
+editable). Right-click shows a context menu only when `ghostty_surface_mouse_button` reports the
+press unconsumed — a mouse-reporting program like vim consumes it. See
+`docs/superpowers/specs/2026-08-11-clowder-clipboard-design.md`.
+
 **Worktrees live outside the project** (`[worktrees] base` / `CLOWDER_WORKTREE_BASE`), defaulting to
 `$XDG_DATA_HOME/clowder/worktrees` › `~/.local/share/clowder/worktrees`. The per-agent path is
 `<base>/<project-basename>-<hash12>/<name>`, so two repos with the same name never collide. Pre-#65

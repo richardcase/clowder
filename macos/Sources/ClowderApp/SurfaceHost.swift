@@ -1,4 +1,5 @@
 import AppKit
+import ClowderCore
 import GhosttyKit
 
 /// Owns one SurfaceView per pane so switching agents never restarts `clowder attach`.
@@ -9,6 +10,13 @@ final class SurfaceHost {
     private(set) var socketPath: String
     private var views: [UInt64: SurfaceView] = [:]
 
+    /// Runs a clowder command chosen from a pane's context menu. Set by the app delegate once the
+    /// AppModel exists; re-applied on every `view(for:)` so ordering and `retarget` can't strand it.
+    var runCommand: ((CommandID) -> Void)?
+
+    /// Whether Close Pane applies to the focused pane right now.
+    var canClosePane: (() -> Bool)?
+
     init(app: ghostty_app_t, clowderBinary: String, socketPath: String) {
         self.app = app
         self.clowderBinary = clowderBinary
@@ -16,9 +24,11 @@ final class SurfaceHost {
     }
 
     func view(for pane: UInt64) -> SurfaceView {
-        if let v = views[pane] { return v }
-        let v = SurfaceView(app: app, paneId: pane, clowderBinary: clowderBinary, socketPath: socketPath)
+        let v = views[pane]
+            ?? SurfaceView(app: app, paneId: pane, clowderBinary: clowderBinary, socketPath: socketPath)
         views[pane] = v
+        v.onCommand = runCommand
+        v.canClosePane = canClosePane
         return v
     }
 

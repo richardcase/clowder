@@ -1,4 +1,5 @@
 import AppKit
+import ClowderCore
 import GhosttyKit
 
 /// A bare NSView that hosts one libghostty surface. libghostty installs its own
@@ -27,6 +28,15 @@ final class SurfaceView: NSView {
 
     /// Called when this surface becomes first responder (e.g. the user clicks it).
     var onFocus: (() -> Void)?
+
+    /// Runs a clowder command chosen from this pane's context menu (splits, close).
+    var onCommand: ((CommandID) -> Void)?
+
+    /// Whether Close Pane applies right now — the context menu asks before it is shown.
+    var canClosePane: (() -> Bool)?
+
+    /// Where copies land and pastes come from. A stored property so a test double could stand in.
+    var pasteboard: ClowderCore.Pasteboard = SystemPasteboard()
 
     override func becomeFirstResponder() -> Bool {
         let ok = super.becomeFirstResponder()
@@ -174,7 +184,18 @@ final class SurfaceView: NSView {
     override func mouseDown(with e: NSEvent)  { sendMouseButton(e, GHOSTTY_MOUSE_PRESS,   GHOSTTY_MOUSE_LEFT) }
     override func mouseUp(with e: NSEvent)    { sendMouseButton(e, GHOSTTY_MOUSE_RELEASE, GHOSTTY_MOUSE_LEFT) }
     override func mouseDragged(with e: NSEvent) { sendMousePos(e) }
-    override func rightMouseDown(with e: NSEvent)  { sendMouseButton(e, GHOSTTY_MOUSE_PRESS,   GHOSTTY_MOUSE_RIGHT) }
+    /// libghostty's `right-click-action` defaults to `context-menu`: on a right-press it selects
+    /// the word (or link) under the cursor and deliberately reports the event as *not* consumed,
+    /// which is its way of asking the host to show a menu. It does consume the event when a
+    /// mouse-reporting program like vim owns the mouse — so honouring the return value suppresses
+    /// the menu in exactly the cases where it would be wrong.
+    override func rightMouseDown(with e: NSEvent) {
+        guard let surface else { return }
+        sendMousePos(e)
+        let consumed = ghostty_surface_mouse_button(surface, GHOSTTY_MOUSE_PRESS, GHOSTTY_MOUSE_RIGHT,
+                                                   ghosttyMods(e.modifierFlags))
+        if !consumed { showContextMenu(for: e) }
+    }
     override func rightMouseUp(with e: NSEvent)    { sendMouseButton(e, GHOSTTY_MOUSE_RELEASE, GHOSTTY_MOUSE_RIGHT) }
     override func rightMouseDragged(with e: NSEvent) { sendMousePos(e) }
     override func otherMouseDown(with e: NSEvent)  { sendMouseButton(e, GHOSTTY_MOUSE_PRESS,   GHOSTTY_MOUSE_MIDDLE) }
@@ -198,6 +219,164 @@ final class SurfaceView: NSView {
     deinit {
         if let surface { ghostty_surface_free(surface) }
     }
+}
+
+// MARK: - Clipboard
+
+extension SurfaceView {
+    private var hasSelection: Bool {
+        guard let surface else { return false }
+        return ghostty_surface_has_selection(surface)
+    }
+
+    /// Run one of libghostty's own keybinding actions by name.
+    @discardableResult
+    private func perform(_ action: String) -> Bool {
+        guard let surface else { return false }
+        return action.withCString { ghostty_surface_binding_action(surface, $0, UInt(strlen($0))) }
+    }
+
+    // MARK: Runtime callbacks
+
+    /// libghostty copied something. Both clipboard kinds land on the general pasteboard: macOS has
+    /// no primary selection, so a SELECTION write (which is what copy-on-select produces) has
+    /// nowhere else sensible to go.
+    func writeClipboard(_ flavours: [ClipboardContent], confirm: Bool) {
+        guard let plain = TerminalClipboard.plainText(from: flavours) else { return }
+        let html = TerminalClipboard.html(from: flavours)
+        guard confirm else {
+            pasteboard.write(plain: plain, html: html)
+            return
+        }
+        // A program in the pane asked to replace the clipboard (OSC 52 with clipboard-write = ask).
+        // Nothing to complete here — this request arrives through the write callback, not as a
+        // clipboard request, so declining simply means not writing.
+        ask(.osc52Write, text: plain) { [weak self] confirmed in
+            guard confirmed, let self else { return }
+            self.pasteboard.write(plain: plain, html: html)
+        }
+    }
+
+    /// libghostty wants clipboard contents. Returning false tells it to release the request state,
+    /// which is why an empty pasteboard must not be answered with an empty string.
+    ///
+    /// `kind` is ignored on purpose: a SELECTION read (middle-click paste) should come from the
+    /// same place a SELECTION write went, and on macOS that is the general pasteboard.
+    func readClipboard(kind: ghostty_clipboard_e, state: UnsafeMutableRawPointer) -> Bool {
+        guard let surface, let text = pasteboard.string() else { return false }
+        text.withCString { ghostty_surface_complete_clipboard_request(surface, $0, state, false) }
+        return true
+    }
+
+    /// libghostty judged the request unsafe (a multi-line paste outside bracketed-paste mode) or
+    /// unauthorised (OSC 52 read with `clipboard-read = ask`) and is asking the user.
+    ///
+    /// The `state` pointer is heap-allocated by libghostty and released *only* by
+    /// `complete_clipboard_request`, so both answers complete it — exactly once. The one path that
+    /// does not is a surface freed while the alert was up, where completing would be a
+    /// use-after-free; that leaks one request rather than crashing.
+    func confirmReadClipboard(text: String,
+                              state: UnsafeMutableRawPointer,
+                              request: ghostty_clipboard_request_e) {
+        ask(PasteRequestKind(request), text: text) { [weak self] confirmed in
+            guard let self, let surface = self.surface else { return }
+            // Declining completes with empty text but still says `confirmed` — an OSC 52 read
+            // completed with `confirmed: false` raises UnauthorizedPaste again and re-enters this
+            // callback, which would loop the prompt forever. Empty text is what makes that safe:
+            // a paste of nothing returns early, and an OSC 52 read replies with an empty
+            // clipboard, which is the denial the program should see.
+            let reply = confirmed ? text : ""
+            reply.withCString {
+                ghostty_surface_complete_clipboard_request(surface, $0, state, true)
+            }
+        }
+    }
+
+    /// Put a confirmation in front of the user and report what they chose.
+    ///
+    /// Always deferred to the next main-queue turn: these callbacks arrive from inside libghostty,
+    /// and running a modal loop there would re-enter it.
+    private func ask(_ kind: PasteRequestKind, text: String, then finish: @escaping (Bool) -> Void) {
+        let content = PasteConfirmation.alert(kind: kind, text: text)
+        DispatchQueue.main.async { [weak self] in
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = content.title
+            alert.informativeText = content.message
+            alert.addButton(withTitle: content.confirmTitle)
+            alert.addButton(withTitle: "Cancel")
+            if let window = self?.window {
+                alert.beginSheetModal(for: window) { finish($0 == .alertFirstButtonReturn) }
+            } else {
+                finish(alert.runModal() == .alertFirstButtonReturn)
+            }
+        }
+    }
+}
+
+// MARK: - Menus
+
+extension SurfaceView: NSMenuItemValidation {
+    // AppKit's stock Edit menu already carries ⌘C/⌘V/⌘A and targets the first responder, which is
+    // the focused pane. Implementing these selectors is all it takes to light it up — and *not*
+    // implementing `cut:` is what correctly leaves Cut greyed out, since a terminal's scrollback
+    // is not an editable buffer. AppKit never validates an item whose action no responder
+    // implements, so Cut and Undo stay disabled without us saying anything.
+    @objc func copy(_ sender: Any?) { perform("copy_to_clipboard") }
+    @objc func paste(_ sender: Any?) { perform("paste_from_clipboard") }
+    // NSResponder already declares selectAll(_:), so this one overrides rather than adds.
+    @objc override func selectAll(_ sender: Any?) { perform("select_all") }
+
+    func validateMenuItem(_ item: NSMenuItem) -> Bool {
+        switch item.action {
+        case #selector(copy(_:)): return hasSelection
+        case #selector(paste(_:)): return pasteboard.string() != nil
+        default: return true
+        }
+    }
+
+    fileprivate func showContextMenu(for event: NSEvent) {
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+        for entry in TerminalMenu.contextMenu(hasSelection: hasSelection,
+                                              pasteboardHasText: pasteboard.string() != nil,
+                                              canClosePane: canClosePane?() ?? false) {
+            guard let entry else {
+                menu.addItem(.separator())
+                continue
+            }
+            let item = NSMenuItem(title: entry.title, action: nil, keyEquivalent: "")
+            item.isEnabled = entry.isEnabled
+            if entry.isEnabled {
+                item.target = self
+                item.action = selector(for: entry.action)
+                item.representedObject = MenuCommand(entry.action)
+            }
+            menu.addItem(item)
+        }
+        NSMenu.popUpContextMenu(menu, with: event, for: self)
+    }
+
+    private func selector(for action: TerminalMenuAction) -> Selector {
+        switch action {
+        case .copy: return #selector(copy(_:))
+        case .paste: return #selector(paste(_:))
+        case .selectAll: return #selector(selectAll(_:))
+        case .command: return #selector(runMenuCommand(_:))
+        }
+    }
+
+    @objc private func runMenuCommand(_ sender: NSMenuItem) {
+        guard let wrapper = sender.representedObject as? MenuCommand,
+              case let .command(id) = wrapper.action else { return }
+        onCommand?(id)
+    }
+}
+
+/// Boxes a `TerminalMenuAction` so it can ride along in `NSMenuItem.representedObject`.
+private final class MenuCommand: NSObject {
+    let action: TerminalMenuAction
+    init(_ action: TerminalMenuAction) { self.action = action }
 }
 
 extension SurfaceView: NSTextInputClient {
