@@ -251,10 +251,16 @@ pub fn merged_profiles(rows: Vec<AgentProfile>, builtins: &[(&str, &str)]) -> Ve
         })
         .collect();
 
+    // First row wins on a duplicate id — matching the built-in `.find()` above, which already
+    // collapses a duplicated built-in id to one entry silently. A hand-edited file can duplicate a
+    // user id too, and `id` is the stable identity (spawn recording, `resolve(id)`, a SwiftUI
+    // `Identifiable` id later), so duplicates must never reach the effective list.
+    let mut seen_user_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     out.extend(
         rows.into_iter()
             .filter(|r| !builtins.iter().any(|(id, _)| *id == r.id))
             .filter(|r| builtins.iter().any(|(id, _)| *id == r.base))
+            .filter(|r| seen_user_ids.insert(r.id.clone()))
             .map(|profile| EffectiveProfile { profile, builtin: false }),
     );
     out
@@ -450,6 +456,20 @@ mod tests {
     }
 
     #[test]
+    fn a_duplicated_user_id_keeps_only_the_first_row() {
+        // Mirrors the built-in `.find()` behaviour above: a hand-edited file with two rows sharing
+        // one id must never surface two entries for that id.
+        let mut first = profile("opus", "claude");
+        first.display_name = "First".into();
+        let mut second = profile("opus", "claude");
+        second.display_name = "Second".into();
+        let out = merged_profiles(vec![first, second], BUILTINS);
+        let opus: Vec<_> = out.iter().filter(|e| e.profile.id == "opus").collect();
+        assert_eq!(opus.len(), 1, "a duplicated id must yield exactly one entry");
+        assert_eq!(opus[0].profile.display_name, "First", "first row wins on a duplicate id");
+    }
+
+    #[test]
     fn validate_profile_rejects_bad_ids_names_and_bases() {
         assert!(validate_profile(&profile("opus", "claude"), BUILTINS).is_ok());
 
@@ -465,6 +485,14 @@ mod tests {
         let mut blank = profile("x", "claude");
         blank.display_name = "  ".into();
         assert!(validate_profile(&blank, BUILTINS).is_err(), "a blank display name is unusable in a picker");
+
+        let mut max_len = profile("x", "claude");
+        max_len.display_name = "x".repeat(64);
+        assert!(validate_profile(&max_len, BUILTINS).is_ok(), "64 chars is the boundary, still valid");
+
+        let mut too_long = profile("x", "claude");
+        too_long.display_name = "x".repeat(65);
+        assert!(validate_profile(&too_long, BUILTINS).is_err(), "65 chars exceeds the display-name limit");
 
         let mut bad_args = profile("x", "claude");
         bad_args.args = "--x {{nope}}".into();
