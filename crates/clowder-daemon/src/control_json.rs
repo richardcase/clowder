@@ -479,7 +479,15 @@ mod tests {
 
     #[test]
     fn list_adapters_returns_registry_descriptor_ids() {
-        let daemon = Daemon::new();
+        let state = tempfile::tempdir().unwrap();
+        let daemon = Daemon::new_with_paths(
+            Arc::new(FakeNotifier::new()),
+            std::path::PathBuf::from("/tmp/unused-descriptor-ids.sock"),
+            state.path().join("agents.json"),
+            state.path().join("projects.json"),
+            state.path().join("agent-profiles.json"),
+            state.path().join("worktrees"),
+        );
         let ids: Vec<String> = daemon.list_adapters().into_iter().map(|a| a.id).collect();
         // Descriptor ids (NOT adapter.id() — shell's adapter reports "synthetic").
         assert!(ids.contains(&"claude".to_string()));
@@ -578,9 +586,14 @@ mod tests {
 
     #[tokio::test]
     async fn control_json_list_adapters_yields_adapter_list_with_codex() {
-        let daemon = Arc::new(Daemon::new_with(
+        let state = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(Daemon::new_with_paths(
             Arc::new(FakeNotifier::new()),
             std::path::PathBuf::from("/tmp/unused-cjson4.sock"),
+            state.path().join("agents.json"),
+            state.path().join("projects.json"),
+            state.path().join("agent-profiles.json"),
+            state.path().join("worktrees"),
         ));
 
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
@@ -683,5 +696,72 @@ mod tests {
             ControlEvent::Error { message } => assert!(message.contains("built-in"), "{message}"),
             other => panic!("expected an Error, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn control_json_broadcasts_a_profile_add_to_a_second_connection() {
+        // The whole point of the broadcast: a connection that did NOT make the mutation must
+        // still learn about it. `control_json_adds_a_profile_and_broadcasts_the_new_lists` only
+        // ever reads the mutating connection's own stream, so it would still pass if the
+        // broadcast were deleted and only the direct reply remained — this test exists to close
+        // that gap.
+        let state = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(Daemon::new_with_paths(
+            Arc::new(FakeNotifier::new()),
+            std::path::PathBuf::from("/tmp/unused-cjson-profiles-broadcast.sock"),
+            state.path().join("agents.json"),
+            state.path().join("projects.json"),
+            state.path().join("agent-profiles.json"),
+            state.path().join("worktrees"),
+        ));
+
+        // Connection A makes the mutation.
+        let (mut client_a, server_a) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(daemon.clone().handle_control_json(server_a));
+        let (crd_a, mut cwr_a) = tokio::io::split(&mut client_a);
+        let mut lines_a = BufReader::new(crd_a).lines();
+        let _snapshot_a = lines_a.next_line().await.unwrap(); // the initial WorktreeList
+
+        // Connection B never sends a request — it only observes what the daemon broadcasts.
+        let (mut client_b, server_b) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(daemon.clone().handle_control_json(server_b));
+        let mut lines_b = BufReader::new(&mut client_b).lines();
+        let _snapshot_b = lines_b.next_line().await.unwrap(); // the initial WorktreeList, drained
+
+        cwr_a.write_all(
+            b"{\"type\":\"addAgentProfile\",\"profile\":{\"id\":\"opus\",\"base\":\"claude\",\
+              \"displayName\":\"Claude (Opus)\",\"enabled\":true,\"args\":\"--model opus\",\"builtin\":false}}\n",
+        )
+        .await
+        .unwrap();
+
+        // Collect a bounded number of lines from B and assert on the SET, since the profile-list
+        // and adapter-list broadcast events are not ordered against each other (mirrors
+        // `control_json_adds_a_profile_and_broadcasts_the_new_lists`'s style). B never wrote a
+        // request, so every line it sees (after its own initial snapshot) is broadcast-driven.
+        let mut saw_profiles_with_opus = false;
+        let mut saw_adapters_with_opus = false;
+        for _ in 0..4 {
+            let l = tokio::time::timeout(Duration::from_secs(2), lines_b.next_line())
+                .await
+                .expect("connection B received nothing within 2s — the mutation on A never broadcast to it")
+                .unwrap()
+                .expect("connection B's stream closed before a broadcast arrived");
+            match serde_json::from_str::<ControlEvent>(&l) {
+                Ok(ControlEvent::AgentProfileList { profiles }) => {
+                    saw_profiles_with_opus |= profiles.iter().any(|p| p.id == "opus");
+                }
+                Ok(ControlEvent::AdapterList { adapters }) => {
+                    saw_adapters_with_opus |= adapters.iter().any(|a| a.id == "opus");
+                }
+                Ok(ControlEvent::Error { message }) => panic!("unexpected error on B: {message}"),
+                _ => {}
+            }
+            if saw_profiles_with_opus && saw_adapters_with_opus {
+                break;
+            }
+        }
+        assert!(saw_profiles_with_opus, "connection B (which never mutated anything) must learn the new profile via the broadcast");
+        assert!(saw_adapters_with_opus, "connection B must learn the new adapter via the broadcast too");
     }
 }
