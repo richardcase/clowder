@@ -155,4 +155,60 @@ final class AgentsViewModelTests: XCTestCase {
         vm.dismissError()
         XCTAssertNil(vm.lastError)
     }
+
+    // MARK: - Fix round 1
+
+    func testASuccessfulAddSelectsTheNewProfileOnceTheBroadcastArrives() {
+        let (vm, rec) = model()
+        vm.beginAdd()
+        vm.draft?.id = "plan"
+        vm.draft?.displayName = "Planner"
+        vm.draft?.base = "claude"
+        vm.save()
+        guard case let .addAgentProfile(added)? = rec.sent.last else {
+            return XCTFail("expected addAgentProfile, got \(rec.sent)")
+        }
+        vm.apply(profiles: vm.profiles + [added])
+        XCTAssertEqual(vm.selected, "plan", "a confirmed add must select the new profile")
+        XCTAssertEqual(vm.draft?.isNew, false, "the draft must stop being 'new' once it exists")
+        XCTAssertFalse(vm.isDirty, "otherwise Save/Revert stay lit forever and a second Save re-adds")
+    }
+
+    func testReportErrorSetsLastErrorAndDismissClearsIt() {
+        let (vm, _) = model()
+        vm.reportError("agent id 'opus' already exists")
+        XCTAssertEqual(vm.lastError, "agent id 'opus' already exists")
+        vm.dismissError()
+        XCTAssertNil(vm.lastError)
+    }
+
+    func testApplyAdoptsARemoteChangeWhenTheDraftIsNotDirty() {
+        let (vm, _) = model()
+        vm.select("opus")
+        XCTAssertFalse(vm.isDirty)
+        let changed = AgentProfileInfo(id: "opus", base: "claude",
+                                       displayName: "Claude (Opus, renamed elsewhere)",
+                                       enabled: true, args: "--model opus", builtin: false)
+        var profiles = vm.profiles
+        profiles[profiles.firstIndex(where: { $0.id == "opus" })!] = changed
+        vm.apply(profiles: profiles)
+        XCTAssertEqual(vm.draft?.displayName, "Claude (Opus, renamed elsewhere)",
+                       "an undirtied draft should pick up a remote change")
+        XCTAssertFalse(vm.isDirty)
+    }
+
+    func testApplyKeepsALocalEditWhenTheProfileAlsoChangedRemotely() {
+        let (vm, _) = model()
+        vm.select("opus")
+        vm.draft?.displayName = "My local edit"
+        XCTAssertTrue(vm.isDirty)
+        let changedElsewhere = AgentProfileInfo(id: "opus", base: "claude",
+                                                displayName: "Someone else's edit",
+                                                enabled: true, args: "--model opus", builtin: false)
+        var profiles = vm.profiles
+        profiles[profiles.firstIndex(where: { $0.id == "opus" })!] = changedElsewhere
+        vm.apply(profiles: profiles)
+        XCTAssertEqual(vm.draft?.displayName, "My local edit",
+                       "a dirty draft must not be clobbered by a concurrent remote edit")
+    }
 }

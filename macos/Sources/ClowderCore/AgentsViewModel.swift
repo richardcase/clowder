@@ -17,6 +17,18 @@ public final class AgentsViewModel: ObservableObject {
     @Published public var draft: AgentProfileDraft?
     @Published public private(set) var lastError: String?
 
+    /// The stored values `draft` was created from. `isDirty` diffs against this, not against the live
+    /// `selectedProfile` — so a remote edit landing via `apply(profiles:)` while the user has typed
+    /// nothing does not masquerade as a local change, and an actual local change is never silently
+    /// overwritten by adopting a concurrent remote edit underneath it.
+    private var baseline: AgentProfileInfo?
+
+    /// The id just sent in an `.addAgentProfile` that hasn't yet been confirmed by a broadcast
+    /// containing it. Without this, a successful add leaves `selected` nil and `draft.isNew` true
+    /// forever — `isDirty` never settles, and a second Save re-sends the same id as a duplicate add.
+    /// `apply(profiles:)` adopts the pane onto the new profile once this id actually appears.
+    private var pendingAddID: String?
+
     private let send: (ControlRequest) throws -> Void
 
     public init(send: @escaping (ControlRequest) throws -> Void) {
@@ -30,14 +42,15 @@ public final class AgentsViewModel: ObservableObject {
     /// Built-ins can be edited and disabled but never removed — the daemon refuses it too.
     public var canRemoveSelection: Bool { selectedProfile.map { !$0.builtin } ?? false }
 
-    /// Whether `draft` differs from what the daemon holds, so Save/Revert only light up when there
-    /// is something to save or discard.
+    /// Whether `draft` differs from `baseline` — the values it was created from — so Save/Revert
+    /// only light up when there is something to save or discard. Deliberately not compared against
+    /// `selectedProfile`: see `baseline`.
     public var isDirty: Bool {
         guard let draft else { return false }
         guard !draft.isNew else { return draft != AgentProfileDraft() }
-        guard let p = selectedProfile else { return true }
-        return draft.displayName != p.displayName || draft.enabled != p.enabled
-            || draft.args != p.args || draft.base != p.base
+        guard let baseline else { return true }
+        return draft.displayName != baseline.displayName || draft.enabled != baseline.enabled
+            || draft.args != baseline.args || draft.base != baseline.base
     }
 
     /// The editor's live preview of the resolved arguments.
@@ -45,31 +58,59 @@ public final class AgentsViewModel: ObservableObject {
 
     public func dismissError() { lastError = nil }
 
-    /// Adopt a list from the daemon. Keeps the current selection and any in-progress edit, unless
-    /// the selected profile has gone away.
+    /// Push an error into this pane's error slot from outside.
+    ///
+    /// The daemon reports a refused mutation as a bare, uncorrelated `ControlEvent.error` — it
+    /// carries no request id, so it cannot be routed back here automatically and lands instead on
+    /// `AgentStore.lastError`. Whoever owns both this view model and the store is responsible for
+    /// forwarding it here, so a refusal can actually be explained inside the Agents pane instead of
+    /// leaving it silently stuck (e.g. mid-save). Mirrors `AgentStore.reportLocalError`.
+    public func reportError(_ message: String) { lastError = message }
+
+    /// Adopt a list from the daemon.
+    ///
+    /// - A pending add whose id has now appeared is adopted: the pane selects it and the draft
+    ///   becomes a normal (non-new) draft of it, so `isDirty` settles and a second Save is possible.
+    /// - Otherwise, while the selection is still present: an undirtied draft adopts the (possibly
+    ///   remotely changed) stored values; a dirtied draft is left completely untouched, so a
+    ///   concurrent edit from elsewhere is never silently clobbered by this pane's own Save.
+    /// - A selection that has gone away is cleared, along with its draft.
     public func apply(profiles: [AgentProfileInfo]) {
         self.profiles = profiles
+
+        if let pendingAddID, let added = profiles.first(where: { $0.id == pendingAddID }) {
+            self.pendingAddID = nil
+            adopt(added)
+            return
+        }
+
         guard let selected else { return }
-        if !profiles.contains(where: { $0.id == selected }) {
+        guard let p = profiles.first(where: { $0.id == selected }) else {
             self.selected = nil
             draft = nil
+            baseline = nil
+            return
         }
+        if !isDirty { adopt(p) }
     }
 
     public func reload() { dispatch(.listAgentProfiles) }
 
     public func select(_ id: String?) {
-        selected = id
+        pendingAddID = nil
         guard let p = id.flatMap({ i in profiles.first { $0.id == i } }) else {
+            selected = id
             draft = nil
+            baseline = nil
             return
         }
-        draft = AgentProfileDraft(id: p.id, base: p.base, displayName: p.displayName,
-                                  enabled: p.enabled, args: p.args, isNew: false)
+        adopt(p)
     }
 
     public func beginAdd() {
         selected = nil
+        baseline = nil
+        pendingAddID = nil
         draft = AgentProfileDraft()
     }
 
@@ -78,6 +119,8 @@ public final class AgentsViewModel: ObservableObject {
     public func duplicateSelected() {
         guard let p = selectedProfile else { return }
         selected = nil
+        baseline = nil
+        pendingAddID = nil
         draft = AgentProfileDraft(id: freshID(basedOn: p.id), base: p.base,
                                   displayName: "\(p.displayName) copy", enabled: p.enabled,
                                   args: p.args, isNew: true)
@@ -94,7 +137,14 @@ public final class AgentsViewModel: ObservableObject {
         }
         let wire = AgentProfileInfo(id: draft.id, base: draft.base, displayName: draft.displayName,
                                     enabled: draft.enabled, args: draft.args, builtin: false)
-        dispatch(draft.isNew ? .addAgentProfile(wire) : .updateAgentProfile(wire))
+        if draft.isNew {
+            // Remembered so `apply(profiles:)` can adopt the pane once the broadcast confirms it —
+            // see `pendingAddID`. Only set once the request was actually dispatched, so a local send
+            // failure can't leave a stale id waiting to be (mis)matched by some later, unrelated add.
+            if dispatch(.addAgentProfile(wire)) { pendingAddID = draft.id }
+        } else {
+            dispatch(.updateAgentProfile(wire))
+        }
     }
 
     public func remove(_ id: String) {
@@ -105,8 +155,24 @@ public final class AgentsViewModel: ObservableObject {
         dispatch(.removeAgentProfile(id: id))
     }
 
-    private func dispatch(_ req: ControlRequest) {
-        do { try send(req) } catch { lastError = "Could not reach the daemon: \(error.localizedDescription)" }
+    /// Point the pane at a stored profile: selection, baseline and a fresh non-new draft, together,
+    /// so the three can never drift apart.
+    private func adopt(_ p: AgentProfileInfo) {
+        selected = p.id
+        baseline = p
+        draft = AgentProfileDraft(id: p.id, base: p.base, displayName: p.displayName,
+                                  enabled: p.enabled, args: p.args, isNew: false)
+    }
+
+    @discardableResult
+    private func dispatch(_ req: ControlRequest) -> Bool {
+        do {
+            try send(req)
+            return true
+        } catch {
+            lastError = "Could not reach the daemon: \(error.localizedDescription)"
+            return false
+        }
     }
 
     /// `<id>-copy`, then `-copy2`, `-copy3`… — always a valid id, never a collision.
