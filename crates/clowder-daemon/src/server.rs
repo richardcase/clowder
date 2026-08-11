@@ -3728,6 +3728,21 @@ mod tests {
             "project_path must reach the process: {out_str:?}"
         );
         assert!(out_str.contains(&want), "workspace_path must reach the process: {out_str:?}");
+
+        // The substring checks above only prove both halves are PRESENT — they'd pass even if
+        // `spawn_agent` prepended the profile args and appended the adapter's own, which for codex
+        // would silently break `-c notify=…`, its attention wiring. Assert ORDER explicitly: the
+        // adapter's own "base" argument must appear in the process's actual argv before any of the
+        // substituted profile args ("--w", the first of them). This generalises to codex without
+        // needing the binary in CI, since it exercises the same `cmd.args.extend(...)` append path.
+        let base_pos = out_str.find("base").expect("adapter's own arg must be present");
+        let first_profile_arg_pos =
+            out_str.find("--w").expect("the first substituted profile arg must be present");
+        assert!(
+            base_pos < first_profile_arg_pos,
+            "the adapter's own argument must precede the substituted profile args in the real \
+             process's argv, not just both be present somewhere: {out_str:?}"
+        );
     }
 
     #[tokio::test]
