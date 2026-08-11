@@ -31,3 +31,11 @@ pub use notify::{FakeNotifier, Notifier, OsNotifier};
 /// `cargo test` runs test fns in parallel by default, so this must be reachable crate-wide.
 #[cfg(test)]
 pub(crate) static STATE_FILE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// `SHELL` is process-global too. `build_adapter`'s "shell"/"synthetic" arm reads it (there's no
+/// other way to know what to resume a shell-kind agent with — that adapter carries no state of its
+/// own). Only one test overrides it today (to make a resumed "shell" agent's real argv observable
+/// without depending on a host's login shell or a `claude`/`codex` binary being installed), but any
+/// test that does must hold this lock for the whole span from `set_var` to `remove_var`/restore.
+#[cfg(test)]
+pub(crate) static SHELL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

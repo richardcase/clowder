@@ -3673,22 +3673,61 @@ mod tests {
         ));
         daemon.add_project(repo.path()).unwrap();
 
-        // /bin/echo takes any arguments and exits — a real process, no agent binary needed.
+        // /bin/echo takes any arguments and exits — a real process, no agent binary needed. Its
+        // stdout IS its argv, so this test can observe what the LAUNCHED PROCESS actually
+        // received, not just what got written to the registry.
         let adapter = SyntheticAdapter {
             command: PaneCommand { program: "/bin/echo".into(), args: vec!["base".into()], cwd: None, env: vec![] },
         };
         let spec = SpawnSpec {
             adapter: &adapter,
             profile_id: Some("echoer".into()),
-            arg_template: clowder_config::agents::split_args("--w {{workspace_name}} --b {{branch}}").unwrap(),
+            arg_template: clowder_config::agents::split_args(
+                "--w {{workspace_name}} --b {{branch}} --p {{project_path}} --wp {{workspace_path}}",
+            )
+            .unwrap(),
         };
         let pane = daemon.spawn_agent(repo.path(), spec, "task-a").unwrap();
 
+        let project_path = repo.path().canonicalize().unwrap();
+        let ws_path = daemon.workspace_of(pane).unwrap().path;
+
         let rec = daemon.registry_for_test().load().into_iter().find(|r| r.agent_id == pane.0).unwrap();
         assert_eq!(rec.profile_id.as_deref(), Some("echoer"));
-        assert_eq!(rec.extra_args, vec!["--w", "task-a", "--b", "clowder/task-a"],
-                   "tokens are substituted once, at spawn");
+        assert_eq!(
+            rec.extra_args,
+            vec![
+                "--w".to_string(), "task-a".to_string(),
+                "--b".to_string(), "clowder/task-a".to_string(),
+                "--p".to_string(), project_path.to_string_lossy().into_owned(),
+                "--wp".to_string(), ws_path.to_string_lossy().into_owned(),
+            ],
+            "tokens are substituted once, at spawn"
+        );
         assert_eq!(rec.adapter_id, "synthetic", "adapter_id still names the BASE adapter");
+
+        // The point of this test: the substituted args must reach the LAUNCHED PROCESS. If
+        // `cmd.args.extend(extra_args...)` in `spawn_agent` were ever deleted, the registry
+        // assertion above would still pass (it reads what was RECORDED, not what was RUN) — only
+        // reading the process's actual stdout can catch that regression.
+        let want = ws_path.to_string_lossy().into_owned();
+        let mut out = Vec::new();
+        for _ in 0..50 {
+            out = daemon.get(pane).unwrap().backlog();
+            if out.windows(want.len().max(1)).any(|w| w == want.as_bytes()) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let out_str = String::from_utf8_lossy(&out);
+        assert!(out_str.contains("base"), "adapter's own arg must survive: {out_str:?}");
+        assert!(out_str.contains("task-a"), "workspace_name must reach the process: {out_str:?}");
+        assert!(out_str.contains("clowder/task-a"), "branch must reach the process: {out_str:?}");
+        assert!(
+            out_str.contains(&project_path.to_string_lossy().to_string()),
+            "project_path must reach the process: {out_str:?}"
+        );
+        assert!(out_str.contains(&want), "workspace_path must reach the process: {out_str:?}");
     }
 
     #[tokio::test]
@@ -3726,13 +3765,113 @@ mod tests {
         assert!(rec.extra_args.is_empty());
     }
 
-    #[test]
-    fn resume_argv_is_the_resume_command_plus_the_recorded_args() {
-        use crate::ClaudeAdapter;
-        // The unit the reconcile path relies on: recorded args are replayed verbatim, never
-        // re-substituted, so a deleted or edited profile cannot change a running agent's argv.
-        let mut cmd = ClaudeAdapter.resume_command(std::path::Path::new("/w"));
-        cmd.args.extend(vec!["--model".to_string(), "opus".to_string()]);
-        assert_eq!(cmd.args, vec!["--continue", "--model", "opus"]);
+    #[tokio::test]
+    async fn resume_replays_recorded_args_verbatim_even_after_the_profile_is_edited_or_deleted() {
+        // End-to-end coverage of the marquee guarantee: once an agent is spawned, nothing done to
+        // the PROFILE afterwards — editing it, deleting it outright — can reach a running (or,
+        // here, a resumed-after-restart) agent's argv. `resume_agent` must replay `rec.extra_args`
+        // verbatim; it must never re-resolve or re-substitute from the live profile store.
+        use crate::{SpawnSpec, SyntheticAdapter};
+
+        let repo = crate::test_support::init_repo();
+        let state = tempfile::tempdir().unwrap();
+
+        let d1 = test_daemon_in(state.path());
+        d1.add_project(repo.path()).unwrap();
+
+        // A real profile in the store, so there is something to edit/delete "out from under" the
+        // agent below — not just a `profile_id` string with nothing backing it.
+        d1.add_agent_profile(clowder_proto::AgentProfileInfo {
+            id: "echoer".into(),
+            base: "shell".into(),
+            display_name: "Echoer".into(),
+            enabled: true,
+            args: "--tag {{branch}}".into(),
+            builtin: false,
+        })
+        .unwrap();
+
+        // Spawned directly against a `SyntheticAdapter` (not through `resolve_profile` +
+        // `build_adapter("shell")`, which would launch the test host's real `$SHELL` — fine for
+        // the INITIAL spawn but not what we're resuming into, see below) — but recorded with the
+        // same `profile_id`/substituted `arg_template` a real `spawn_from_control("echoer")` would
+        // have produced.
+        let adapter = SyntheticAdapter {
+            command: PaneCommand { program: "/bin/sh".into(), args: vec!["-c".into(), "true".into()], cwd: None, env: vec![] },
+        };
+        let spec = SpawnSpec {
+            adapter: &adapter,
+            profile_id: Some("echoer".into()),
+            arg_template: clowder_config::agents::split_args("--tag {{branch}}").unwrap(),
+        };
+        let pane = d1.spawn_agent(repo.path(), spec, "demo").unwrap();
+
+        let rec = d1.registry_for_test().load().into_iter().find(|r| r.agent_id == pane.0).unwrap();
+        assert_eq!(rec.extra_args, vec!["--tag", "clowder/demo"], "substituted once, at spawn");
+
+        // Change the profile out from under the (about-to-be-resumed) agent: edit its args to
+        // something clearly different, then remove it outright — the stronger guarantee.
+        d1.update_agent_profile(clowder_proto::AgentProfileInfo {
+            id: "echoer".into(),
+            base: "shell".into(),
+            display_name: "Echoer".into(),
+            enabled: true,
+            args: "--tag SOMETHING-ELSE-ENTIRELY".into(),
+            builtin: false,
+        })
+        .unwrap();
+        d1.remove_agent_profile("echoer").unwrap();
+        assert!(d1.resolve_profile("echoer").is_err(), "profile is genuinely gone");
+        d1.shutdown();
+
+        // `resume_agent` (shared by `reconcile` and `restart_worktree`) rebuilds the adapter from
+        // `rec.adapter_id` — "synthetic", since that's all `SyntheticAdapter::id()` ever reports —
+        // via `build_adapter`, which for "shell"/"synthetic" always launches whatever `$SHELL`
+        // currently is; the daemon has no memory of our custom launch command. So the RESUMED
+        // process is `$SHELL --tag clowder/demo`. To observe that process's real argv
+        // deterministically — without depending on the test host's login shell's own argv
+        // handling, or requiring a `claude`/`codex` binary CI does not have — point `$SHELL` at a
+        // tiny script we control that just echoes its argv. `SHELL_ENV_LOCK` brackets the whole
+        // span `build_adapter` can read it in.
+        let script_path = state.path().join("fake_shell.sh");
+        std::fs::write(&script_path, "#!/bin/sh\necho \"ARGV:$@\"\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let _shell_lock = crate::SHELL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_shell = std::env::var("SHELL").ok();
+        std::env::set_var("SHELL", &script_path);
+
+        let d2 = test_daemon_in(state.path());
+        d2.reconcile();
+
+        let resumed = d2.get(pane).unwrap();
+        let mut out = Vec::new();
+        for _ in 0..50 {
+            out = resumed.backlog();
+            if !out.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        match prev_shell {
+            Some(s) => std::env::set_var("SHELL", s),
+            None => std::env::remove_var("SHELL"),
+        }
+        drop(_shell_lock);
+
+        let out_str = String::from_utf8_lossy(&out);
+        assert!(
+            out_str.contains("clowder/demo"),
+            "resume must replay the ORIGINAL recorded args verbatim, unaffected by the profile \
+             having been edited then deleted: {out_str:?}"
+        );
+        assert!(
+            !out_str.contains("SOMETHING-ELSE-ENTIRELY"),
+            "must never reflect the profile as it stood after being edited: {out_str:?}"
+        );
     }
 }
