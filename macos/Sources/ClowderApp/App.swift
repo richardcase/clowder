@@ -77,15 +77,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         var runtime = ghostty_runtime_config_s()
         runtime.userdata = nil
-        runtime.supports_selection_clipboard = false
         runtime.wakeup_cb = { _ in
             DispatchQueue.main.async { if let a = gApp { ghostty_app_tick(a) } }
         }
         runtime.action_cb = { _, _, _ in false }
-        runtime.read_clipboard_cb = { _, _, _ in false }
-        runtime.confirm_read_clipboard_cb = { _, _, _, _ in }
-        runtime.write_clipboard_cb = { _, _, _, _, _ in }
         runtime.close_surface_cb = { _, _ in }
+        // Copy, paste and copy-on-select. Each callback recovers its SurfaceView from the
+        // *surface's* userdata, so no app-level registry is needed here.
+        GhosttyClipboard.install(&runtime)
 
         guard let app = ghostty_app_new(&runtime, config) else {
             fatalError("clowder: ghostty_app_new failed")
@@ -96,6 +95,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // --- model + surface registry ---
         let host = SurfaceHost(app: app, clowderBinary: clowderBinary, socketPath: socketPath)
         let model = AppModel(makeTransport: { try UnixSocketConnection(path: controlPath) })
+        host.runCommand = { [weak model] in model?.run($0) }
+        host.canClosePane = { [weak model] in model?.isEnabled(.closePane) ?? false }
         surfaceHost = host
         appModel = model
         model.backends = self
