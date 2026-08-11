@@ -34,6 +34,7 @@ async fn provision_spawn_hook_teardown_end_to_end() {
         hook_sock.clone(),
         state.path().join("agents.json"),
         state.path().join("projects.json"),
+        state.path().join("agent-profiles.json"),
         state.path().join("worktrees"),
     ));
     daemon.add_project(repo.path()).unwrap();
@@ -96,6 +97,7 @@ async fn spawn_agent_tears_down_worktree_on_launch_failure() {
         hook_sock.clone(),
         state.path().join("agents.json"),
         state.path().join("projects.json"),
+        state.path().join("agent-profiles.json"),
         state.path().join("worktrees"),
     ));
     daemon.add_project(repo.path()).unwrap();
@@ -166,6 +168,7 @@ async fn an_agent_launched_by_bare_name_resolves_against_the_pane_environment() 
             hook_sock.clone(),
             state.path().join("agents.json"),
             state.path().join("projects.json"),
+            state.path().join("agent-profiles.json"),
             state.path().join("worktrees"),
         )
         .with_pane_env(pane_env),

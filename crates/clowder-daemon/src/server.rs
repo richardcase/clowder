@@ -42,6 +42,17 @@ pub(crate) fn project_info(rec: crate::projects::ProjectRecord) -> clowder_proto
     }
 }
 
+/// Wire form → storage form. `builtin` is derived, never stored, so it is dropped here.
+pub(crate) fn storage_profile(p: clowder_proto::AgentProfileInfo) -> clowder_config::agents::AgentProfile {
+    clowder_config::agents::AgentProfile {
+        id: p.id,
+        base: p.base,
+        display_name: p.display_name,
+        enabled: p.enabled,
+        args: p.args,
+    }
+}
+
 /// A change to the project list, broadcast to every connected client.
 #[derive(Clone, Debug)]
 pub enum ProjectChange {
@@ -77,6 +88,11 @@ pub struct Daemon {
     pane_env: Arc<crate::login_env::PaneEnv>,
     registry: Arc<crate::registry::Registry>,
     projects: Arc<crate::projects::ProjectStore>,
+    profiles: Arc<crate::agent_profiles::AgentProfileStore>,
+    /// Ticked after any successful profile mutation. Carries no payload: every control connection
+    /// recomputes `AgentProfileList` + `AdapterList` from the store, so there is one code path
+    /// from store state to wire events.
+    profiles_tx: broadcast::Sender<()>,
     /// Where worktrees are provisioned. The SAME value the `ProjectStore` holds (both are built
     /// from one `WorktreeLayout` in `new_with_paths`), so the spawner's collision check and the
     /// "is this a worktree?" guard can never disagree about the layout.
@@ -113,6 +129,7 @@ impl Daemon {
             hook_sock,
             crate::registry::Registry::default_path(),
             crate::projects::ProjectStore::default_path(),
+            crate::agent_profiles::AgentProfileStore::default_path(),
             clowder_config::default_worktree_base(),
         )
     }
@@ -128,6 +145,7 @@ impl Daemon {
         hook_sock: PathBuf,
         registry_path: PathBuf,
         projects_path: PathBuf,
+        profiles_path: PathBuf,
         worktree_base: PathBuf,
     ) -> Daemon {
         // ONE layout, shared with the ProjectStore — see the `worktrees` field.
@@ -136,6 +154,7 @@ impl Daemon {
         let (removed_tx, _) = broadcast::channel(256);
         let (split_tx, _) = broadcast::channel(256);
         let (projects_tx, _) = broadcast::channel(256);
+        let (profiles_tx, _) = broadcast::channel(256);
         // `$SHELL` is unset under launchd, so this must consult the passwd database — otherwise
         // every companion pane in the packaged app runs /bin/sh (#76).
         let shell = clowder_config::login_shell();
@@ -165,6 +184,8 @@ impl Daemon {
             pane_env,
             registry: Arc::new(crate::registry::Registry::new(registry_path)),
             projects: Arc::new(crate::projects::ProjectStore::new(projects_path, worktrees.clone())),
+            profiles: Arc::new(crate::agent_profiles::AgentProfileStore::new(profiles_path)),
+            profiles_tx,
             worktrees,
             projects_tx,
             project_terms: Arc::new(Mutex::new(HashMap::new())),
@@ -186,6 +207,7 @@ impl Daemon {
             config.hook_sock,
             crate::registry::Registry::default_path(),
             crate::projects::ProjectStore::default_path(),
+            crate::agent_profiles::AgentProfileStore::default_path(),
             config.worktree_base,
         );
         d.backlog_cap = config.backlog_cap;
@@ -270,6 +292,49 @@ impl Daemon {
         self.projects.remove(&canonical)?;
         let _ = self.projects_tx.send(ProjectChange::Removed(canonical));
         Ok(())
+    }
+
+    pub fn subscribe_agent_profiles(&self) -> broadcast::Receiver<()> {
+        self.profiles_tx.subscribe()
+    }
+
+    /// Every profile, enabled or not — what the Settings pane renders.
+    pub fn list_agent_profiles(&self) -> Vec<clowder_proto::AgentProfileInfo> {
+        self.profiles
+            .effective()
+            .into_iter()
+            .map(|e| clowder_proto::AgentProfileInfo {
+                id: e.profile.id,
+                base: e.profile.base,
+                display_name: e.profile.display_name,
+                enabled: e.profile.enabled,
+                args: e.profile.args,
+                builtin: e.builtin,
+            })
+            .collect()
+    }
+
+    pub fn add_agent_profile(&self, p: clowder_proto::AgentProfileInfo) -> Result<()> {
+        self.profiles.add(storage_profile(p))?;
+        let _ = self.profiles_tx.send(());
+        Ok(())
+    }
+
+    pub fn update_agent_profile(&self, p: clowder_proto::AgentProfileInfo) -> Result<()> {
+        self.profiles.update(storage_profile(p))?;
+        let _ = self.profiles_tx.send(());
+        Ok(())
+    }
+
+    pub fn remove_agent_profile(&self, id: &str) -> Result<()> {
+        self.profiles.remove(id)?;
+        let _ = self.profiles_tx.send(());
+        Ok(())
+    }
+
+    /// Resolve a spawnable profile id to its adapter + argument template.
+    pub fn resolve_profile(&self, id: &str) -> Result<crate::agent_profiles::ResolvedProfile> {
+        self.profiles.resolve(id)
     }
 
     /// The shell pane rooted at a project. Lazy and idempotent: a second caller attaches to the
@@ -1090,11 +1155,16 @@ impl Daemon {
         out
     }
 
-    /// The adapters a client may spawn (registry descriptor ids + labels).
+    /// The agents a client may spawn: the ENABLED profiles, in effective order.
     pub fn list_adapters(&self) -> Vec<clowder_proto::AdapterInfo> {
-        crate::adapter_descriptors()
-            .iter()
-            .map(|d| clowder_proto::AdapterInfo { id: d.id.to_string(), display_name: d.display_name.to_string() })
+        self.profiles
+            .effective()
+            .into_iter()
+            .filter(|e| e.profile.enabled)
+            .map(|e| clowder_proto::AdapterInfo {
+                id: e.profile.id,
+                display_name: e.profile.display_name,
+            })
             .collect()
     }
 
@@ -1543,6 +1613,7 @@ mod tests {
             std::path::PathBuf::from("/tmp/unused-listagents.sock"),
             state.path().join("agents.json"),
             state.path().join("projects.json"),
+            state.path().join("agent-profiles.json"),
             state.path().join("worktrees"),
         ));
         daemon.add_project(repo.path()).unwrap();
@@ -1597,6 +1668,7 @@ mod tests {
             std::path::PathBuf::from("/tmp/unused-m9.sock"),
             statedir.path().join("agents.json"),
             statedir.path().join("projects.json"),
+            statedir.path().join("agent-profiles.json"),
             statedir.path().join("worktrees"),
         ));
         daemon.add_project(repo.path()).unwrap();
@@ -1649,6 +1721,7 @@ mod tests {
             std::path::PathBuf::from("/tmp/unused-reconcile1.sock"),
             state_path.clone(),
             projects_path.clone(),
+            statedir.path().join("agent-profiles.json"),
             statedir.path().join("worktrees"),
         ));
         daemon.add_project(repo.path()).unwrap();
@@ -1671,6 +1744,7 @@ mod tests {
             std::path::PathBuf::from("/tmp/unused-reconcile2.sock"),
             state_path.clone(),
             projects_path.clone(),
+            statedir.path().join("agent-profiles.json"),
             statedir.path().join("worktrees"),
         ));
         d2.reconcile();
@@ -1692,6 +1766,7 @@ mod tests {
             std::path::PathBuf::from("/tmp/unused-reconcile3.sock"),
             state_path.clone(),
             projects_path.clone(),
+            statedir.path().join("agent-profiles.json"),
             statedir.path().join("worktrees"),
         ));
         d3.reconcile();
@@ -1736,6 +1811,7 @@ mod tests {
             std::path::PathBuf::from("/tmp/unused-restore1.sock"),
             state_path.clone(),
             projects_path.clone(),
+            statedir.path().join("agent-profiles.json"),
             statedir.path().join("worktrees"),
         ));
         d1.add_project(repo.path()).unwrap();
@@ -1758,6 +1834,7 @@ mod tests {
             std::path::PathBuf::from("/tmp/unused-restore2.sock"),
             state_path,
             projects_path,
+            statedir.path().join("agent-profiles.json"),
             statedir.path().join("worktrees"),
         ));
         d2.reconcile();
@@ -1804,6 +1881,7 @@ mod tests {
             std::path::PathBuf::from("/tmp/unused-persist.sock"),
             state_path.clone(),
             statedir.path().join("projects.json"),
+            statedir.path().join("agent-profiles.json"),
             statedir.path().join("worktrees"),
         ));
         daemon.add_project(repo.path()).unwrap();
@@ -1855,6 +1933,7 @@ mod tests {
             std::path::PathBuf::from("/tmp/unused-control.sock"),
             state.path().join("agents.json"),
             state.path().join("projects.json"),
+            state.path().join("agent-profiles.json"),
             state.path().join("worktrees"),
         ));
         daemon.add_project(repo.path()).unwrap();
@@ -1925,6 +2004,7 @@ mod tests {
             std::path::PathBuf::from("/tmp/unused-reaper.sock"),
             state.path().join("agents.json"),
             state.path().join("projects.json"),
+            state.path().join("agent-profiles.json"),
             state.path().join("worktrees"),
         ));
         daemon.add_project(repo.path()).unwrap();
@@ -1976,6 +2056,7 @@ mod tests {
             std::path::PathBuf::from("/tmp/unused-teardown-race.sock"),
             state.path().join("agents.json"),
             state.path().join("projects.json"),
+            state.path().join("agent-profiles.json"),
             state.path().join("worktrees"),
         ));
         daemon.add_project(repo.path()).unwrap();
@@ -2022,6 +2103,7 @@ mod tests {
             std::path::PathBuf::from("/tmp/unused-removed.sock"),
             state.path().join("agents.json"),
             state.path().join("projects.json"),
+            state.path().join("agent-profiles.json"),
             state.path().join("worktrees"),
         ));
         daemon.add_project(repo.path()).unwrap();
@@ -2071,6 +2153,7 @@ mod tests {
             std::path::PathBuf::from("/tmp/unused-split-tree.sock"),
             state.path().join("agents.json"),
             state.path().join("projects.json"),
+            state.path().join("agent-profiles.json"),
             state.path().join("worktrees"),
         ));
         daemon.add_project(repo.path()).unwrap();
@@ -2351,6 +2434,7 @@ mod tests {
             std::path::PathBuf::from("/tmp/unused-jj.sock"),
             state.path().join("agents.json"),
             state.path().join("projects.json"),
+            state.path().join("agent-profiles.json"),
             state.path().join("worktrees"),
         ));
         daemon.add_project(repo.path()).unwrap();
@@ -2560,6 +2644,7 @@ mod tests {
             std::path::PathBuf::from("/tmp/unused-ratio.sock"),
             state_path.clone(),
             statedir.path().join("projects.json"),
+            statedir.path().join("agent-profiles.json"),
             statedir.path().join("worktrees"),
         ));
         daemon.add_project(repo.path()).unwrap();
@@ -2620,6 +2705,7 @@ mod tests {
             std::path::PathBuf::from("/tmp/unused-collide1.sock"),
             state_path.clone(),
             projects_path.clone(),
+            statedir.path().join("agent-profiles.json"),
             statedir.path().join("worktrees"),
         ));
         d1.add_project(repo.path()).unwrap();
@@ -2641,6 +2727,7 @@ mod tests {
             std::path::PathBuf::from("/tmp/unused-collide2.sock"),
             state_path,
             projects_path,
+            statedir.path().join("agent-profiles.json"),
             statedir.path().join("worktrees"),
         ));
         d2.reconcile();
@@ -2686,6 +2773,7 @@ mod tests {
             std::path::PathBuf::from("/tmp/unused-nolt1.sock"),
             state_path.clone(),
             projects_path.clone(),
+            statedir.path().join("agent-profiles.json"),
             statedir.path().join("worktrees"),
         ));
         d1.add_project(repo.path()).unwrap();
@@ -2703,6 +2791,7 @@ mod tests {
             std::path::PathBuf::from("/tmp/unused-nolt2.sock"),
             state_path,
             projects_path,
+            statedir.path().join("agent-profiles.json"),
             statedir.path().join("worktrees"),
         ));
         d2.reconcile();
@@ -2823,6 +2912,7 @@ mod tests {
             "/tmp/unused-vt1.sock".into(),
             statedir.path().join("agents.json"),
             statedir.path().join("projects.json"),
+            statedir.path().join("agent-profiles.json"),
             statedir.path().join("worktrees"),
         );
         d.content_idle = Duration::from_millis(40);
@@ -2878,6 +2968,7 @@ mod tests {
             "/tmp/unused-vt.sock".into(),
             statedir.path().join("agents.json"),
             statedir.path().join("projects.json"),
+            statedir.path().join("agent-profiles.json"),
             statedir.path().join("worktrees"),
         );
         d.content_idle = Duration::from_millis(40);
@@ -2941,6 +3032,7 @@ mod tests {
             std::path::PathBuf::from("/tmp/unused-m10b.sock"),
             dir.join("agents.json"),
             dir.join("projects.json"),
+            dir.join("agent-profiles.json"),
             dir.join("worktrees"),
         ))
     }
@@ -3442,5 +3534,109 @@ mod tests {
         assert!(d.get(term).is_none(), "the terminal root must be gone");
         assert!(d.get(companion).is_none(), "closing the root must not orphan its companion pane");
         assert!(d.owner_of(companion).is_none(), "the companion's owner entry must not survive its pane");
+    }
+
+    #[test]
+    fn list_adapters_returns_only_enabled_profiles() {
+        use crate::FakeNotifier;
+        let state = tempfile::tempdir().unwrap();
+        let daemon = std::sync::Arc::new(Daemon::new_with_paths(
+            std::sync::Arc::new(FakeNotifier::new()),
+            std::path::PathBuf::from("/tmp/unused-profiles.sock"),
+            state.path().join("agents.json"),
+            state.path().join("projects.json"),
+            state.path().join("agent-profiles.json"),
+            state.path().join("worktrees"),
+        ));
+
+        let ids: Vec<String> = daemon.list_adapters().into_iter().map(|a| a.id).collect();
+        assert_eq!(ids, vec!["claude", "codex", "shell"], "defaults are all enabled");
+
+        let mut codex = daemon
+            .list_agent_profiles()
+            .into_iter()
+            .find(|p| p.id == "codex")
+            .unwrap();
+        codex.enabled = false;
+        daemon.update_agent_profile(codex).unwrap();
+
+        let ids: Vec<String> = daemon.list_adapters().into_iter().map(|a| a.id).collect();
+        assert_eq!(ids, vec!["claude", "shell"], "a disabled profile leaves the picker");
+
+        // ...but the Settings list still shows it, marked disabled.
+        let codex = daemon.list_agent_profiles().into_iter().find(|p| p.id == "codex").unwrap();
+        assert!(!codex.enabled && codex.builtin);
+    }
+
+    #[test]
+    fn adapter_list_shows_a_user_profiles_display_name() {
+        use crate::FakeNotifier;
+        let state = tempfile::tempdir().unwrap();
+        let daemon = std::sync::Arc::new(Daemon::new_with_paths(
+            std::sync::Arc::new(FakeNotifier::new()),
+            std::path::PathBuf::from("/tmp/unused-profiles2.sock"),
+            state.path().join("agents.json"),
+            state.path().join("projects.json"),
+            state.path().join("agent-profiles.json"),
+            state.path().join("worktrees"),
+        ));
+        daemon
+            .add_agent_profile(clowder_proto::AgentProfileInfo {
+                id: "opus".into(),
+                base: "claude".into(),
+                display_name: "Claude (Opus)".into(),
+                enabled: true,
+                args: "--model opus".into(),
+                builtin: false,
+            })
+            .unwrap();
+        let a = daemon.list_adapters();
+        assert!(a.iter().any(|a| a.id == "opus" && a.display_name == "Claude (Opus)"), "{a:?}");
+    }
+
+    #[test]
+    fn profile_mutations_tick_the_broadcast() {
+        use crate::FakeNotifier;
+        let state = tempfile::tempdir().unwrap();
+        let daemon = std::sync::Arc::new(Daemon::new_with_paths(
+            std::sync::Arc::new(FakeNotifier::new()),
+            std::path::PathBuf::from("/tmp/unused-profiles3.sock"),
+            state.path().join("agents.json"),
+            state.path().join("projects.json"),
+            state.path().join("agent-profiles.json"),
+            state.path().join("worktrees"),
+        ));
+        let mut rx = daemon.subscribe_agent_profiles();
+        daemon
+            .add_agent_profile(clowder_proto::AgentProfileInfo {
+                id: "opus".into(),
+                base: "claude".into(),
+                display_name: "Opus".into(),
+                enabled: true,
+                args: String::new(),
+                builtin: false,
+            })
+            .unwrap();
+        assert!(rx.try_recv().is_ok(), "add must notify connected clients");
+
+        daemon.remove_agent_profile("opus").unwrap();
+        assert!(rx.try_recv().is_ok(), "remove must notify too");
+    }
+
+    #[test]
+    fn a_failed_mutation_does_not_tick() {
+        use crate::FakeNotifier;
+        let state = tempfile::tempdir().unwrap();
+        let daemon = std::sync::Arc::new(Daemon::new_with_paths(
+            std::sync::Arc::new(FakeNotifier::new()),
+            std::path::PathBuf::from("/tmp/unused-profiles4.sock"),
+            state.path().join("agents.json"),
+            state.path().join("projects.json"),
+            state.path().join("agent-profiles.json"),
+            state.path().join("worktrees"),
+        ));
+        let mut rx = daemon.subscribe_agent_profiles();
+        assert!(daemon.remove_agent_profile("claude").is_err());
+        assert!(rx.try_recv().is_err(), "a refused mutation must not broadcast");
     }
 }
