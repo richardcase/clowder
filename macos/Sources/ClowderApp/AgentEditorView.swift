@@ -5,7 +5,7 @@ import ClowderCore
 struct AgentEditorView: View {
     @ObservedObject var model: AgentsViewModel
 
-    private let bases = ["claude", "codex", "shell"]
+    private let bases = AgentProfileDraft.bases
 
     var body: some View {
         if let draft = model.draft {

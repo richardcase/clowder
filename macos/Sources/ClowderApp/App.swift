@@ -132,11 +132,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // this pane — it carries no request id to route it back here automatically. Forward it so a
         // save the Agents pane just attempted doesn't appear to silently do nothing while the
         // Settings window has the user's attention. `compactMap` drops the `nil`s a dismissed error
-        // publishes (those clear the main banner, not this one); `removeDuplicates` stops the same
-        // message from being re-presented back-to-back if the store republishes it unchanged.
+        // publishes (those clear the main banner, not this one). Deliberately NOT deduplicated:
+        // `store.lastError` is only ever assigned once per genuine `.error` event/`reportLocalError`
+        // call, so there is no republish-storm to filter — and the Agents alert's own OK button
+        // clears only `AgentsViewModel.lastError`, never the store's, so a second identical refusal
+        // (Save → refused → OK → Save again → refused the same way) must still come through, or the
+        // pane goes silent on exactly the retry a user is most likely to make.
         agentErrorSubscription = model.store.$lastError
             .compactMap { $0 }
-            .removeDuplicates()
             .receive(on: DispatchQueue.main)
             .sink { [weak agents] message in agents?.reportError(message) }
         agentsModel = agents

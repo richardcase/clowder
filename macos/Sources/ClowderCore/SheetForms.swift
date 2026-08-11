@@ -160,6 +160,13 @@ public struct AgentProfileDraft: Equatable, Sendable {
         self.isNew = isNew
     }
 
+    /// The base adapters a new profile can be built on. Must track the daemon's
+    /// `adapter_descriptors()` (`crates/clowder-daemon/src/agent.rs`) — the daemon is the actual
+    /// authority and only validates `base` at spawn time, so drift here would let the editor create
+    /// a profile that fails later rather than being caught up front. Not fetched from the daemon at
+    /// runtime (out of scope); this is the same "mirrors the daemon's rule" tradeoff as `idError`.
+    public static let bases = ["claude", "codex", "shell"]
+
     private static let maxDisplayName = 64
 
     /// Nil when acceptable. Same rule as a host name — see `HostDraft.nameError`.

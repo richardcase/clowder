@@ -61,7 +61,14 @@ struct AgentsSettingsView: View {
             }
             .frame(minWidth: 420)
         }
-        .onAppear { model.reload() }
+        .onAppear {
+            model.reload()
+            // Discard whatever is sitting in the pane's error slot from a previous, possibly
+            // unrelated, occasion — `AgentStore.lastError` is the app's one uncorrelated error
+            // channel, so an error that arrived while this pane was closed (a failed spawn, a host
+            // error, anything) must not pop an "Agents" alert about it the next time the pane opens.
+            model.dismissError()
+        }
         .alert("Agents", isPresented: Binding(
             get: { model.lastError != nil },
             set: { if !$0 { model.dismissError() } }
