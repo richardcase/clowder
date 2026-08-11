@@ -55,44 +55,66 @@ impl AgentProfileStore {
         builtin_pairs().iter().any(|(b, _)| *b == id)
     }
 
+    /// Whether `id` is present in the effective list computed from `rows` — the same merge
+    /// `effective()` does, but over an in-hand `Vec` rather than a fresh `store.load()`. Used
+    /// INSIDE a `try_mutate` closure so the existence check and the write share one lock
+    /// acquisition; checking via `self.effective()` before calling `try_mutate` would read and
+    /// write under two separate lock acquisitions, leaving a check-then-act race between
+    /// concurrent control-connection tasks (see `JsonStore`'s doc comment).
+    fn contains_id(rows: &[AgentProfile], id: &str) -> bool {
+        merged_profiles(rows.to_vec(), &builtin_pairs()).iter().any(|e| e.profile.id == id)
+    }
+
     /// Create a new user profile. Messages are user-facing — they surface in the Settings alert
     /// and on the CLI.
     pub fn add(&self, profile: AgentProfile) -> Result<()> {
         validate_profile(&profile, &builtin_pairs()).map_err(anyhow::Error::msg)?;
+        // Pure function of the compiled-in adapter list, not of the file — no lock needed.
         if Self::is_builtin(&profile.id) {
             bail!("{} is a built-in agent — pick another id", profile.id);
         }
-        if self.effective().iter().any(|e| e.profile.id == profile.id) {
-            bail!("an agent named {} already exists", profile.id);
-        }
-        self.store.try_mutate(move |all| all.push(profile))?;
-        Ok(())
+        self.store
+            .try_mutate(move |all| {
+                if Self::contains_id(all, &profile.id) {
+                    return Err(format!("an agent named {} already exists", profile.id));
+                }
+                all.push(profile);
+                Ok(())
+            })?
+            .map_err(anyhow::Error::msg)
     }
 
     /// Replace an existing profile — a user row, or a built-in (which writes an override row).
     pub fn update(&self, profile: AgentProfile) -> Result<()> {
         validate_profile(&profile, &builtin_pairs()).map_err(anyhow::Error::msg)?;
-        if !self.effective().iter().any(|e| e.profile.id == profile.id) {
-            bail!("no such agent: {}", profile.id);
-        }
-        self.store.try_mutate(move |all| {
-            all.retain(|r| r.id != profile.id);
-            all.push(profile);
-        })?;
-        Ok(())
+        self.store
+            .try_mutate(move |all| {
+                if !Self::contains_id(all, &profile.id) {
+                    return Err(format!("no such agent: {}", profile.id));
+                }
+                all.retain(|r| r.id != profile.id);
+                all.push(profile);
+                Ok(())
+            })?
+            .map_err(anyhow::Error::msg)
     }
 
     /// Delete a user profile. Built-ins are never removable — their row is only an override.
     pub fn remove(&self, id: &str) -> Result<()> {
+        // Pure function of the compiled-in adapter list, not of the file — no lock needed.
         if Self::is_builtin(id) {
             bail!("{id} is a built-in agent and cannot be removed — disable it instead");
         }
-        if !self.effective().iter().any(|e| e.profile.id == id) {
-            bail!("no such agent: {id}");
-        }
         let id = id.to_string();
-        self.store.try_mutate(move |all| all.retain(|r| r.id != id))?;
-        Ok(())
+        self.store
+            .try_mutate(move |all| {
+                if !Self::contains_id(all, &id) {
+                    return Err(format!("no such agent: {id}"));
+                }
+                all.retain(|r| r.id != id);
+                Ok(())
+            })?
+            .map_err(anyhow::Error::msg)
     }
 
     /// Resolve a spawnable id. Validates the template again here: the file is hand-editable and is
@@ -254,5 +276,39 @@ mod tests {
         let p = dir.path().join("agent-profiles.json");
         std::fs::write(&p, b"not json").unwrap();
         assert_eq!(AgentProfileStore::new(p).effective().len(), 3);
+    }
+
+    #[test]
+    fn default_path_is_agent_profiles_json_and_distinct_from_the_other_stores() {
+        // The file must never be called agents.json — that name is already the live-agent
+        // registry (crate::registry::Registry). No env mutation needed: this only compares the
+        // no-override branch of each store's derivation, which all three share.
+        let p = AgentProfileStore::default_path();
+        assert_eq!(p.file_name().unwrap(), "agent-profiles.json");
+        assert_ne!(p, crate::registry::Registry::default_path(), "must not collide with the agent registry");
+        assert_ne!(p, crate::projects::ProjectStore::default_path(), "must not collide with the project store");
+    }
+
+    #[test]
+    fn add_closes_the_check_then_act_race_on_a_duplicate_id() {
+        // Mirrors store.rs's concurrent_mutates_do_not_lose_records: several concurrent `add`
+        // calls for the SAME id must leave exactly one row, not two, in the file. Before the
+        // fix, the duplicate check ran outside `try_mutate`'s lock, so two callers could both
+        // pass it and both push.
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent-profiles.json");
+        let s = Arc::new(AgentProfileStore::new(path.clone()));
+        let handles: Vec<_> = (0..16)
+            .map(|_| {
+                let s = Arc::clone(&s);
+                std::thread::spawn(move || s.add(opus()).is_ok())
+            })
+            .collect();
+        let successes = handles.into_iter().map(|h| h.join().unwrap()).filter(|ok| *ok).count();
+        assert_eq!(successes, 1, "exactly one concurrent add of the same id must succeed");
+
+        let raw: Vec<AgentProfile> = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(raw.iter().filter(|r| r.id == "opus").count(), 1, "the file must hold exactly one row");
     }
 }
