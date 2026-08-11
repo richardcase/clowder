@@ -155,4 +155,38 @@ final class ModelsTests: XCTestCase {
         XCTAssertNotNil(b, "fixture did not parse as a JSON object", file: file, line: line)
         XCTAssertEqual(a, b, file: file, line: line)
     }
+
+    func testAgentProfileRequestsEncodeLikeTheRustEnum() throws {
+        let p = AgentProfileInfo(id: "opus", base: "claude", displayName: "Claude (Opus)",
+                                 enabled: true, args: "--model opus", builtin: false)
+        let add = try JSONEncoder().encode(ControlRequest.addAgentProfile(p))
+        let obj = try XCTUnwrap(JSONSerialization.jsonObject(with: add) as? [String: Any])
+        XCTAssertEqual(obj["type"] as? String, "addAgentProfile")
+        let profile = try XCTUnwrap(obj["profile"] as? [String: Any])
+        XCTAssertEqual(profile["displayName"] as? String, "Claude (Opus)")
+        XCTAssertEqual(profile["builtin"] as? Bool, false)
+
+        let list = try JSONEncoder().encode(ControlRequest.listAgentProfiles)
+        XCTAssertEqual(String(decoding: list, as: UTF8.self), #"{"type":"listAgentProfiles"}"#)
+
+        let rm = try JSONEncoder().encode(ControlRequest.removeAgentProfile(id: "opus"))
+        let rmObj = try XCTUnwrap(JSONSerialization.jsonObject(with: rm) as? [String: Any])
+        XCTAssertEqual(rmObj["type"] as? String, "removeAgentProfile")
+        XCTAssertEqual(rmObj["id"] as? String, "opus")
+    }
+
+    func testAgentProfileListEventDecodes() throws {
+        let json = #"""
+        {"type":"agentProfileList","profiles":[
+          {"id":"claude","base":"claude","displayName":"Claude Code","enabled":true,"args":"","builtin":true},
+          {"id":"opus","base":"claude","displayName":"Claude (Opus)","enabled":false,"args":"--model opus","builtin":false}
+        ]}
+        """#
+        let ev = try JSONDecoder().decode(ControlEvent.self, from: Data(json.utf8))
+        guard case let .agentProfileList(profiles) = ev else { return XCTFail("wrong case: \(ev)") }
+        XCTAssertEqual(profiles.count, 2)
+        XCTAssertTrue(profiles[0].builtin)
+        XCTAssertFalse(profiles[1].enabled)
+        XCTAssertEqual(profiles[1].args, "--model opus")
+    }
 }

@@ -25,6 +25,9 @@ public final class AgentStore: ObservableObject {
     @Published public private(set) var trees: [UInt64: PaneTree] = [:]
     @Published public private(set) var adapters: [AdapterInfo] = AgentStore.defaultAdapters
     @Published public private(set) var projects: [ProjectInfo] = []
+    /// Every profile, enabled or not — what the Settings Agents pane renders. `adapters` remains
+    /// the ENABLED subset the daemon sends for the New Worktree picker.
+    @Published public private(set) var agentProfiles: [AgentProfileInfo] = []
     /// Project path → its open terminal's pane. Populated by `projectTerminalOpened`; a missing
     /// entry means "not open yet", which is what makes selecting a project ask the daemon.
     @Published public private(set) var projectTerminals: [String: UInt64] = [:]
@@ -76,6 +79,8 @@ public final class AgentStore: ObservableObject {
             projectTerminals[path] = pane
         case let .projectTerminalClosed(path):
             projectTerminals[path] = nil
+        case let .agentProfileList(list):
+            agentProfiles = list
         }
     }
 
@@ -108,6 +113,7 @@ public final class AgentStore: ObservableObject {
         adapters = AgentStore.defaultAdapters
         projects = []
         projectTerminals = [:]
+        agentProfiles = []
     }
 
     /// Projects with their worktrees, ready to render. Projects sort by display name, worktrees

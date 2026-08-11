@@ -156,4 +156,17 @@ final class AgentStoreTests: XCTestCase {
         XCTAssertTrue(s.projects.isEmpty)
         XCTAssertTrue(s.projectTerminals.isEmpty)
     }
+
+    func testAgentProfileListIsStoredAndClearedOnReset() {
+        let store = AgentStore()
+        XCTAssertTrue(store.agentProfiles.isEmpty)
+        store.apply(.agentProfileList([
+            AgentProfileInfo(id: "claude", base: "claude", displayName: "Claude Code",
+                             enabled: true, args: "", builtin: true)
+        ]))
+        XCTAssertEqual(store.agentProfiles.map(\.id), ["claude"])
+        // Backend switches must not carry one host's profiles to another.
+        store.reset()
+        XCTAssertTrue(store.agentProfiles.isEmpty)
+    }
 }

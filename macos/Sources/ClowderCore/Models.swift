@@ -41,6 +41,25 @@ public struct AdapterInfo: Codable, Identifiable, Equatable, Sendable {
     }
 }
 
+/// Mirrors the Rust `AgentProfileInfo`. `builtin` is derived daemon-side: built-in agents can be
+/// edited and disabled but never removed.
+public struct AgentProfileInfo: Codable, Identifiable, Equatable, Sendable {
+    public let id: String
+    public var base: String
+    public var displayName: String
+    public var enabled: Bool
+    public var args: String
+    public let builtin: Bool
+    public init(id: String, base: String, displayName: String, enabled: Bool, args: String, builtin: Bool) {
+        self.id = id
+        self.base = base
+        self.displayName = displayName
+        self.enabled = enabled
+        self.args = args
+        self.builtin = builtin
+    }
+}
+
 /// Mirrors the Rust `ProjectInfo`.
 public struct ProjectInfo: Codable, Identifiable, Equatable, Sendable {
     /// Canonical path to the project root — the identity.
@@ -74,9 +93,13 @@ public enum ControlRequest: Encodable, Equatable, Sendable {
     case removeProject(path: String)
     case openProjectTerminal(path: String)
     case restartWorktree(pane: UInt64)
+    case listAgentProfiles
+    case addAgentProfile(AgentProfileInfo)
+    case updateAgentProfile(AgentProfileInfo)
+    case removeAgentProfile(id: String)
 
     private enum CodingKeys: String, CodingKey {
-        case type, project, name, adapter, pane, direction, split, ratio, agent, path
+        case type, project, name, adapter, pane, direction, split, ratio, agent, path, profile, id
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -125,6 +148,17 @@ public enum ControlRequest: Encodable, Equatable, Sendable {
         case let .restartWorktree(pane):
             try c.encode("restartWorktree", forKey: .type)
             try c.encode(pane, forKey: .pane)
+        case .listAgentProfiles:
+            try c.encode("listAgentProfiles", forKey: .type)
+        case let .addAgentProfile(profile):
+            try c.encode("addAgentProfile", forKey: .type)
+            try c.encode(profile, forKey: .profile)
+        case let .updateAgentProfile(profile):
+            try c.encode("updateAgentProfile", forKey: .type)
+            try c.encode(profile, forKey: .profile)
+        case let .removeAgentProfile(id):
+            try c.encode("removeAgentProfile", forKey: .type)
+            try c.encode(id, forKey: .id)
         }
     }
 }
@@ -143,9 +177,10 @@ public enum ControlEvent: Decodable, Equatable, Sendable {
     case projectRemoved(path: String)
     case projectTerminalOpened(path: String, pane: UInt64)
     case projectTerminalClosed(path: String)
+    case agentProfileList([AgentProfileInfo])
 
     private enum CodingKeys: String, CodingKey {
-        case type, worktrees, adapters, pane, state, message, agent, tree, projects, project, path
+        case type, worktrees, adapters, pane, state, message, agent, tree, projects, project, path, profiles
     }
 
     public init(from decoder: Decoder) throws {
@@ -182,6 +217,8 @@ public enum ControlEvent: Decodable, Equatable, Sendable {
                 pane: try c.decode(UInt64.self, forKey: .pane))
         case "projectTerminalClosed":
             self = .projectTerminalClosed(path: try c.decode(String.self, forKey: .path))
+        case "agentProfileList":
+            self = .agentProfileList(try c.decode([AgentProfileInfo].self, forKey: .profiles))
         default:
             throw DecodingError.dataCorruptedError(
                 forKey: .type, in: c, debugDescription: "unknown control event type: \(type)")
