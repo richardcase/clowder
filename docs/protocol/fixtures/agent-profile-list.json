@@ -1,0 +1,1 @@
+{"type":"agentProfileList","profiles":[{"id":"claude","base":"claude","displayName":"Claude Code","enabled":true,"args":"","builtin":true},{"id":"opus","base":"claude","displayName":"Claude (Opus)","enabled":false,"args":"--model opus","builtin":false}]}

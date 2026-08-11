@@ -364,6 +364,26 @@ mod tests {
                     second: Box::new(PaneTree::Leaf { pane: PaneId(3) }),
                 },
             }),
+            ("agent-profile-list.json", ControlEvent::AgentProfileList {
+                profiles: vec![
+                    AgentProfileInfo {
+                        id: "claude".into(),
+                        base: "claude".into(),
+                        display_name: "Claude Code".into(),
+                        enabled: true,
+                        args: "".into(),
+                        builtin: true,
+                    },
+                    AgentProfileInfo {
+                        id: "opus".into(),
+                        base: "claude".into(),
+                        display_name: "Claude (Opus)".into(),
+                        enabled: false,
+                        args: "--model opus".into(),
+                        builtin: false,
+                    },
+                ],
+            }),
         ];
         for (file, ev) in cases {
             assert_eq!(serde_json::to_string(&ev).unwrap(), fixture(file),
@@ -387,6 +407,28 @@ mod tests {
             ("open-project-terminal.json", ControlRequest::OpenProjectTerminal {
                 path: "/Users/x/code/clowder".into(),
             }),
+            ("list-agent-profiles.json", ControlRequest::ListAgentProfiles),
+            ("add-agent-profile.json", ControlRequest::AddAgentProfile {
+                profile: AgentProfileInfo {
+                    id: "opus".into(),
+                    base: "claude".into(),
+                    display_name: "Claude (Opus)".into(),
+                    enabled: true,
+                    args: "--model opus".into(),
+                    builtin: false,
+                },
+            }),
+            ("update-agent-profile.json", ControlRequest::UpdateAgentProfile {
+                profile: AgentProfileInfo {
+                    id: "opus".into(),
+                    base: "claude".into(),
+                    display_name: "Claude (Opus, updated)".into(),
+                    enabled: false,
+                    args: "--model opus --verbose".into(),
+                    builtin: false,
+                },
+            }),
+            ("remove-agent-profile.json", ControlRequest::RemoveAgentProfile { id: "opus".into() }),
         ];
         for (file, expected) in cases {
             let raw = fixture(file);

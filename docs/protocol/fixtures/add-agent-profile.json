@@ -1,0 +1,1 @@
+{"type":"addAgentProfile","profile":{"id":"opus","base":"claude","displayName":"Claude (Opus)","enabled":true,"args":"--model opus","builtin":false}}

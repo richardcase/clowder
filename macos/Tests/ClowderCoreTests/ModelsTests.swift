@@ -114,6 +114,16 @@ final class ModelsTests: XCTestCase {
         XCTAssertEqual(ratio, 0.5, accuracy: 0.0001)
         XCTAssertEqual(first, .leaf(pane: 2))
         XCTAssertEqual(second, .leaf(pane: 3))
+
+        guard case let .agentProfileList(profiles) =
+                try d.decode(ControlEvent.self, from: fixture("agent-profile-list.json")) else {
+            return XCTFail("agent-profile-list.json did not decode to .agentProfileList")
+        }
+        XCTAssertEqual(profiles.count, 2)
+        XCTAssertTrue(profiles[0].builtin, "first profile must be builtin: \(profiles[0])")
+        XCTAssertFalse(profiles[1].builtin, "second profile must be a user profile: \(profiles[1])")
+        XCTAssertEqual(profiles[1].displayName, "Claude (Opus)")
+        XCTAssertEqual(profiles[1].args, "--model opus")
     }
 
     func testSpawnAgentEncodesNameNotTask() throws {
@@ -144,6 +154,22 @@ final class ModelsTests: XCTestCase {
 
         let openData = try e.encode(ControlRequest.openProjectTerminal(path: "/Users/x/code/clowder"))
         try assertJSONObjectsEqual(openData, fixture("open-project-terminal.json"))
+
+        let listData = try e.encode(ControlRequest.listAgentProfiles)
+        try assertJSONObjectsEqual(listData, fixture("list-agent-profiles.json"))
+
+        let addData = try e.encode(ControlRequest.addAgentProfile(AgentProfileInfo(
+            id: "opus", base: "claude", displayName: "Claude (Opus)",
+            enabled: true, args: "--model opus", builtin: false)))
+        try assertJSONObjectsEqual(addData, fixture("add-agent-profile.json"))
+
+        let updateData = try e.encode(ControlRequest.updateAgentProfile(AgentProfileInfo(
+            id: "opus", base: "claude", displayName: "Claude (Opus, updated)",
+            enabled: false, args: "--model opus --verbose", builtin: false)))
+        try assertJSONObjectsEqual(updateData, fixture("update-agent-profile.json"))
+
+        let removeData = try e.encode(ControlRequest.removeAgentProfile(id: "opus"))
+        try assertJSONObjectsEqual(removeData, fixture("remove-agent-profile.json"))
     }
 
     private func assertJSONObjectsEqual(
