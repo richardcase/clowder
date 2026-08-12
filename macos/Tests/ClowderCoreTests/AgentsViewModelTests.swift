@@ -89,6 +89,42 @@ final class AgentsViewModelTests: XCTestCase {
         XCTAssertTrue(rec.sent.isEmpty, "duplicate is local until saved")
     }
 
+    func testDuplicatingAnIdAtTheLengthLimitStillYieldsAValidId() {
+        // A 64-scalar id is legal, so it can exist. Appending "-copy" would push the duplicate past
+        // the limit and hand the user a draft that is invalid the instant it appears.
+        let long = String(repeating: "a", count: 64)
+        let (vm, _) = model()
+        vm.apply(profiles: [AgentProfileInfo(id: long, base: "claude", displayName: "Long",
+                                             enabled: true, args: "", builtin: false)])
+        vm.select(long)
+        vm.duplicateSelected()
+
+        let id = vm.draft?.id ?? ""
+        XCTAssertNil(vm.draft?.idError, "duplicate must be valid as-is, got \(id.count) scalars: \(id)")
+        XCTAssertLessThanOrEqual(id.unicodeScalars.count, 64)
+        XCTAssertTrue(id.hasSuffix("-copy"), "still recognisably a copy: \(id)")
+        XCTAssertNotEqual(id, long)
+    }
+
+    func testDuplicatingTwiceAtTheLengthLimitAvoidsACollision() {
+        let long = String(repeating: "a", count: 64)
+        let firstCopy = String(repeating: "a", count: 59) + "-copy"
+        let (vm, _) = model()
+        vm.apply(profiles: [
+            AgentProfileInfo(id: long, base: "claude", displayName: "Long", enabled: true,
+                             args: "", builtin: false),
+            AgentProfileInfo(id: firstCopy, base: "claude", displayName: "Copy", enabled: true,
+                             args: "", builtin: false),
+        ])
+        vm.select(long)
+        vm.duplicateSelected()
+
+        let id = vm.draft?.id ?? ""
+        XCTAssertNil(vm.draft?.idError, "still valid: \(id)")
+        XCTAssertNotEqual(id, firstCopy, "must not collide with the existing copy")
+        XCTAssertLessThanOrEqual(id.unicodeScalars.count, 64)
+    }
+
     func testDuplicatingABuiltinSavesAsANewNonBuiltinProfile() {
         let (vm, rec) = model()
         vm.select("claude")

@@ -24,6 +24,29 @@ public struct NewWorktreeForm: Equatable, Sendable {
 
     public var isValid: Bool { !projectPath.isEmpty && nameError == nil }
 
+    /// Fill in whatever the user has not chosen, and nothing else.
+    ///
+    /// Safe to call repeatedly, which is the point: the sheet applies it when it appears AND again
+    /// whenever the enabled-agent list changes, because that list can arrive after the sheet is
+    /// already on screen (the control connection delivers `agentProfileList` asynchronously) or
+    /// change under it (a profile toggled in Settings, a backend switch, the `clowder agent` CLI).
+    ///
+    /// So it must not overwrite a choice the user has already made:
+    /// - `projectPath` is only ever filled when empty. Re-applying it would yank the user back to
+    ///   the initial/first project mid-edit.
+    /// - `adapter` is re-pointed only when it is empty or names an agent that is no longer offered
+    ///   — otherwise the picker would jump off the user's selection.
+    public mutating func applyDefaults(projects: [SidebarProject],
+                                       adapters: [AdapterInfo],
+                                       initialProjectPath: String) {
+        if projectPath.isEmpty {
+            projectPath = initialProjectPath.isEmpty ? (projects.first?.path ?? "") : initialProjectPath
+        }
+        if adapter.isEmpty || !adapters.contains(where: { $0.id == adapter }) {
+            adapter = adapters.first?.id ?? ""
+        }
+    }
+
     /// Nil when the name is acceptable; otherwise a user-facing reason. Validates `name` AS SENT
     /// — no trimming — so this agrees with the daemon's `validate_workspace_name`, which also
     /// does not trim (whitespace, including a leading/trailing space, is rejected by the charset

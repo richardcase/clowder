@@ -52,6 +52,55 @@ final class SheetFormsTests: XCTestCase {
     }
 }
 
+final class NewWorktreeFormDefaultsTests: XCTestCase {
+    private func project(_ path: String) -> SidebarProject {
+        SidebarProject(path: path, name: path, kind: "git", worktrees: [], attentionCount: 0)
+    }
+    private func adapter(_ id: String) -> AdapterInfo { AdapterInfo(id: id, displayName: id) }
+
+    func testFillsAnEmptyFormFromTheInitialSelection() {
+        var form = NewWorktreeForm(projectPath: "", name: "", adapter: "")
+        form.applyDefaults(projects: [project("/a"), project("/b")],
+                           adapters: [adapter("claude"), adapter("codex")],
+                           initialProjectPath: "/b")
+        XCTAssertEqual(form.projectPath, "/b")
+        XCTAssertEqual(form.adapter, "claude")
+    }
+
+    func testFallsBackToTheFirstProjectWhenThereIsNoInitialSelection() {
+        var form = NewWorktreeForm(projectPath: "", name: "", adapter: "")
+        form.applyDefaults(projects: [project("/a")], adapters: [adapter("claude")],
+                           initialProjectPath: "")
+        XCTAssertEqual(form.projectPath, "/a")
+    }
+
+    func testReapplyingNeverMovesAChoiceTheUserAlreadyMade() {
+        // The sheet re-applies defaults whenever the agent list changes, which can happen while the
+        // user is mid-edit (a profile toggled in Settings, a reconnect). It must not yank them back.
+        var form = NewWorktreeForm(projectPath: "/chosen", name: "task", adapter: "codex")
+        form.applyDefaults(projects: [project("/a"), project("/chosen")],
+                           adapters: [adapter("claude"), adapter("codex")],
+                           initialProjectPath: "/a")
+        XCTAssertEqual(form.projectPath, "/chosen", "re-applying must not reset the project")
+        XCTAssertEqual(form.adapter, "codex", "re-applying must not reset the agent")
+        XCTAssertEqual(form.name, "task")
+    }
+
+    func testRepointsTheAgentOnlyWhenTheChosenOneIsNoLongerOffered() {
+        var form = NewWorktreeForm(projectPath: "/chosen", name: "", adapter: "codex")
+        // codex disabled in Settings while the sheet is open.
+        form.applyDefaults(projects: [project("/chosen")], adapters: [adapter("claude")],
+                           initialProjectPath: "/chosen")
+        XCTAssertEqual(form.adapter, "claude")
+    }
+
+    func testEveryAgentDisabledLeavesNoSelection() {
+        var form = NewWorktreeForm(projectPath: "/chosen", name: "", adapter: "codex")
+        form.applyDefaults(projects: [project("/chosen")], adapters: [], initialProjectPath: "/chosen")
+        XCTAssertEqual(form.adapter, "", "no agent may be pre-selected when none is offered")
+    }
+}
+
 final class HostDraftTests: XCTestCase {
     private func fixtureCases(_ name: String, file: StaticString = #filePath) throws -> [(String, Bool)] {
         struct Case: Decodable { let name: String; let valid: Bool }

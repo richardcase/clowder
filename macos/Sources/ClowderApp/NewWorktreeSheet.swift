@@ -46,16 +46,15 @@ struct NewWorktreeSheet: View {
         .padding(20)
         .frame(width: 460)
         .onAppear { applyDefaults() }
-        // `onAppear` fires once. If the enabled-profile list is still empty at that moment — e.g. the
-        // control connection hasn't delivered `agentProfileList` yet — `form.adapter` falls back to
-        // "claude" and then never updates once real profiles arrive, since nothing re-runs the
-        // default. Re-applying the same defaulting whenever `adapters` changes keeps the picker's
-        // selection live instead of stuck on a stale fallback.
+        // `onAppear` fires once, but the enabled-agent list can arrive later (the control connection
+        // delivers `agentProfileList` asynchronously) or change while the sheet is open. Re-applying
+        // keeps the picker live rather than stuck on a stale fallback — and `applyDefaults` only
+        // fills in what the user has not chosen, so re-running it cannot move their selection.
         .onChange(of: adapters) { applyDefaults() }
     }
 
     private func applyDefaults() {
-        form.projectPath = initialProjectPath.isEmpty ? (projects.first?.path ?? "") : initialProjectPath
-        form.adapter = adapters.first?.id ?? "claude"
+        form.applyDefaults(projects: projects, adapters: adapters,
+                           initialProjectPath: initialProjectPath)
     }
 }

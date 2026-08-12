@@ -181,15 +181,33 @@ public final class AgentsViewModel: ObservableObject {
         }
     }
 
-    /// `<id>-copy`, then `-copy2`, `-copy3`… — always a valid id, never a collision.
+    /// `<id>-copy`, then `-copy2`, `-copy3`… — never a collision, and never longer than the id rule
+    /// allows.
+    ///
+    /// The stem is truncated when the suffix would push it past the 64-scalar limit that
+    /// `AgentProfileDraft.idError` enforces (via the host-name rule). Without that, duplicating a
+    /// profile whose id is already at the limit produced a draft that was invalid the moment it
+    /// appeared — Save disabled, with an error the user did nothing to cause. Truncation is by
+    /// unicode scalar, the same unit the validator counts.
     private func freshID(basedOn id: String) -> String {
         let taken = Set(profiles.map(\.id))
-        var candidate = "\(id)-copy"
+
+        func candidate(_ suffix: String) -> String {
+            let room = Self.maxIDScalars - suffix.unicodeScalars.count
+            let stem = String(String.UnicodeScalarView(id.unicodeScalars.prefix(max(0, room))))
+            return stem + suffix
+        }
+
+        var out = candidate("-copy")
         var n = 2
-        while taken.contains(candidate) {
-            candidate = "\(id)-copy\(n)"
+        while taken.contains(out) {
+            out = candidate("-copy\(n)")
             n += 1
         }
-        return candidate
+        return out
     }
+
+    /// Mirrors the 64-scalar cap in `clowder_config::hosts::validate_name`, which
+    /// `AgentProfileDraft.idError` delegates to.
+    private static let maxIDScalars = 64
 }
