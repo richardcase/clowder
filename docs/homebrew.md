@@ -1,6 +1,6 @@
 # Homebrew distribution (cask + tap)
 
-Clowder ships a Homebrew **cask** from a personal **tap** (`richardcase/homebrew-clowder`). Each **final**
+Clowder ships a Homebrew **cask** from an organization **tap** (`defiantsoftware/homebrew-clowder`). Each **final**
 signed release auto-updates the cask, so users get new versions with `brew upgrade`.
 
 > The clowder **source repo is private**, so its release assets aren't publicly downloadable. The signed
@@ -10,9 +10,9 @@ signed release auto-updates the cask, so users get new versions with `brew upgra
 ## Install
 
 ```sh
-brew install --cask richardcase/clowder/clowder
+brew install --cask defiantsoftware/clowder/clowder
 # or:
-brew tap richardcase/clowder
+brew tap defiantsoftware/clowder
 brew install --cask clowder
 ```
 
@@ -42,11 +42,11 @@ fails the run if a real push fails (so cask drift is visible).
 
 ### a. Create the tap repo
 
-A public repo named `homebrew-<tap>` — here `richardcase/homebrew-clowder` (installed as
-`richardcase/clowder`). The first final release seeds `Casks/clowder.rb`; no manual cask commit needed.
+A public repo named `homebrew-<tap>` — here `defiantsoftware/homebrew-clowder` (installed as
+`defiantsoftware/clowder`). The first final release seeds `Casks/clowder.rb`; no manual cask commit needed.
 
 ```sh
-gh repo create richardcase/homebrew-clowder --public --add-readme
+gh repo create defiantsoftware/homebrew-clowder --public --add-readme
 ```
 
 ### b. Create a fine-grained PAT and store it in Doppler
@@ -56,8 +56,13 @@ asset), which an SSH deploy key can't do — so use a **fine-grained personal ac
 the tap repo:
 
 1. GitHub → **Settings → Developer settings → Fine-grained tokens → Generate new token**. Resource owner
-   **richardcase**; **Only select repositories → `homebrew-clowder`**; Repository permissions →
+   **defiantsoftware**; **Only select repositories → `homebrew-clowder`**; Repository permissions →
    **Contents: Read and write**. (Metadata read is added automatically.)
+
+   > Fine-grained PATs are bound to their **resource owner**, so a token issued under a personal account
+   > stops working the moment the tap moves to the org — it must be re-minted with `defiantsoftware` as
+   > the owner. The org must also permit fine-grained tokens (Organization settings → **Personal access
+   > tokens**), which has no personal-account equivalent; without it the token is created but denied.
 2. Put the token in the Doppler **release config** as `HOMEBREW_TAP_TOKEN` (alongside the signing
    secrets — see [`code-signing.md`](code-signing.md)).
 
@@ -81,6 +86,6 @@ git push && git push origin vX.Y.Z
 
 ```sh
 brew style Casks/clowder.rb            # cask lint (also enforced on every PR in ci.yml)
-brew info --cask richardcase/clowder/clowder
+brew info --cask defiantsoftware/clowder/clowder
 brew livecheck --cask clowder          # should report the latest final version
 ```

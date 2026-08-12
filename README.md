@@ -1,7 +1,7 @@
 # clowder
 
-[![CI](https://github.com/richardcase/clowder/actions/workflows/ci.yml/badge.svg)](https://github.com/richardcase/clowder/actions/workflows/ci.yml)
-[![Release](https://github.com/richardcase/clowder/actions/workflows/release.yml/badge.svg)](https://github.com/richardcase/clowder/actions/workflows/release.yml)
+[![CI](https://github.com/defiantsoftware/clowder/actions/workflows/ci.yml/badge.svg)](https://github.com/defiantsoftware/clowder/actions/workflows/ci.yml)
+[![Release](https://github.com/defiantsoftware/clowder/actions/workflows/release.yml/badge.svg)](https://github.com/defiantsoftware/clowder/actions/workflows/release.yml)
 ![macOS 14+](https://img.shields.io/badge/macOS-14%2B-black?logo=apple)
 ![Rust 2021](https://img.shields.io/badge/rust-2021-orange?logo=rust)
 ![Swift 6](https://img.shields.io/badge/swift-6-orange?logo=swift)
@@ -70,7 +70,7 @@ and survival.
 ### Homebrew (recommended)
 
 ```sh
-brew install --cask richardcase/clowder/clowder
+brew install --cask defiantsoftware/clowder/clowder
 ```
 
 Installs the signed + notarized `Clowder.app` and puts the `clowder` CLI on `PATH`. See
@@ -78,7 +78,7 @@ Installs the signed + notarized `Clowder.app` and puts the `clowder` CLI on `PAT
 
 ### From a release (collaborators)
 
-Download `Clowder-vX.Y.Z-macos.dmg` from the repo's [Releases](https://github.com/richardcase/clowder/releases),
+Download `Clowder-vX.Y.Z-macos.dmg` from the repo's [Releases](https://github.com/defiantsoftware/clowder/releases),
 open it, and drag **Clowder** to **Applications**. Releases are **signed with a Developer ID and
 notarized by Apple**, so Gatekeeper accepts them with no workaround.
 
@@ -88,7 +88,7 @@ notarized by Apple**, so Gatekeeper accepts them with no workaround.
 ### From source
 
 ```sh
-git clone git@github.com:richardcase/clowder.git && cd clowder
+git clone git@github.com:defiantsoftware/clowder.git && cd clowder
 scripts/build-libghostty.sh    # zig 0.16 + full Xcode; builds the vendored libghostty (once)
 scripts/build-app.sh           # → dist/Clowder.app
 open dist/Clowder.app
@@ -170,4 +170,4 @@ across a daemon restart.
 
 ## License
 
-Proprietary. © Richard Case. **All rights reserved.** No open-source license is granted.
+Proprietary. © Defiant Software. **All rights reserved.** No open-source license is granted.
