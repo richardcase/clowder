@@ -26,6 +26,12 @@ pub enum Action {
     Remove(String),
 }
 
+/// The base agents a new profile may wrap, as the daemon currently reports them. Derived rather
+/// than hardcoded so it cannot drift from the daemon's adapter registry.
+fn builtin_ids(existing: &[AgentProfileInfo]) -> Vec<&str> {
+    existing.iter().filter(|p| p.builtin).map(|p| p.id.as_str()).collect()
+}
+
 /// Decide what `args` means against the daemon's current profiles. Pure.
 pub fn plan(args: &[String], existing: &[AgentProfileInfo]) -> Result<Action, String> {
     let sub = args.first().map(|s| s.as_str()).ok_or_else(|| USAGE.to_string())?;
@@ -48,6 +54,15 @@ pub fn plan(args: &[String], existing: &[AgentProfileInfo]) -> Result<Action, St
             .ok_or_else(|| format!("no such agent: {id}"))
     };
 
+    // A display name the daemon would reject. `trim` matches `validate_profile`, which also counts
+    // an all-whitespace name as empty.
+    let checked_name = |name: &str| -> Result<String, String> {
+        if name.trim().is_empty() {
+            return Err("display name must not be empty".into());
+        }
+        Ok(name.to_string())
+    };
+
     match sub {
         "add" => {
             flags.reject_unknown(&["base", "name", "args", "disabled"])?;
@@ -59,10 +74,19 @@ pub fn plan(args: &[String], existing: &[AgentProfileInfo]) -> Result<Action, St
                 .str("base")
                 .ok_or_else(|| "add requires --base <claude|codex|shell>".to_string())?
                 .to_string();
+            // Check it against the built-ins the DAEMON just reported, not a list hardcoded here —
+            // a hardcoded one would drift the moment an adapter is added. Keeps the "fails
+            // instantly and locally" promise instead of spending a round trip to be told no.
+            if !existing.iter().any(|p| p.builtin && p.id == base) {
+                return Err(format!(
+                    "unknown agent {base:?} — must be one of {}",
+                    builtin_ids(existing).join(", ")
+                ));
+            }
             let args_template = flags.str("args").unwrap_or_default().to_string();
             clowder_config::agents::validate_template(&args_template)?;
             Ok(Action::Add(AgentProfileInfo {
-                display_name: flags.str("name").unwrap_or(&id).to_string(),
+                display_name: checked_name(flags.str("name").unwrap_or(&id))?,
                 id,
                 base,
                 enabled: !flags.bool("disabled"),
@@ -74,7 +98,7 @@ pub fn plan(args: &[String], existing: &[AgentProfileInfo]) -> Result<Action, St
             flags.reject_unknown(&["name", "args"])?;
             let mut p = find(&id)?;
             if let Some(name) = flags.str("name") {
-                p.display_name = name.to_string();
+                p.display_name = checked_name(name)?;
             }
             if let Some(a) = flags.str("args") {
                 clowder_config::agents::validate_template(a)?;
@@ -131,8 +155,19 @@ mod tests {
 
     fn existing() -> Vec<clowder_proto::AgentProfileInfo> {
         vec![
+            // All three built-ins, as the daemon always reports them — `--base` is now validated
+            // against exactly this list, so a fixture missing one would test a state that cannot
+            // occur.
             clowder_proto::AgentProfileInfo {
                 id: "claude".into(), base: "claude".into(), display_name: "Claude Code".into(),
+                enabled: true, args: String::new(), builtin: true,
+            },
+            clowder_proto::AgentProfileInfo {
+                id: "codex".into(), base: "codex".into(), display_name: "OpenAI Codex".into(),
+                enabled: true, args: String::new(), builtin: true,
+            },
+            clowder_proto::AgentProfileInfo {
+                id: "shell".into(), base: "shell".into(), display_name: "Shell".into(),
                 enabled: true, args: String::new(), builtin: true,
             },
             clowder_proto::AgentProfileInfo {
@@ -175,9 +210,36 @@ mod tests {
     #[test]
     fn add_requires_a_base_and_a_valid_id_and_valid_args() {
         assert!(plan(&args("add plan"), &existing()).is_err(), "--base is required");
-        assert!(plan(&args("add has\\ space --base claude"), &existing()).is_err());
+        // Built explicitly, NOT via `args()`: that helper splits on whitespace, so "has\ space"
+        // would arrive as two argv entries and this would pass without ever testing an id that
+        // actually contains a space — which is what a real shell would deliver from `'has space'`.
+        let spaced = ["add", "has space", "--base", "claude"].map(String::from).to_vec();
+        let e = plan(&spaced, &existing()).unwrap_err();
+        assert!(e.contains("letters") || e.contains("may only contain"), "must explain: {e}");
         let e = plan(&args("add p --base claude --args {{nope}}"), &existing()).unwrap_err();
         assert!(e.contains("nope"), "args are validated before the daemon is dialled: {e}");
+    }
+
+    #[test]
+    fn add_rejects_a_base_that_is_not_a_builtin() {
+        let e = plan(&args("add p --base emacs"), &existing()).unwrap_err();
+        assert!(e.contains("emacs"), "must name the offender: {e}");
+        assert!(e.contains("claude") && e.contains("codex"), "must list the valid bases: {e}");
+
+        // A USER profile is not a valid base either — only the built-ins are.
+        assert!(plan(&args("add p --base opus"), &existing()).is_err());
+    }
+
+    #[test]
+    fn a_blank_display_name_is_refused_before_the_daemon_is_dialled() {
+        // The daemon rejects these; catching them here keeps the error local.
+        for blank in ["", "   "] {
+            let add = ["add", "p", "--base", "claude", "--name", blank].map(String::from).to_vec();
+            assert!(plan(&add, &existing()).is_err(), "add --name {blank:?} must be refused");
+
+            let set = ["set", "opus", "--name", blank].map(String::from).to_vec();
+            assert!(plan(&set, &existing()).is_err(), "set --name {blank:?} must be refused");
+        }
     }
 
     #[test]
