@@ -189,13 +189,19 @@ impl Daemon {
                     match pf {
                         // A tick, not a payload: recompute both lists so the Settings pane and the
                         // New Worktree picker update together, from one source.
-                        Ok(()) => {
+                        //
+                        // `Lagged` is handled identically, NOT skipped: it means "one or more
+                        // profile changes happened and you missed them", which is the same
+                        // instruction as a tick. Skipping it would leave that client showing a
+                        // stale list until some later mutation happened to arrive. Recomputing is
+                        // safe and idempotent precisely because the payload is not the change —
+                        // the store is the source of truth, and both events carry the whole list.
+                        Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                             write_event(&mut wr, &ControlEvent::AgentProfileList {
                                 profiles: self.list_agent_profiles() }).await?;
                             write_event(&mut wr, &ControlEvent::AdapterList {
                                 adapters: self.list_adapters() }).await?;
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                         Err(_) => break,
                     }
                 }
