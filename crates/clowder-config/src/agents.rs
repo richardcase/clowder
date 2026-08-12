@@ -222,6 +222,16 @@ pub fn validate_profile(p: &AgentProfile, builtins: &[(&str, &str)]) -> Result<(
             builtins.iter().map(|(id, _)| *id).collect::<Vec<_>>().join(", ")
         ));
     }
+    // A built-in's `base` is its own id. `merged_profiles` enforces that on the way OUT (the file is
+    // hand-editable and is not validated on load), but accepting a mismatch here would let a stored
+    // row disagree with what is served: the write appears to succeed, and the next read silently
+    // shows something else. Refuse it at the point the user can still be told why.
+    if builtins.iter().any(|(id, _)| *id == p.id) && p.base != p.id {
+        return Err(format!(
+            "{} is a built-in agent — its base must be {:?}, not {:?}",
+            p.id, p.id, p.base
+        ));
+    }
     validate_template(&p.args)
 }
 
@@ -467,6 +477,23 @@ mod tests {
         let opus: Vec<_> = out.iter().filter(|e| e.profile.id == "opus").collect();
         assert_eq!(opus.len(), 1, "a duplicated id must yield exactly one entry");
         assert_eq!(opus[0].profile.display_name, "First", "first row wins on a duplicate id");
+    }
+
+    #[test]
+    fn a_builtin_id_must_carry_its_own_base() {
+        // `merged_profiles` would silently force this back to base == id, so the write would look
+        // like it succeeded and the next read would show something else. Refuse it up front.
+        let mut repointed = profile("shell", "claude");
+        repointed.display_name = "Shell".into();
+        let e = validate_profile(&repointed, BUILTINS).unwrap_err();
+        assert!(e.contains("shell") && e.contains("built-in"), "must explain why: {e}");
+
+        // The honest version of the same row is still fine, and a USER profile may of course name
+        // any built-in as its base.
+        let mut ok = profile("shell", "shell");
+        ok.display_name = "Shell".into();
+        assert!(validate_profile(&ok, BUILTINS).is_ok());
+        assert!(validate_profile(&profile("opus", "claude"), BUILTINS).is_ok());
     }
 
     #[test]
