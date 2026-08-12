@@ -12,12 +12,13 @@ pub mod remote_tls;
 pub mod registry;
 pub mod store;
 pub mod projects;
+pub mod agent_profiles;
 mod split_tree;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub use agent::{
     adapter_descriptors, build_adapter, AdapterDescriptor, AgentAdapter, ClaudeAdapter, CodexAdapter,
-    SyntheticAdapter,
+    SpawnSpec, SyntheticAdapter,
 };
 pub use login_env::{CaptureSpec, PaneEnv};
 pub use pane::{Pane, PaneCommand};

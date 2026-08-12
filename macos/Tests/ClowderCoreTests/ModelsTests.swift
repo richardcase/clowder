@@ -114,6 +114,16 @@ final class ModelsTests: XCTestCase {
         XCTAssertEqual(ratio, 0.5, accuracy: 0.0001)
         XCTAssertEqual(first, .leaf(pane: 2))
         XCTAssertEqual(second, .leaf(pane: 3))
+
+        guard case let .agentProfileList(profiles) =
+                try d.decode(ControlEvent.self, from: fixture("agent-profile-list.json")) else {
+            return XCTFail("agent-profile-list.json did not decode to .agentProfileList")
+        }
+        XCTAssertEqual(profiles.count, 2)
+        XCTAssertTrue(profiles[0].builtin, "first profile must be builtin: \(profiles[0])")
+        XCTAssertFalse(profiles[1].builtin, "second profile must be a user profile: \(profiles[1])")
+        XCTAssertEqual(profiles[1].displayName, "Claude (Opus)")
+        XCTAssertEqual(profiles[1].args, "--model opus")
     }
 
     func testSpawnAgentEncodesNameNotTask() throws {
@@ -144,6 +154,22 @@ final class ModelsTests: XCTestCase {
 
         let openData = try e.encode(ControlRequest.openProjectTerminal(path: "/Users/x/code/clowder"))
         try assertJSONObjectsEqual(openData, fixture("open-project-terminal.json"))
+
+        let listData = try e.encode(ControlRequest.listAgentProfiles)
+        try assertJSONObjectsEqual(listData, fixture("list-agent-profiles.json"))
+
+        let addData = try e.encode(ControlRequest.addAgentProfile(AgentProfileInfo(
+            id: "opus", base: "claude", displayName: "Claude (Opus)",
+            enabled: true, args: "--model opus", builtin: false)))
+        try assertJSONObjectsEqual(addData, fixture("add-agent-profile.json"))
+
+        let updateData = try e.encode(ControlRequest.updateAgentProfile(AgentProfileInfo(
+            id: "opus", base: "claude", displayName: "Claude (Opus, updated)",
+            enabled: false, args: "--model opus --verbose", builtin: false)))
+        try assertJSONObjectsEqual(updateData, fixture("update-agent-profile.json"))
+
+        let removeData = try e.encode(ControlRequest.removeAgentProfile(id: "opus"))
+        try assertJSONObjectsEqual(removeData, fixture("remove-agent-profile.json"))
     }
 
     private func assertJSONObjectsEqual(
@@ -154,5 +180,39 @@ final class ModelsTests: XCTestCase {
         XCTAssertNotNil(a, "encoded request did not parse as a JSON object", file: file, line: line)
         XCTAssertNotNil(b, "fixture did not parse as a JSON object", file: file, line: line)
         XCTAssertEqual(a, b, file: file, line: line)
+    }
+
+    func testAgentProfileRequestsEncodeLikeTheRustEnum() throws {
+        let p = AgentProfileInfo(id: "opus", base: "claude", displayName: "Claude (Opus)",
+                                 enabled: true, args: "--model opus", builtin: false)
+        let add = try JSONEncoder().encode(ControlRequest.addAgentProfile(p))
+        let obj = try XCTUnwrap(JSONSerialization.jsonObject(with: add) as? [String: Any])
+        XCTAssertEqual(obj["type"] as? String, "addAgentProfile")
+        let profile = try XCTUnwrap(obj["profile"] as? [String: Any])
+        XCTAssertEqual(profile["displayName"] as? String, "Claude (Opus)")
+        XCTAssertEqual(profile["builtin"] as? Bool, false)
+
+        let list = try JSONEncoder().encode(ControlRequest.listAgentProfiles)
+        XCTAssertEqual(String(decoding: list, as: UTF8.self), #"{"type":"listAgentProfiles"}"#)
+
+        let rm = try JSONEncoder().encode(ControlRequest.removeAgentProfile(id: "opus"))
+        let rmObj = try XCTUnwrap(JSONSerialization.jsonObject(with: rm) as? [String: Any])
+        XCTAssertEqual(rmObj["type"] as? String, "removeAgentProfile")
+        XCTAssertEqual(rmObj["id"] as? String, "opus")
+    }
+
+    func testAgentProfileListEventDecodes() throws {
+        let json = #"""
+        {"type":"agentProfileList","profiles":[
+          {"id":"claude","base":"claude","displayName":"Claude Code","enabled":true,"args":"","builtin":true},
+          {"id":"opus","base":"claude","displayName":"Claude (Opus)","enabled":false,"args":"--model opus","builtin":false}
+        ]}
+        """#
+        let ev = try JSONDecoder().decode(ControlEvent.self, from: Data(json.utf8))
+        guard case let .agentProfileList(profiles) = ev else { return XCTFail("wrong case: \(ev)") }
+        XCTAssertEqual(profiles.count, 2)
+        XCTAssertTrue(profiles[0].builtin)
+        XCTAssertFalse(profiles[1].enabled)
+        XCTAssertEqual(profiles[1].args, "--model opus")
     }
 }

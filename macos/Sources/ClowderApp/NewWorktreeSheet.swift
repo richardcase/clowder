@@ -18,8 +18,13 @@ struct NewWorktreeSheet: View {
                     ForEach(projects) { p in Text(p.name).tag(p.path) }
                 }
                 TextField("Name", text: $form.name).textFieldStyle(.roundedBorder)
-                Picker("Agent", selection: $form.adapter) {
-                    ForEach(adapters) { a in Text(a.displayName).tag(a.id) }
+                if adapters.isEmpty {
+                    Text("No agents are enabled — turn one on in Settings → Agents.")
+                        .font(.caption).foregroundStyle(.secondary)
+                } else {
+                    Picker("Agent", selection: $form.adapter) {
+                        ForEach(adapters) { a in Text(a.displayName).tag(a.id) }
+                    }
                 }
             }
             if let err = form.nameError, !form.name.isEmpty {
@@ -35,14 +40,21 @@ struct NewWorktreeSheet: View {
                     dismiss()
                 }
                 .keyboardShortcut(.defaultAction)
-                .disabled(!form.isValid)
+                .disabled(!form.isValid || adapters.isEmpty)
             }
         }
         .padding(20)
         .frame(width: 460)
-        .onAppear {
-            form.projectPath = initialProjectPath.isEmpty ? (projects.first?.path ?? "") : initialProjectPath
-            form.adapter = adapters.first?.id ?? "claude"
-        }
+        .onAppear { applyDefaults() }
+        // `onAppear` fires once, but the enabled-agent list can arrive later (the control connection
+        // delivers `agentProfileList` asynchronously) or change while the sheet is open. Re-applying
+        // keeps the picker live rather than stuck on a stale fallback — and `applyDefaults` only
+        // fills in what the user has not chosen, so re-running it cannot move their selection.
+        .onChange(of: adapters) { applyDefaults() }
+    }
+
+    private func applyDefaults() {
+        form.applyDefaults(projects: projects, adapters: adapters,
+                           initialProjectPath: initialProjectPath)
     }
 }

@@ -1,6 +1,7 @@
 use serde::Deserialize;
 use std::path::PathBuf;
 
+pub mod agents;
 pub mod hosts;
 
 const DEFAULT_BACKLOG_CAP: usize = 256 * 1024;

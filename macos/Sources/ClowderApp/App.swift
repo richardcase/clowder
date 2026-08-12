@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import Combine
 import GhosttyKit
 import ClowderCore
 
@@ -15,6 +16,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Backs the Settings window's Hosts pane. Built once in `bootstrap()` (idempotent), alongside
     /// `hostRegistry` — the two are always created together.
     private(set) var hostsModel: HostsViewModel?
+    /// Backs the Settings window's Agents pane. Built in `bootstrap()` once `appModel` exists,
+    /// since it sends through that model's control session.
+    private(set) var agentsModel: AgentsViewModel?
+    /// Keeps the store → pane subscription alive for the app's lifetime.
+    private var agentProfilesSubscription: AnyCancellable?
+    /// Forwards the daemon's uncorrelated refusals (`AgentStore.lastError`) into the Agents pane —
+    /// see `bootstrap()`.
+    private var agentErrorSubscription: AnyCancellable?
     private var mainWindow: NSWindow?
     private var windowCloseDelegate: HideOnCloseDelegate?
     private var statusBar: StatusBarController?
@@ -33,8 +42,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// startup). Creating the ghostty app object here is run-loop-independent; the wakeup tick
     /// is queued via DispatchQueue.main and serviced once the run loop is up.
     @discardableResult
-    func bootstrap() -> (appModel: AppModel, surfaceHost: SurfaceHost, hostsModel: HostsViewModel?) {
-        if let appModel, let surfaceHost { return (appModel, surfaceHost, hostsModel) }
+    func bootstrap() -> (appModel: AppModel, surfaceHost: SurfaceHost, hostsModel: HostsViewModel?,
+                          agentsModel: AgentsViewModel?) {
+        if let appModel, let surfaceHost { return (appModel, surfaceHost, hostsModel, agentsModel) }
 
         // Bundled binary + per-user sockets (dev overrides via env/CLOWDER_BIN still honored).
         let socks = ClowderPaths.socketPaths()
@@ -105,7 +115,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusBar = StatusBarController(appModel: model,
                                         backends: self,
                                         showWindow: { [weak self] in self?.showWindow() })
-        return (model, host, hostsModel)
+
+        let agents = AgentsViewModel(send: { [weak self] req in
+            guard let model = self?.appModel else { throw AppModel.ControlSendError.notConnected }
+            try model.sendControl(req)
+        })
+        // The daemon broadcasts the full list after every mutation — including one made from
+        // another client, or from `clowder agent` in a terminal — so the pane follows the daemon
+        // rather than its own last write. Also covers a backend switch: `reset()` empties the
+        // store, and the new connection's list arrives the same way.
+        agentProfilesSubscription = model.store.$agentProfiles
+            .receive(on: DispatchQueue.main)
+            .sink { [weak agents] profiles in agents?.apply(profiles: profiles) }
+        // A refused mutation arrives as an uncorrelated `ControlEvent.error`, which lands on
+        // `AgentStore.lastError` (and is already shown as the main window's banner) rather than on
+        // this pane — it carries no request id to route it back here automatically. Forward it so a
+        // save the Agents pane just attempted doesn't appear to silently do nothing while the
+        // Settings window has the user's attention. `compactMap` drops the `nil`s a dismissed error
+        // publishes (those clear the main banner, not this one). Deliberately NOT deduplicated:
+        // `store.lastError` is only ever assigned once per genuine `.error` event/`reportLocalError`
+        // call, so there is no republish-storm to filter — and the Agents alert's own OK button
+        // clears only `AgentsViewModel.lastError`, never the store's, so a second identical refusal
+        // (Save → refused → OK → Save again → refused the same way) must still come through, or the
+        // pane goes silent on exactly the retry a user is most likely to make.
+        agentErrorSubscription = model.store.$lastError
+            .compactMap { $0 }
+            .receive(on: DispatchQueue.main)
+            .sink { [weak agents] message in agents?.reportError(message) }
+        agentsModel = agents
+
+        return (model, host, hostsModel, agentsModel)
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -317,7 +356,8 @@ struct ClowderApp: App {
             // bootstrap() is idempotent, so calling it here makes a Settings-first launch (⌘,
             // before the WindowGroup has ever rendered) safe too. The Settings scene body cannot
             // see the WindowGroup's @EnvironmentObject, so the model is passed explicitly.
-            SettingsView(hosts: delegate.bootstrap().hostsModel)
+            let b = delegate.bootstrap()
+            SettingsView(hosts: b.hostsModel, agents: b.agentsModel)
                 .frame(width: 680, height: 460)
         }
     }

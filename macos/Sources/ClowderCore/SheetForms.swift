@@ -24,6 +24,29 @@ public struct NewWorktreeForm: Equatable, Sendable {
 
     public var isValid: Bool { !projectPath.isEmpty && nameError == nil }
 
+    /// Fill in whatever the user has not chosen, and nothing else.
+    ///
+    /// Safe to call repeatedly, which is the point: the sheet applies it when it appears AND again
+    /// whenever the enabled-agent list changes, because that list can arrive after the sheet is
+    /// already on screen (the control connection delivers `agentProfileList` asynchronously) or
+    /// change under it (a profile toggled in Settings, a backend switch, the `clowder agent` CLI).
+    ///
+    /// So it must not overwrite a choice the user has already made:
+    /// - `projectPath` is only ever filled when empty. Re-applying it would yank the user back to
+    ///   the initial/first project mid-edit.
+    /// - `adapter` is re-pointed only when it is empty or names an agent that is no longer offered
+    ///   — otherwise the picker would jump off the user's selection.
+    public mutating func applyDefaults(projects: [SidebarProject],
+                                       adapters: [AdapterInfo],
+                                       initialProjectPath: String) {
+        if projectPath.isEmpty {
+            projectPath = initialProjectPath.isEmpty ? (projects.first?.path ?? "") : initialProjectPath
+        }
+        if adapter.isEmpty || !adapters.contains(where: { $0.id == adapter }) {
+            adapter = adapters.first?.id ?? ""
+        }
+    }
+
     /// Nil when the name is acceptable; otherwise a user-facing reason. Validates `name` AS SENT
     /// — no trimming — so this agrees with the daemon's `validate_workspace_name`, which also
     /// does not trim (whitespace, including a leading/trailing space, is rejected by the charset
@@ -132,4 +155,69 @@ public struct HostDraft: Equatable, Sendable {
         if host.contains(":") { return nil }   // bare v6 literal — require brackets
         return (host, String(s[s.index(after: colon)...]))
     }
+}
+
+/// The Agents pane's editor state.
+///
+/// `idError` mirrors `clowder_config::agents::validate_id`, which delegates to the host-name rule —
+/// so it is checked against the same `docs/protocol/fixtures/host-names.json`. `argsError` mirrors
+/// `split_args` + `validate_template` via `AgentArgs`, pinned to `agent-args.json`. The daemon
+/// remains the authority.
+public struct AgentProfileDraft: Equatable, Sendable {
+    /// Immutable once created: the id is recorded on every agent spawned from this profile.
+    public var id: String
+    public var base: String
+    public var displayName: String
+    public var enabled: Bool
+    public var args: String
+    /// True when this draft creates a profile rather than editing one.
+    public var isNew: Bool
+
+    public init(id: String = "", base: String = "claude", displayName: String = "",
+                enabled: Bool = true, args: String = "", isNew: Bool = true) {
+        self.id = id
+        self.base = base
+        self.displayName = displayName
+        self.enabled = enabled
+        self.args = args
+        self.isNew = isNew
+    }
+
+    /// The base adapters a new profile can be built on. Must track the daemon's
+    /// `adapter_descriptors()` (`crates/clowder-daemon/src/agent.rs`) — the daemon is the actual
+    /// authority and only validates `base` at spawn time, so drift here would let the editor create
+    /// a profile that fails later rather than being caught up front. Not fetched from the daemon at
+    /// runtime (out of scope); this is the same "mirrors the daemon's rule" tradeoff as `idError`.
+    public static let bases = ["claude", "codex", "shell"]
+
+    private static let maxDisplayName = 64
+    /// Mirrors `clowder_config::agents::MAX_ARGS` — see `argsError`.
+    private static let maxArgs = 4096
+
+    /// Nil when acceptable. Same rule as a host name — see `HostDraft.nameError`.
+    public var idError: String? {
+        var host = HostDraft()
+        host.name = id
+        return host.nameError
+    }
+
+    public var displayNameError: String? {
+        if displayName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return "Name must not be empty" }
+        if displayName.unicodeScalars.count > Self.maxDisplayName {
+            return "Name must be \(Self.maxDisplayName) characters or fewer"
+        }
+        return nil
+    }
+
+    /// Nil when acceptable. The length bound mirrors `validate_profile`'s `MAX_ARGS` check — same
+    /// threshold, counted the same way (Unicode scalars, matching Rust's `chars().count()`) — so the
+    /// editor refuses an over-long template before the daemon does.
+    public var argsError: String? {
+        if args.unicodeScalars.count > Self.maxArgs {
+            return "Args must be \(Self.maxArgs) characters or fewer"
+        }
+        return AgentArgs.templateError(args)
+    }
+
+    public var isValid: Bool { idError == nil && displayNameError == nil && argsError == nil }
 }

@@ -202,6 +202,7 @@ public final class AppModel: ObservableObject {
         connectionState = .live
         try session.send(.listWorktrees)
         try session.send(.listAdapters)
+        try session.send(.listAgentProfiles)
         try session.send(.listProjects)
         store.clearProjectTerminals()
     }
@@ -457,6 +458,16 @@ public final class AppModel: ObservableObject {
     /// deliberately does not require a live session: the most important case is precisely the one
     /// where there is no connection to the backend in question.
     public func reportBackendError(_ message: String) { store.reportLocalError(message) }
+
+    public enum ControlSendError: Error { case notConnected }
+
+    /// Send one control request, failing loudly when there is no connection — unlike the
+    /// fire-and-forget `try? session?.send(...)` callers, the Settings pane must be able to tell
+    /// the user that nothing was saved.
+    public func sendControl(_ req: ControlRequest) throws {
+        guard let session else { throw ControlSendError.notConnected }
+        try session.send(req)
+    }
 
     /// Explicit teardown (F1): cancel any reconnect loop, then disconnect. `isShuttingDown` makes the
     /// disconnect's own `onClose` a no-op so we don't re-arm reconnect while quitting.

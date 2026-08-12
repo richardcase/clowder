@@ -41,6 +41,7 @@ impl Daemon {
         let mut removed_rx = self.subscribe_removed();
         let mut split_rx = self.subscribe_splits();
         let mut proj_rx = self.subscribe_projects();
+        let mut prof_rx = self.subscribe_agent_profiles();
 
         write_event(&mut wr, &ControlEvent::WorktreeList { worktrees: self.list_worktrees() }).await?;
 
@@ -122,6 +123,23 @@ impl Daemon {
                                         Ok(pane) => ControlEvent::ProjectTerminalOpened { path, pane },
                                         Err(e) => ControlEvent::Error { message: e.to_string() },
                                     },
+                                Ok(ControlRequest::ListAgentProfiles) =>
+                                    ControlEvent::AgentProfileList { profiles: self.list_agent_profiles() },
+                                Ok(ControlRequest::AddAgentProfile { profile }) =>
+                                    match self.add_agent_profile(profile) {
+                                        Ok(()) => ControlEvent::AgentProfileList { profiles: self.list_agent_profiles() },
+                                        Err(e) => ControlEvent::Error { message: e.to_string() },
+                                    },
+                                Ok(ControlRequest::UpdateAgentProfile { profile }) =>
+                                    match self.update_agent_profile(profile) {
+                                        Ok(()) => ControlEvent::AgentProfileList { profiles: self.list_agent_profiles() },
+                                        Err(e) => ControlEvent::Error { message: e.to_string() },
+                                    },
+                                Ok(ControlRequest::RemoveAgentProfile { id }) =>
+                                    match self.remove_agent_profile(&id) {
+                                        Ok(()) => ControlEvent::AgentProfileList { profiles: self.list_agent_profiles() },
+                                        Err(e) => ControlEvent::Error { message: e.to_string() },
+                                    },
                                 Err(e) => ControlEvent::Error { message: format!("bad request: {e}") },
                             };
                             write_event(&mut wr, &ev).await?;
@@ -167,15 +185,47 @@ impl Daemon {
                         Err(_) => break,
                     }
                 }
+                pf = prof_rx.recv() => {
+                    match pf {
+                        // A tick, not a payload: recompute both lists so the Settings pane and the
+                        // New Worktree picker update together, from one source.
+                        //
+                        // `Lagged` is handled identically, NOT skipped: it means "one or more
+                        // profile changes happened and you missed them", which is the same
+                        // instruction as a tick. Skipping it would leave that client showing a
+                        // stale list until some later mutation happened to arrive. Recomputing is
+                        // safe and idempotent precisely because the payload is not the change —
+                        // the store is the source of truth, and both events carry the whole list.
+                        Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            write_event(&mut wr, &ControlEvent::AgentProfileList {
+                                profiles: self.list_agent_profiles() }).await?;
+                            write_event(&mut wr, &ControlEvent::AdapterList {
+                                adapters: self.list_adapters() }).await?;
+                        }
+                        Err(_) => break,
+                    }
+                }
             }
         }
         Ok(())
     }
 
-    fn spawn_from_control(self: &Arc<Self>, project: &str, name: &str, adapter: &str) -> Result<PaneId> {
+    fn spawn_from_control(self: &Arc<Self>, project: &str, name: &str, profile: &str) -> Result<PaneId> {
         let project_path = Path::new(project);
-        let a = build_adapter(adapter, &self.shell).ok_or_else(|| anyhow!("unknown adapter: {adapter}"))?;
-        self.spawn_agent(project_path, a.as_ref(), name)
+        // `adapter` on the wire is a PROFILE id now. Built-in ids (claude/codex/shell) still
+        // resolve, so `clowder spawn <project> <name> claude` is unchanged.
+        let resolved = self.resolve_profile(profile)?;
+        let a = build_adapter(&resolved.base, &self.shell)
+            .ok_or_else(|| anyhow!("unknown adapter: {}", resolved.base))?;
+        self.spawn_agent(
+            project_path,
+            crate::SpawnSpec {
+                adapter: a.as_ref(),
+                profile_id: Some(resolved.profile_id),
+                arg_template: resolved.arg_template,
+            },
+            name,
+        )
     }
 }
 
@@ -197,6 +247,7 @@ mod tests {
             std::path::PathBuf::from("/tmp/unused-cjson.sock"),
             state.path().join("agents.json"),
             state.path().join("projects.json"),
+            state.path().join("agent-profiles.json"),
             state.path().join("worktrees"),
         ));
         daemon.add_project(repo.path()).unwrap();
@@ -280,6 +331,7 @@ mod tests {
             std::path::PathBuf::from("/tmp/unused-cjson3.sock"),
             state.path().join("agents.json"),
             state.path().join("projects.json"),
+            state.path().join("agent-profiles.json"),
             state.path().join("worktrees"),
         ));
         daemon.add_project(repo.path()).unwrap();
@@ -355,6 +407,7 @@ mod tests {
             std::path::PathBuf::from("/tmp/unused-cjson5.sock"),
             state.path().join("agents.json"),
             state.path().join("projects.json"),
+            state.path().join("agent-profiles.json"),
             state.path().join("worktrees"),
         ));
         daemon.add_project(repo.path()).unwrap();
@@ -444,7 +497,15 @@ mod tests {
 
     #[test]
     fn list_adapters_returns_registry_descriptor_ids() {
-        let daemon = Daemon::new();
+        let state = tempfile::tempdir().unwrap();
+        let daemon = Daemon::new_with_paths(
+            Arc::new(FakeNotifier::new()),
+            std::path::PathBuf::from("/tmp/unused-descriptor-ids.sock"),
+            state.path().join("agents.json"),
+            state.path().join("projects.json"),
+            state.path().join("agent-profiles.json"),
+            state.path().join("worktrees"),
+        );
         let ids: Vec<String> = daemon.list_adapters().into_iter().map(|a| a.id).collect();
         // Descriptor ids (NOT adapter.id() — shell's adapter reports "synthetic").
         assert!(ids.contains(&"claude".to_string()));
@@ -462,6 +523,7 @@ mod tests {
             std::path::PathBuf::from("/tmp/unused-projects.sock"),
             state.path().join("agents.json"),
             state.path().join("projects.json"),
+            state.path().join("agent-profiles.json"),
             state.path().join("worktrees"),
         ));
 
@@ -515,6 +577,7 @@ mod tests {
             std::path::PathBuf::from("/tmp/unused-projects2.sock"),
             state.path().join("agents.json"),
             state.path().join("projects.json"),
+            state.path().join("agent-profiles.json"),
             state.path().join("worktrees"),
         ));
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
@@ -541,9 +604,14 @@ mod tests {
 
     #[tokio::test]
     async fn control_json_list_adapters_yields_adapter_list_with_codex() {
-        let daemon = Arc::new(Daemon::new_with(
+        let state = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(Daemon::new_with_paths(
             Arc::new(FakeNotifier::new()),
             std::path::PathBuf::from("/tmp/unused-cjson4.sock"),
+            state.path().join("agents.json"),
+            state.path().join("projects.json"),
+            state.path().join("agent-profiles.json"),
+            state.path().join("worktrees"),
         ));
 
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
@@ -565,5 +633,153 @@ mod tests {
             other => panic!("expected AdapterList, got {other:?}"),
         };
         assert!(adapters.iter().any(|a| a.id == "codex"), "{adapters:?}");
+    }
+
+    #[tokio::test]
+    async fn control_json_adds_a_profile_and_broadcasts_the_new_lists() {
+        let state = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(Daemon::new_with_paths(
+            Arc::new(FakeNotifier::new()),
+            std::path::PathBuf::from("/tmp/unused-cjson-profiles.sock"),
+            state.path().join("agents.json"),
+            state.path().join("projects.json"),
+            state.path().join("agent-profiles.json"),
+            state.path().join("worktrees"),
+        ));
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(daemon.clone().handle_control_json(server));
+
+        let (crd, mut cwr) = tokio::io::split(&mut client);
+        let mut lines = BufReader::new(crd).lines();
+        let _snapshot = lines.next_line().await.unwrap(); // the initial WorktreeList
+
+        cwr.write_all(
+            b"{\"type\":\"addAgentProfile\",\"profile\":{\"id\":\"opus\",\"base\":\"claude\",\
+              \"displayName\":\"Claude (Opus)\",\"enabled\":true,\"args\":\"--model opus\",\"builtin\":false}}\n",
+        )
+        .await
+        .unwrap();
+
+        // The reply, then the broadcast pair — collect a few lines and assert on the set, since
+        // the direct reply and the tick-driven events are not ordered against each other.
+        let mut saw_profiles_with_opus = false;
+        let mut saw_adapters_with_opus = false;
+        for _ in 0..4 {
+            let Ok(Some(l)) = tokio::time::timeout(Duration::from_secs(2), lines.next_line())
+                .await
+                .unwrap()
+            else {
+                break;
+            };
+            match serde_json::from_str::<ControlEvent>(&l) {
+                Ok(ControlEvent::AgentProfileList { profiles }) => {
+                    saw_profiles_with_opus |= profiles.iter().any(|p| p.id == "opus");
+                    assert!(profiles.iter().any(|p| p.id == "claude" && p.builtin));
+                }
+                Ok(ControlEvent::AdapterList { adapters }) => {
+                    saw_adapters_with_opus |= adapters.iter().any(|a| a.id == "opus");
+                }
+                Ok(ControlEvent::Error { message }) => panic!("unexpected error: {message}"),
+                _ => {}
+            }
+            if saw_profiles_with_opus && saw_adapters_with_opus {
+                break;
+            }
+        }
+        assert!(saw_profiles_with_opus, "an added profile must reach the profile list");
+        assert!(saw_adapters_with_opus, "and the spawnable adapter list");
+    }
+
+    #[tokio::test]
+    async fn control_json_refuses_removing_a_builtin() {
+        let state = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(Daemon::new_with_paths(
+            Arc::new(FakeNotifier::new()),
+            std::path::PathBuf::from("/tmp/unused-cjson-builtin.sock"),
+            state.path().join("agents.json"),
+            state.path().join("projects.json"),
+            state.path().join("agent-profiles.json"),
+            state.path().join("worktrees"),
+        ));
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(daemon.clone().handle_control_json(server));
+
+        let (crd, mut cwr) = tokio::io::split(&mut client);
+        let mut lines = BufReader::new(crd).lines();
+        let _snapshot = lines.next_line().await.unwrap();
+
+        cwr.write_all(b"{\"type\":\"removeAgentProfile\",\"id\":\"claude\"}\n").await.unwrap();
+        let l = lines.next_line().await.unwrap().unwrap();
+        match serde_json::from_str::<ControlEvent>(&l).unwrap() {
+            ControlEvent::Error { message } => assert!(message.contains("built-in"), "{message}"),
+            other => panic!("expected an Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn control_json_broadcasts_a_profile_add_to_a_second_connection() {
+        // The whole point of the broadcast: a connection that did NOT make the mutation must
+        // still learn about it. `control_json_adds_a_profile_and_broadcasts_the_new_lists` only
+        // ever reads the mutating connection's own stream, so it would still pass if the
+        // broadcast were deleted and only the direct reply remained — this test exists to close
+        // that gap.
+        let state = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(Daemon::new_with_paths(
+            Arc::new(FakeNotifier::new()),
+            std::path::PathBuf::from("/tmp/unused-cjson-profiles-broadcast.sock"),
+            state.path().join("agents.json"),
+            state.path().join("projects.json"),
+            state.path().join("agent-profiles.json"),
+            state.path().join("worktrees"),
+        ));
+
+        // Connection A makes the mutation.
+        let (mut client_a, server_a) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(daemon.clone().handle_control_json(server_a));
+        let (crd_a, mut cwr_a) = tokio::io::split(&mut client_a);
+        let mut lines_a = BufReader::new(crd_a).lines();
+        let _snapshot_a = lines_a.next_line().await.unwrap(); // the initial WorktreeList
+
+        // Connection B never sends a request — it only observes what the daemon broadcasts.
+        let (mut client_b, server_b) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(daemon.clone().handle_control_json(server_b));
+        let mut lines_b = BufReader::new(&mut client_b).lines();
+        let _snapshot_b = lines_b.next_line().await.unwrap(); // the initial WorktreeList, drained
+
+        cwr_a.write_all(
+            b"{\"type\":\"addAgentProfile\",\"profile\":{\"id\":\"opus\",\"base\":\"claude\",\
+              \"displayName\":\"Claude (Opus)\",\"enabled\":true,\"args\":\"--model opus\",\"builtin\":false}}\n",
+        )
+        .await
+        .unwrap();
+
+        // Collect a bounded number of lines from B and assert on the SET, since the profile-list
+        // and adapter-list broadcast events are not ordered against each other (mirrors
+        // `control_json_adds_a_profile_and_broadcasts_the_new_lists`'s style). B never wrote a
+        // request, so every line it sees (after its own initial snapshot) is broadcast-driven.
+        let mut saw_profiles_with_opus = false;
+        let mut saw_adapters_with_opus = false;
+        for _ in 0..4 {
+            let l = tokio::time::timeout(Duration::from_secs(2), lines_b.next_line())
+                .await
+                .expect("connection B received nothing within 2s — the mutation on A never broadcast to it")
+                .unwrap()
+                .expect("connection B's stream closed before a broadcast arrived");
+            match serde_json::from_str::<ControlEvent>(&l) {
+                Ok(ControlEvent::AgentProfileList { profiles }) => {
+                    saw_profiles_with_opus |= profiles.iter().any(|p| p.id == "opus");
+                }
+                Ok(ControlEvent::AdapterList { adapters }) => {
+                    saw_adapters_with_opus |= adapters.iter().any(|a| a.id == "opus");
+                }
+                Ok(ControlEvent::Error { message }) => panic!("unexpected error on B: {message}"),
+                _ => {}
+            }
+            if saw_profiles_with_opus && saw_adapters_with_opus {
+                break;
+            }
+        }
+        assert!(saw_profiles_with_opus, "connection B (which never mutated anything) must learn the new profile via the broadcast");
+        assert!(saw_adapters_with_opus, "connection B must learn the new adapter via the broadcast too");
     }
 }

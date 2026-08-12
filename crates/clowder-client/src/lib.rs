@@ -22,6 +22,7 @@ async fn next_control_line<R: AsyncRead + Unpin>(
         .map_err(anyhow::Error::from)
 }
 
+pub mod agent_cli;
 pub mod forward;
 pub mod probe;
 pub mod remote_cli;
@@ -215,6 +216,62 @@ pub async fn remove_project_via_control(
     }
 }
 
+/// Send one profile request and wait for the resulting `AgentProfileList`.
+///
+/// Shared by all four helpers: every profile mutation answers with the full new list, so the CLI
+/// can print the resulting state without a second round trip.
+async fn agent_profiles_request(
+    control_sock: &std::path::Path,
+    req: ControlRequest,
+) -> anyhow::Result<Vec<clowder_proto::AgentProfileInfo>> {
+    let stream = UnixStream::connect(control_sock).await?;
+    let (rd, mut wr) = tokio::io::split(stream);
+    let mut lines = BufReader::new(rd).lines();
+
+    let mut line = serde_json::to_string(&req)?;
+    line.push('\n');
+    wr.write_all(line.as_bytes()).await?;
+
+    loop {
+        match next_control_line(&mut lines).await? {
+            Some(l) => match serde_json::from_str::<ControlEvent>(&l) {
+                Ok(ControlEvent::AgentProfileList { profiles }) => return Ok(profiles),
+                Ok(ControlEvent::Error { message }) => return Err(anyhow::anyhow!(message)),
+                Ok(_) => continue,  // the initial WorktreeList, streamed attention, ...
+                Err(_) => continue, // ignore unparseable lines defensively
+            },
+            None => return Err(anyhow::anyhow!("control socket closed before the result")),
+        }
+    }
+}
+
+pub async fn list_agent_profiles_via_control(
+    control_sock: &std::path::Path,
+) -> anyhow::Result<Vec<clowder_proto::AgentProfileInfo>> {
+    agent_profiles_request(control_sock, ControlRequest::ListAgentProfiles).await
+}
+
+pub async fn add_agent_profile_via_control(
+    control_sock: &std::path::Path,
+    profile: clowder_proto::AgentProfileInfo,
+) -> anyhow::Result<Vec<clowder_proto::AgentProfileInfo>> {
+    agent_profiles_request(control_sock, ControlRequest::AddAgentProfile { profile }).await
+}
+
+pub async fn update_agent_profile_via_control(
+    control_sock: &std::path::Path,
+    profile: clowder_proto::AgentProfileInfo,
+) -> anyhow::Result<Vec<clowder_proto::AgentProfileInfo>> {
+    agent_profiles_request(control_sock, ControlRequest::UpdateAgentProfile { profile }).await
+}
+
+pub async fn remove_agent_profile_via_control(
+    control_sock: &std::path::Path,
+    id: &str,
+) -> anyhow::Result<Vec<clowder_proto::AgentProfileInfo>> {
+    agent_profiles_request(control_sock, ControlRequest::RemoveAgentProfile { id: id.to_string() }).await
+}
+
 pub async fn pump<S, R, W>(
     io: S,
     pane: PaneId,
@@ -396,6 +453,7 @@ mod tests {
             std::path::PathBuf::from("/tmp/unused-cli.sock"),
             state.path().join("agents.json"),
             state.path().join("projects.json"),
+            state.path().join("agent-profiles.json"),
             state.path().join("worktrees"),
         ));
         daemon.add_project(repo.path()).unwrap();
@@ -453,5 +511,55 @@ mod tests {
         });
         let err = add_project_via_control(&sock, "/p").await.unwrap_err();
         assert!(err.to_string().contains("timed out"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn agent_profile_helpers_round_trip_against_a_daemon() {
+        use clowder_daemon::FakeNotifier;
+
+        // Same setup as the spawn test above (lib.rs:390-404) minus the git repo — profiles need
+        // no project. Each test gets its own state dir so none can read the developer's real file.
+        let sockdir = tempfile::tempdir().unwrap();
+        let sock = sockdir.path().join("control.sock");
+        let state = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(Daemon::new_with_paths(
+            Arc::new(FakeNotifier::new()),
+            std::path::PathBuf::from("/tmp/unused-cli-profiles.sock"),
+            state.path().join("agents.json"),
+            state.path().join("projects.json"),
+            state.path().join("agent-profiles.json"),
+            state.path().join("worktrees"),
+        ));
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        tokio::spawn(async move { let _ = daemon.serve_control_json(listener).await; });
+
+        let before = list_agent_profiles_via_control(&sock).await.unwrap();
+        assert_eq!(before.len(), 3, "the three builtins");
+
+        let after = add_agent_profile_via_control(
+            &sock,
+            clowder_proto::AgentProfileInfo {
+                id: "opus".into(),
+                base: "claude".into(),
+                display_name: "Claude (Opus)".into(),
+                enabled: true,
+                args: "--model opus".into(),
+                builtin: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(after.iter().any(|p| p.id == "opus"));
+
+        let mut opus = after.into_iter().find(|p| p.id == "opus").unwrap();
+        opus.enabled = false;
+        let after = update_agent_profile_via_control(&sock, opus).await.unwrap();
+        assert!(!after.iter().find(|p| p.id == "opus").unwrap().enabled);
+
+        let after = remove_agent_profile_via_control(&sock, "opus").await.unwrap();
+        assert!(!after.iter().any(|p| p.id == "opus"));
+
+        let e = remove_agent_profile_via_control(&sock, "claude").await.unwrap_err().to_string();
+        assert!(e.contains("built-in"), "{e}");
     }
 }

@@ -52,6 +52,55 @@ final class SheetFormsTests: XCTestCase {
     }
 }
 
+final class NewWorktreeFormDefaultsTests: XCTestCase {
+    private func project(_ path: String) -> SidebarProject {
+        SidebarProject(path: path, name: path, kind: "git", worktrees: [], attentionCount: 0)
+    }
+    private func adapter(_ id: String) -> AdapterInfo { AdapterInfo(id: id, displayName: id) }
+
+    func testFillsAnEmptyFormFromTheInitialSelection() {
+        var form = NewWorktreeForm(projectPath: "", name: "", adapter: "")
+        form.applyDefaults(projects: [project("/a"), project("/b")],
+                           adapters: [adapter("claude"), adapter("codex")],
+                           initialProjectPath: "/b")
+        XCTAssertEqual(form.projectPath, "/b")
+        XCTAssertEqual(form.adapter, "claude")
+    }
+
+    func testFallsBackToTheFirstProjectWhenThereIsNoInitialSelection() {
+        var form = NewWorktreeForm(projectPath: "", name: "", adapter: "")
+        form.applyDefaults(projects: [project("/a")], adapters: [adapter("claude")],
+                           initialProjectPath: "")
+        XCTAssertEqual(form.projectPath, "/a")
+    }
+
+    func testReapplyingNeverMovesAChoiceTheUserAlreadyMade() {
+        // The sheet re-applies defaults whenever the agent list changes, which can happen while the
+        // user is mid-edit (a profile toggled in Settings, a reconnect). It must not yank them back.
+        var form = NewWorktreeForm(projectPath: "/chosen", name: "task", adapter: "codex")
+        form.applyDefaults(projects: [project("/a"), project("/chosen")],
+                           adapters: [adapter("claude"), adapter("codex")],
+                           initialProjectPath: "/a")
+        XCTAssertEqual(form.projectPath, "/chosen", "re-applying must not reset the project")
+        XCTAssertEqual(form.adapter, "codex", "re-applying must not reset the agent")
+        XCTAssertEqual(form.name, "task")
+    }
+
+    func testRepointsTheAgentOnlyWhenTheChosenOneIsNoLongerOffered() {
+        var form = NewWorktreeForm(projectPath: "/chosen", name: "", adapter: "codex")
+        // codex disabled in Settings while the sheet is open.
+        form.applyDefaults(projects: [project("/chosen")], adapters: [adapter("claude")],
+                           initialProjectPath: "/chosen")
+        XCTAssertEqual(form.adapter, "claude")
+    }
+
+    func testEveryAgentDisabledLeavesNoSelection() {
+        var form = NewWorktreeForm(projectPath: "/chosen", name: "", adapter: "codex")
+        form.applyDefaults(projects: [project("/chosen")], adapters: [], initialProjectPath: "/chosen")
+        XCTAssertEqual(form.adapter, "", "no agent may be pre-selected when none is offered")
+    }
+}
+
 final class HostDraftTests: XCTestCase {
     private func fixtureCases(_ name: String, file: StaticString = #filePath) throws -> [(String, Bool)] {
         struct Case: Decodable { let name: String; let valid: Bool }
@@ -126,5 +175,62 @@ final class HostDraftTests: XCTestCase {
         draft.tls = true
         XCTAssertTrue(draft.isValid)
         XCTAssertNil(draft.tlsError)
+    }
+}
+
+final class AgentProfileDraftTests: XCTestCase {
+    func testValidDraftIsValid() {
+        let d = AgentProfileDraft(id: "opus", base: "claude", displayName: "Claude (Opus)",
+                                  enabled: true, args: "--model opus", isNew: true)
+        XCTAssertNil(d.idError)
+        XCTAssertNil(d.displayNameError)
+        XCTAssertNil(d.argsError)
+        XCTAssertTrue(d.isValid)
+    }
+
+    func testIdFollowsTheHostNameRule() throws {
+        var d = AgentProfileDraft(id: "has space", base: "claude", displayName: "x", enabled: true,
+                                  args: "", isNew: true)
+        XCTAssertNotNil(d.idError)
+        d.id = ""
+        XCTAssertNotNil(d.idError)
+        d.id = "a.b-c_1"
+        XCTAssertNil(d.idError)
+    }
+
+    func testBlankDisplayNameAndBadArgsAreRejected() {
+        var d = AgentProfileDraft(id: "opus", base: "claude", displayName: "  ", enabled: true,
+                                  args: "", isNew: true)
+        XCTAssertNotNil(d.displayNameError)
+        XCTAssertFalse(d.isValid)
+
+        d.displayName = "Opus"
+        d.args = "--x {{nope}}"
+        XCTAssertNotNil(d.argsError)
+        XCTAssertFalse(d.isValid)
+    }
+
+    func testNewlineOnlyDisplayNameIsBlank() {
+        // Mirrors clowder_config::agents::validate_profile, which uses `trim()` (strips newlines) —
+        // not just `.whitespaces`, which in Foundation does NOT include newlines. A "\n" name must
+        // be rejected here exactly as the daemon would reject it.
+        let d = AgentProfileDraft(id: "opus", base: "claude", displayName: "\n", enabled: true,
+                                  args: "", isNew: true)
+        XCTAssertNotNil(d.displayNameError, "a newline-only name must count as blank")
+        XCTAssertFalse(d.isValid)
+    }
+
+    func testArgsAtTheLengthLimitIsAccepted() {
+        let d = AgentProfileDraft(id: "opus", base: "claude", displayName: "Opus", enabled: true,
+                                  args: String(repeating: "a", count: 4096), isNew: true)
+        XCTAssertNil(d.argsError, "4096 chars is the boundary, still valid")
+        XCTAssertTrue(d.isValid)
+    }
+
+    func testArgsOverTheLengthLimitIsRejected() {
+        let d = AgentProfileDraft(id: "opus", base: "claude", displayName: "Opus", enabled: true,
+                                  args: String(repeating: "a", count: 4097), isNew: true)
+        XCTAssertNotNil(d.argsError, "4097 chars exceeds the args limit")
+        XCTAssertFalse(d.isValid)
     }
 }

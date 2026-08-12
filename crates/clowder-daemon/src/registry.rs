@@ -17,6 +17,13 @@ pub struct AgentRecord {
     /// records — written before this field existed — deserialize). Rebuilt on reconcile (M9b).
     #[serde(default)]
     pub tree: Option<PaneTree>,
+    /// The profile this agent was spawned from, if any. Informational — resume uses `extra_args`.
+    #[serde(default)]
+    pub profile_id: Option<String>,
+    /// The profile's arguments AS SUBSTITUTED at spawn. Replayed verbatim on resume, so editing,
+    /// renaming or deleting the profile can never change (or break) a running agent's argv.
+    #[serde(default)]
+    pub extra_args: Vec<String>,
 }
 
 /// Durable, restart-surviving list of live agents, stored as one atomically-written JSON file.
@@ -82,7 +89,7 @@ mod tests {
             agent_id: id, project: PathBuf::from("/p"), task: "t".into(),
             adapter_id: "claude".into(), worktree_path: PathBuf::from("/p/.clowder/worktrees/t"),
             branch: "clowder/t".into(), workspace_kind: "git".into(), cols: 80, rows: 24,
-            tree: None,
+            tree: None, profile_id: None, extra_args: Vec::new(),
         }
     }
 

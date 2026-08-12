@@ -19,6 +19,23 @@ pub trait AgentAdapter: Send + Sync {
     fn provides_hooks(&self) -> bool;
 }
 
+/// What to spawn: the base adapter, plus the profile that selected it and the argument template to
+/// append. Substitution happens inside `Daemon::spawn_agent`, once the worktree exists.
+pub struct SpawnSpec<'a> {
+    pub adapter: &'a dyn AgentAdapter,
+    /// The profile this came from, recorded on the agent. `None` for a direct adapter spawn (tests).
+    pub profile_id: Option<String>,
+    /// Split, not yet substituted.
+    pub arg_template: Vec<String>,
+}
+
+impl<'a> SpawnSpec<'a> {
+    /// A bare adapter spawn: no profile, no extra arguments.
+    pub fn adapter_only(adapter: &'a dyn AgentAdapter) -> Self {
+        Self { adapter, profile_id: None, arg_template: Vec::new() }
+    }
+}
+
 /// Resolve the `clowder-hook` binary the injected hooks should invoke. The agent process
 /// (e.g. `claude`) runs these hooks and does not necessarily have `clowder-hook` on its PATH
 /// — a dev running the daemon from `cargo`/`target/debug` certainly won't — so prefer an

@@ -1,0 +1,1 @@
+{"type":"updateAgentProfile","profile":{"id":"opus","base":"claude","displayName":"Claude (Opus, updated)","enabled":false,"args":"--model opus --verbose","builtin":false}}

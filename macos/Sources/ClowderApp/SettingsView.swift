@@ -1,10 +1,10 @@
 import SwiftUI
 import ClowderCore
 
-/// The Settings window (⌘,). One tab today; `TabView` so General/Keys can be added later without
-/// restructuring the scene.
+/// The Settings window (⌘,). `TabView` so panes can be added later without restructuring the scene.
 struct SettingsView: View {
     let hosts: HostsViewModel?
+    let agents: AgentsViewModel?
 
     var body: some View {
         TabView {
@@ -18,6 +18,16 @@ struct SettingsView: View {
                 }
             }
             .tabItem { Label("Hosts", systemImage: "network") }
+
+            Group {
+                if let agents {
+                    AgentsSettingsView(model: agents)
+                } else {
+                    Text("Agent settings need a running daemon.")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .tabItem { Label("Agents", systemImage: "cpu") }
         }
     }
 }
