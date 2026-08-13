@@ -11,6 +11,9 @@ final class SurfaceView: NSView {
     private let command: String
     private let socketPath: String
     private var wantsFocus = false
+    /// Last size handed to libghostty, in backing pixels. `sizeDidChange` runs on every SwiftUI
+    /// update, not just real resizes, so identical pushes are dropped here.
+    private var pushedPixels: (UInt32, UInt32)?
 
     init(app: ghostty_app_t, paneId: UInt64, clowderBinary: String, socketPath: String) {
         self.app = app
@@ -52,7 +55,14 @@ final class SurfaceView: NSView {
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        guard window != nil, surface == nil else { return }
+        guard window != nil else { return }
+        guard surface == nil else {
+            // A cached surface coming back on screen (SurfaceHost keeps one view per pane, and only
+            // the selected pane is in the hierarchy). Its grid is whatever it was when it was last
+            // visible, so a window resize that happened meanwhile has to be applied now.
+            pushSize()
+            return
+        }
         createSurface()
     }
 
@@ -88,16 +98,46 @@ final class SurfaceView: NSView {
         ghostty_surface_set_focus(surface, wantsFocus)
     }
 
-    private func pushSize() {
+    /// Hand libghostty a new drawable size, in **backing pixels** — points would silently give a
+    /// half-size grid on Retina. Driven by SwiftUI through `TerminalContainer.updateNSView`, which
+    /// is the layout path that actually fires here; `setFrameSize` alone does not, which is what
+    /// left resized windows rendering at the old grid (#87).
+    func sizeDidChange(_ size: CGSize) {
         guard let surface else { return }
-        let backing = convertToBacking(bounds)
+        let backing = convertToBacking(NSRect(origin: .zero, size: size))
         let w = UInt32(max(1, backing.width))
         let h = UInt32(max(1, backing.height))
+        guard pushedPixels ?? (0, 0) != (w, h) else { return }
+        pushedPixels = (w, h)
         ghostty_surface_set_size(surface, w, h)
     }
 
+    private func pushSize() { sizeDidChange(bounds.size) }
+
     override func setFrameSize(_ newSize: NSSize) {
         super.setFrameSize(newSize)
+        sizeDidChange(newSize)
+    }
+
+    /// The window moved to a display with a different scale factor (or gained one). libghostty needs
+    /// both halves re-pushed: the scale, and then the size — the pixel count changed even though the
+    /// point size did not. Mirrors what Ghostty's own AppKit view does.
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        guard let surface, let window else { return }
+
+        // The layer is libghostty's; retag it without an implicit animation.
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer?.contentsScale = window.backingScaleFactor
+        CATransaction.commit()
+
+        let backing = convertToBacking(frame)
+        let xScale = frame.width > 0 ? backing.width / frame.width : window.backingScaleFactor
+        let yScale = frame.height > 0 ? backing.height / frame.height : window.backingScaleFactor
+        ghostty_surface_set_content_scale(surface, xScale, yScale)
+
+        pushedPixels = nil   // same points, different pixels — the dedupe must not swallow this
         pushSize()
     }
 
