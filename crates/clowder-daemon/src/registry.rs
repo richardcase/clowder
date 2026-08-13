@@ -74,6 +74,21 @@ impl Registry {
             None => false,
         });
     }
+
+    /// Update just one agent's persisted grid size, so a resumed agent comes back at the size the
+    /// window actually is rather than the 80×24 default it was spawned with. A no-op — no write, no
+    /// disk I/O — for an unknown id (companion panes have no record) and for a size that is already
+    /// what is stored, which matters because resizes arrive in bursts as the user drags.
+    pub fn set_size(&self, agent_id: u64, cols: u16, rows: u16) {
+        self.store.mutate_if(|all| match all.iter_mut().find(|r| r.agent_id == agent_id) {
+            Some(rec) if (rec.cols, rec.rows) != (cols, rows) => {
+                rec.cols = cols;
+                rec.rows = rows;
+                true
+            }
+            _ => false,
+        });
+    }
 }
 
 #[cfg(test)]
@@ -183,5 +198,37 @@ mod tests {
         assert_eq!(loaded.iter().find(|r| r.agent_id == 1).unwrap().tree, Some(t));
         assert_eq!(loaded.iter().find(|r| r.agent_id == 2).unwrap().tree, None);
         assert_eq!(loaded.len(), 2);
+    }
+
+    #[test]
+    fn set_size_updates_one_record_and_noops_on_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = Registry::new(dir.path().join("agents.json"));
+        reg.upsert(rec(1));
+        reg.upsert(rec(2));
+        reg.set_size(1, 132, 43);
+        reg.set_size(99, 132, 43); // absent (a companion pane) → no-op, no panic
+        let loaded = reg.load();
+        let one = loaded.iter().find(|r| r.agent_id == 1).unwrap();
+        assert_eq!((one.cols, one.rows), (132, 43));
+        let two = loaded.iter().find(|r| r.agent_id == 2).unwrap();
+        assert_eq!((two.cols, two.rows), (80, 24), "the other agent must be untouched");
+        assert_eq!(loaded.len(), 2);
+    }
+
+    /// A window drag produces a burst of resizes, most of which land on the same grid. Re-writing
+    /// `agents.json` for each would be pointless disk churn.
+    #[test]
+    fn set_size_to_the_same_grid_does_not_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agents.json");
+        let reg = Registry::new(path.clone());
+        reg.upsert(rec(1));
+        reg.set_size(1, 132, 43);
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        reg.set_size(1, 132, 43);
+        let after = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(before, after, "an unchanged size must not touch the file");
     }
 }

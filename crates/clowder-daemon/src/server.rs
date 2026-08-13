@@ -104,6 +104,10 @@ pub struct Daemon {
     term_project: Arc<Mutex<HashMap<PaneId, PathBuf>>>,
     /// Agents whose ratios changed since the last flush; drained by the periodic layout flusher.
     layout_dirty: Arc<Mutex<std::collections::HashSet<PaneId>>>,
+    /// Agents whose grid was resized since the last flush; drained by the same flusher. Coalesced
+    /// for the same reason ratios are: a window drag produces a burst of resizes and each one would
+    /// otherwise rewrite `agents.json`.
+    size_dirty: Arc<Mutex<std::collections::HashSet<PaneId>>>,
     /// Idle debounce before content-based attention inspects the screen for a blocking prompt.
     pub(crate) content_idle: std::time::Duration,
     /// Serializes project-list mutations against agent spawns. `spawn_agent` validates the project
@@ -191,6 +195,7 @@ impl Daemon {
             project_terms: Arc::new(Mutex::new(HashMap::new())),
             term_project: Arc::new(Mutex::new(HashMap::new())),
             layout_dirty: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            size_dirty: Arc::new(Mutex::new(std::collections::HashSet::new())),
             content_idle: std::time::Duration::from_millis(500),
             project_mutation: Mutex::new(()),
         }
@@ -973,8 +978,29 @@ impl Daemon {
         }
     }
 
-    /// Spawn the background task that flushes coalesced ratio changes every `LAYOUT_FLUSH_INTERVAL`.
-    /// Runs for the daemon's lifetime.
+    /// Mark an agent's grid size dirty (a window resize). Coalesced: the periodic flusher persists
+    /// it. Only agent panes are tracked — a companion or project terminal has no registry record.
+    fn mark_size_dirty(&self, pane: PaneId) {
+        if self.trees.lock().contains_key(&pane) {
+            self.size_dirty.lock().insert(pane);
+        }
+    }
+
+    /// Persist every dirty agent's current grid size, then clear the dirty set. The live `Pane` is
+    /// the source of truth, so a resize that landed after the mark is picked up here rather than
+    /// being staged separately. Safe to call directly (used by tests + the flusher).
+    pub fn flush_dirty_sizes(&self) {
+        let dirty: Vec<PaneId> = self.size_dirty.lock().drain().collect();
+        for agent in dirty {
+            if let Some(pane) = self.get(agent) {
+                let (cols, rows) = pane.size();
+                self.registry.set_size(agent.0, cols, rows);
+            }
+        }
+    }
+
+    /// Spawn the background task that flushes coalesced ratio and resize changes every
+    /// `LAYOUT_FLUSH_INTERVAL`. Runs for the daemon's lifetime.
     pub fn spawn_layout_flusher(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
         let me = Arc::clone(self);
         tokio::spawn(async move {
@@ -982,6 +1008,7 @@ impl Daemon {
             loop {
                 ticker.tick().await;
                 me.flush_dirty_layouts();
+                me.flush_dirty_sizes();
             }
         })
     }
@@ -1265,7 +1292,14 @@ impl Daemon {
                                 self.set_attention(pid, AttentionState::Working);
                             }
                         }
-                        Some(ClientToDaemon::Resize { cols, rows, .. }) => { let _ = pane.resize(cols, rows); }
+                        Some(ClientToDaemon::Resize { cols, rows, .. }) => {
+                            // Not a silent `let _`: this is the one place a broken resize path shows
+                            // up in daemon.log, and #87 spent its whole life invisible for want of it.
+                            match pane.resize(cols, rows) {
+                                Ok(()) => self.mark_size_dirty(pane.id()),
+                                Err(e) => tracing::warn!("resize pane {} to {cols}x{rows} failed: {e}", pane.id().0),
+                            }
+                        }
                         Some(ClientToDaemon::Detach) | None => break,
                         Some(ClientToDaemon::Attach { .. }) => continue,
                         Some(ClientToDaemon::ListWorktrees) => continue,
@@ -1423,6 +1457,101 @@ mod tests {
             }
         }
         assert!(seen.windows(2).any(|w| w == b"hi"), "did not receive echoed output");
+    }
+
+    /// Attach, then resize the way `clowder attach` does on SIGWINCH, and check it lands on the
+    /// PTY. `Pane::size()` is only updated after the `TIOCSWINSZ` succeeds, so this covers the whole
+    /// wire path — which had no test at all while #87 was open.
+    #[tokio::test]
+    async fn wire_resize_reaches_the_pty() {
+        let daemon = Arc::new(Daemon::new());
+        let pane = daemon.spawn_pane(sh("cat"), 80, 24).unwrap();
+        assert_eq!(daemon.get(pane).unwrap().size(), (80, 24));
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let d = daemon.clone();
+        tokio::spawn(async move { d.handle_conn(server_io).await.unwrap() });
+
+        let mut client = MsgStream::<_>::new(client_io);
+        client.send(&ClientToDaemon::Attach { pane }).await.unwrap();
+        let _attached: DaemonToClient = client.recv().await.unwrap().unwrap();
+        let _backlog: DaemonToClient = client.recv().await.unwrap().unwrap();
+
+        client.send(&ClientToDaemon::Resize { pane, cols: 132, rows: 43 }).await.unwrap();
+
+        for _ in 0..100 {
+            if daemon.get(pane).unwrap().size() == (132, 43) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            daemon.get(pane).unwrap().size(),
+            (132, 43),
+            "a wire Resize never reached the pane's PTY"
+        );
+    }
+
+    #[tokio::test]
+    async fn resizing_an_agent_persists_its_grid_and_resumes_at_it() {
+        use crate::{FakeNotifier, SyntheticAdapter};
+
+        let repo = init_repo();
+        let statedir = tempfile::tempdir().unwrap();
+        let _state_lock = crate::STATE_FILE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("CLOWDER_STATE_FILE", statedir.path().join("agents.json"));
+        let state_path = statedir.path().join("agents.json");
+        let projects_path = statedir.path().join("projects.json");
+        let mk = |sock: &str| {
+            Arc::new(Daemon::new_with_paths(
+                Arc::new(FakeNotifier::new()),
+                std::path::PathBuf::from(sock),
+                state_path.clone(),
+                projects_path.clone(),
+                statedir.path().join("agent-profiles.json"),
+                statedir.path().join("worktrees"),
+            ))
+        };
+
+        let d1 = mk("/tmp/unused-resize1.sock");
+        d1.add_project(repo.path()).unwrap();
+        let adapter = SyntheticAdapter { command: sh("sleep 30") };
+        let id = d1.spawn_agent(repo.path(), SpawnSpec::adapter_only(&adapter), "demo").unwrap();
+
+        let rec_of = |d: &Arc<Daemon>| {
+            d.registry_for_test().load().into_iter().find(|r| r.agent_id == id.0).unwrap()
+        };
+        let spawned = rec_of(&d1);
+        assert_eq!((spawned.cols, spawned.rows), (d1.default_cols, d1.default_rows));
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let d = d1.clone();
+        tokio::spawn(async move { d.handle_conn(server_io).await.unwrap() });
+        let mut client = MsgStream::<_>::new(client_io);
+        client.send(&ClientToDaemon::Attach { pane: id }).await.unwrap();
+        let _attached: DaemonToClient = client.recv().await.unwrap().unwrap();
+        let _backlog: DaemonToClient = client.recv().await.unwrap().unwrap();
+        client.send(&ClientToDaemon::Resize { pane: id, cols: 132, rows: 43 }).await.unwrap();
+
+        for _ in 0..100 {
+            if d1.get(id).unwrap().size() == (132, 43) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // Coalesced, so nothing is on disk until the flusher runs.
+        d1.flush_dirty_sizes();
+        let resized = rec_of(&d1);
+        assert_eq!((resized.cols, resized.rows), (132, 43), "resize was not persisted");
+
+        // The point of persisting: a fresh daemon resumes the agent at the window's size, not 80x24.
+        let d2 = mk("/tmp/unused-resize2.sock");
+        d2.reconcile();
+        assert_eq!(
+            d2.get(id).expect("agent resumed").size(),
+            (132, 43),
+            "resumed agent fell back to the default grid"
+        );
     }
 
     #[tokio::test]
