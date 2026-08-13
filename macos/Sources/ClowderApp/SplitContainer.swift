@@ -12,9 +12,17 @@ struct SplitContainer: View {
     var body: some View {
         switch node {
         case let .leaf(pane):
-            TerminalContainer(pane: pane, surfaceHost: surfaceHost,
-                              isFocused: focusedPane == pane,
-                              onFocus: { focusedPane = pane })
+            // The GeometryReader is load-bearing, not decoration: measuring the leaf is what turns a
+            // window resize (or a divider drag) into a `TerminalContainer` update, and from there
+            // into `ghostty_surface_set_size`. It is also what makes the leaf greedy, which the
+            // terminal wants anyway.
+            GeometryReader { geo in
+                TerminalContainer(pane: pane, surfaceHost: surfaceHost,
+                                  size: geo.size,
+                                  isFocused: focusedPane == pane,
+                                  onFocus: { focusedPane = pane })
+                    .frame(width: geo.size.width, height: geo.size.height)
+            }
                 .overlay(
                     RoundedRectangle(cornerRadius: 3)
                         .strokeBorder(focusedPane == pane ? Color.accentColor : Color.clear, lineWidth: 2)
