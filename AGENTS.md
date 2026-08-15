@@ -237,6 +237,18 @@ is now the one place that computes it, and the app is the only caller that passe
   counts as failed, which is strictly worse.
 - **`deploy-site.yml` must never gain a `pull_request` trigger.** It holds `pages: write` and
   `id-token: write`, in the same repo as `DOPPLER_TOKEN` and the signing path.
+- **`getclowder.app` is fronted by Cloudflare, and Pages' "Enforce HTTPS" is deliberately off.**
+  GitHub cannot complete its ACME challenge for a proxied domain, so `https_enforced` stays `false`
+  by necessity — don't go looking for the toggle, and don't file it as a defect. TLS termination, the
+  HTTP→HTTPS redirect (**Always Use HTTPS**) and the encryption mode (**Full**/**Full (strict)**;
+  Flexible would leave the Cloudflare→Pages leg in plain HTTP) all live in Cloudflare. DNS resolves to
+  Cloudflare IPs, not the GitHub Pages apex range, which is how you can tell from outside.
+- **A failed site deploy does not retry itself.** `deploy-site.yml` fires on push, schedule and
+  dispatch — nothing re-runs a failed run. The 2026-08-15 cutover took the site down for ~20 minutes
+  exactly this way: the merge-triggered run failed because Pages was not yet enabled on this repo, the
+  domain was then moved across, and no deploy ran again until someone dispatched one by hand. After
+  any Pages or domain change, dispatch `deploy-site.yml` and confirm `https://getclowder.app` returns
+  200 before walking away.
 
 ## CI
 
