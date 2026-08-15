@@ -287,18 +287,24 @@ Expected: `product` — this branch has touched `docs/` and `scripts/`.
 
 - [ ] **Step 4: Prove the cheap path is reachable, not just tested in fixtures**
 
+Run this **after** committing the script in Step 5 — the probe needs `changed-scope.sh` to be
+tracked, and `git stash -u` would otherwise stash away the very file under test.
+
+The base must be the commit immediately before the probe, **not** `origin/main`. This branch already
+contains non-`site/` changes since `main` (that is exactly what Step 3 asserts), and `git diff` is
+cumulative from the merge base — so comparing against `origin/main` can only ever say `product`, no
+matter what the probe commit touches.
+
 ```bash
-git stash -u 2>/dev/null || true
-tmp=$(git rev-parse --abbrev-ref HEAD)
-git checkout -b tmp/scope-probe
+base=$(git rev-parse HEAD)
 echo "probe" >> site/README.md && git commit -qam "docs(site): scope probe"
-scripts/changed-scope.sh origin/main HEAD tmp/scope-probe   # expect: site-only
-git checkout "$tmp" && git branch -D tmp/scope-probe
-git stash pop 2>/dev/null || true
+scripts/changed-scope.sh "$base" HEAD feature   # expect: site-only
+git reset --hard "$base"                        # drop the probe commit
+git log --oneline -1                            # confirm you are back where you started
 ```
 
-Expected: `site-only`. This is the whole point of the milestone — confirm it against real git, not
-only against the fixture list.
+Expected: `site-only`, then a clean tree at `$base`. This is the whole point of the milestone —
+confirm it against real git, not only against the fixture list.
 
 - [ ] **Step 5: Commit**
 
