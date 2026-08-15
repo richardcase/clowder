@@ -1,0 +1,258 @@
+---
+/**
+ * Six benefit-led feature blocks. Every claim here maps to something Clowder
+ * actually ships today — nothing aspirational. Known gaps are handled
+ * honestly in the FAQ instead of being papered over here.
+ */
+
+const features = [
+  {
+    icon: 'fleet',
+    title: 'One window, a whole fleet',
+    body: 'Spawn Claude Code, OpenAI Codex or a plain shell against any git or jj project and drive them all from a single native app. <kbd>⌘N</kbd> picks the project, the task and the adapter.',
+    wide: false,
+  },
+  {
+    icon: 'isolate',
+    title: "Agents can't step on each other",
+    body: 'Every agent gets its own <strong>git worktree or jj workspace</strong>, auto-detected per project and created <em>outside</em> your repo — so your working tree stays exactly as you left it. Finish with <strong>Land</strong> to commit and keep the branch, or <strong>Discard</strong> to throw it away. Both from the UI, both with confirmation.',
+    wide: true,
+  },
+  {
+    icon: 'attention',
+    title: 'Know which agent needs you',
+    body: 'Native turn-complete hooks for Claude and Codex, plus a VT-signal fallback (BEL, OSC 9, OSC 777) for everything else, drive sidebar badges and a menu-bar count. Stop cycling through terminals to find out who is waiting on you.',
+    wide: false,
+  },
+  {
+    icon: 'terminal',
+    title: 'Real terminals, natively rendered',
+    body: 'An embedded <strong>libghostty</strong> surface per agent — genuine keys, mouse, IME and resize, not a web view. Split panes with <kbd>⌘D</kbd>, a rebindable command palette on <kbd>⌘K</kbd>, and hotkeys to jump between agents.',
+    wide: false,
+  },
+  {
+    icon: 'survive',
+    title: 'Close the window, keep the work',
+    body: 'A headless daemon owns the agent PTYs, so they keep running while the window is shut. The app launches and supervises its own daemon and reconnects on its own — with bounded backoff — if the connection drops.',
+    wide: false,
+  },
+  {
+    icon: 'remote',
+    title: 'Local and remote, one app',
+    body: 'Switch backends from the sidebar chip, the menu bar or <kbd>⌘K</kbd>. Moving away from Local <em>detaches</em> rather than kills, so agents on both sides keep running. Add, edit and TLS-pair remote hosts in Settings ▸ Hosts (<kbd>⌘,</kbd>).',
+    wide: false,
+  },
+] as const;
+---
+
+<section class="section" id="features">
+  <div class="shell">
+    <div class="section-head">
+      <p class="eyebrow">Why Clowder</p>
+      <h2>Built for the way you actually run agents</h2>
+      <p class="lede" style="margin-top: 1rem;">
+        Running one coding agent is easy. Running six — without them colliding, and without losing
+        track of which one is blocked on you — is the hard part. That is the whole job Clowder does.
+      </p>
+    </div>
+
+    <ul class="grid">
+      {
+        features.map((feature) => (
+          <li class:list={['card', feature.wide && 'card--wide']}>
+            <span class="card__icon" aria-hidden="true">
+              {feature.icon === 'fleet' && (
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
+                  <rect x="3" y="4" width="18" height="4.5" rx="1.4" />
+                  <rect x="3" y="10.5" width="18" height="4.5" rx="1.4" />
+                  <rect x="3" y="17" width="18" height="3.5" rx="1.4" />
+                </svg>
+              )}
+              {feature.icon === 'isolate' && (
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
+                  <circle cx="6" cy="6" r="2.5" />
+                  <circle cx="18" cy="6" r="2.5" />
+                  <circle cx="12" cy="18.5" r="2.5" />
+                  <path d="M6 8.5v3a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2v-3M12 13.5v2.5" />
+                </svg>
+              )}
+              {feature.icon === 'attention' && (
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
+                  <path d="M18 8.5a6 6 0 1 0-12 0c0 5-2 6.5-2 6.5h16s-2-1.5-2-6.5Z" />
+                  <path d="M10.3 19a2 2 0 0 0 3.4 0" />
+                </svg>
+              )}
+              {feature.icon === 'terminal' && (
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
+                  <rect x="2.5" y="4" width="19" height="16" rx="2" />
+                  <path d="M6.5 9.5 9.5 12l-3 2.5M12.5 15h5" />
+                </svg>
+              )}
+              {feature.icon === 'survive' && (
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
+                  <path d="M12 3.5 4.5 6.5v5c0 4.6 3.1 8 7.5 9.2 4.4-1.2 7.5-4.6 7.5-9.2v-5L12 3.5Z" />
+                  <path d="m9 12 2.2 2.2L15.2 10" />
+                </svg>
+              )}
+              {feature.icon === 'remote' && (
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
+                  <circle cx="12" cy="12" r="8.5" />
+                  <path d="M3.5 12h17M12 3.5c2.2 2.4 3.4 5.4 3.4 8.5S14.2 18.1 12 20.5c-2.2-2.4-3.4-5.4-3.4-8.5S9.8 5.9 12 3.5Z" />
+                </svg>
+              )}
+            </span>
+            <h3>{feature.title}</h3>
+            <p set:html={feature.body} />
+          </li>
+        ))
+      }
+    </ul>
+
+    <div class="cli">
+      <div class="cli__copy">
+        <h3>There's a headless CLI too</h3>
+        <p>
+          The bundled <code>clowder</code> command talks to the running daemon, so you can drive the
+          same fleet from a script or over SSH.
+        </p>
+      </div>
+      <pre class="cli__code"><code><span class="c-cmd">clowder spawn</span> &lt;project&gt; &lt;task&gt; [adapter]
+<span class="c-cmd">clowder attach</span> &lt;pane-id&gt;
+<span class="c-cmd">clowder remote</span> add|list|show|set|rm
+<span class="c-cmd">clowder connect</span> &lt;name-or-host:port&gt;</code></pre>
+    </div>
+  </div>
+</section>
+
+<style>
+  .grid {
+    list-style: none;
+    padding: 0;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(270px, 1fr));
+    gap: 1rem;
+  }
+
+  .card {
+    position: relative;
+    padding: 1.5rem 1.4rem;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: linear-gradient(
+      165deg,
+      color-mix(in srgb, var(--surface) 85%, transparent),
+      color-mix(in srgb, var(--bg-raised) 92%, transparent)
+    );
+    transition: border-color 0.2s ease;
+  }
+
+  .card:hover {
+    border-color: var(--border-bright);
+  }
+
+  .card--wide {
+    grid-column: span 2;
+  }
+
+  @media (max-width: 700px) {
+    .card--wide {
+      grid-column: span 1;
+    }
+  }
+
+  .card__icon {
+    display: grid;
+    place-items: center;
+    width: 38px;
+    height: 38px;
+    margin-bottom: 1rem;
+    border-radius: 10px;
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    border: 1px solid color-mix(in srgb, var(--accent) 24%, transparent);
+    color: var(--accent);
+  }
+
+  .card__icon svg {
+    width: 20px;
+    height: 20px;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+
+  .card p {
+    margin-top: 0.55rem;
+    font-size: 0.925rem;
+    color: var(--text-dim);
+    text-wrap: pretty;
+  }
+
+  .card :global(strong) {
+    color: var(--text);
+    font-weight: 600;
+  }
+
+  .card :global(em) {
+    color: var(--text);
+    font-style: italic;
+  }
+
+  .card :global(kbd) {
+    display: inline-block;
+    font-family: var(--font-mono);
+    font-size: 0.78em;
+    line-height: 1;
+    padding: 0.24em 0.4em;
+    border: 1px solid var(--border-bright);
+    border-bottom-width: 2px;
+    border-radius: 5px;
+    background: var(--surface-2);
+    color: var(--text);
+    white-space: nowrap;
+  }
+
+  /* ---------- CLI strip ---------- */
+
+  .cli {
+    display: grid;
+    grid-template-columns: minmax(220px, 0.85fr) 1.15fr;
+    gap: 1.5rem;
+    align-items: center;
+    margin-top: 1rem;
+    padding: 1.5rem 1.4rem;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--bg-raised);
+  }
+
+  .cli__copy p {
+    margin-top: 0.5rem;
+    font-size: 0.9rem;
+    color: var(--text-dim);
+  }
+
+  .cli__copy code {
+    color: var(--accent);
+  }
+
+  .cli__code {
+    margin: 0;
+    padding: 1rem 1.1rem;
+    border-radius: 10px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    font-size: 0.79rem;
+    line-height: 1.85;
+    color: var(--text-faint);
+    overflow-x: auto;
+  }
+
+  .c-cmd {
+    color: var(--accent);
+  }
+
+  @media (max-width: 760px) {
+    .cli {
+      grid-template-columns: 1fr;
+    }
+  }
+</style>

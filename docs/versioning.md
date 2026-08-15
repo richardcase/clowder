@@ -102,8 +102,12 @@ distinct causes the workflow reports:
 - *a required check concluded non-success* — including `cancelled`, `skipped` and `neutral`, which
   GitHub's rulesets count as passing but a release deliberately does not: a check that did not
   execute has not vouched for anything.
-- *CI did not start on the branch* (10-minute deadline) — the `Start CI` dispatch is what makes the
-  required checks run; check that `ci.yml` still accepts `workflow_dispatch`.
+- *a required check is still missing* (60-minute deadline) — the `Start CI` dispatch is what makes
+  the required checks run; check that `ci.yml` still accepts `workflow_dispatch`. Note that the
+  required context `build + test (macOS, unsigned)` is now reported by `required-build-gate`, a job
+  that depends on the macOS build, so it is not created — and so cannot even report `pending` — until
+  that build completes. That is why the deadline is 60 minutes rather than a few seconds: a genuine
+  timeout here can also mean the build itself has run far longer than its usual ~35-45 minutes.
 - *the PR is still `blocked` after 10 minutes* — the status-check rollup is a separate,
   eventually-consistent projection from the check runs the workflow waits on, so it can lag behind
   them. The merge retries; if it never converges, merge by hand.

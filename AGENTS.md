@@ -23,6 +23,7 @@ socket drives the app's sidebar, spawning, and splits.
 | `crates/clowder-vt` | Headless scanner for terminal attention signals (BEL, OSC 9, OSC 777) via `vte` — signal detection only, no cell grid | lib |
 | `crates/clowder-workspace` | Per-agent worktree provisioning: `WorkspaceDriver` (`GitWorktreeDriver` / jj), `WorkspaceKind {Git, Jj}`, provision/land/discard; `WorktreeLayout` owns where worktrees go (outside the project) | lib |
 | `macos/` | SwiftPM package: `ClowderCore` (lib, libghostty-free, unit-tested) + `clowder-app` (exe, links vendored libghostty via `GhosttyKit`). The Settings window (⌘,) has two panes: `SettingsView` → `HostsSettingsView` (list + editor) → `HostEditorView` → `PairingSheet`, and `SettingsView` → `AgentsSettingsView` → `AgentEditorView`. All of them render only — every decision (validation, add/edit/remove/pair, argument parsing) lives in `ClowderCore`'s `HostsViewModel` / `AgentsViewModel` / `AgentArgs`, since `clowder-app` has no test target | — |
+| `site/` | The public marketing site for `getclowder.app` (Astro, deployed to GitHub Pages). Ubuntu-only CI; **never** link to this repo from it — it is private and `site/scripts/audit.sh` fails the build on such a link | — |
 | `scripts/` | `build-app.sh`, `build-libghostty.sh`, `set-version.sh`, `gen-icon.swift` | — |
 | `docs/` | `superpowers/` (design specs + plans), `versioning.md`, `building-libghostty.md`, `code-signing.md` | — |
 
@@ -80,6 +81,19 @@ archive.
 | `next-version.sh` | Derive the next release version from the commits since the last tag (used by `release.yml`) | `scripts/next-version.sh [--notes\|--self-test]` |
 | `check-runs-state.sh` | Classify a commit's check runs against the ruleset's required set (the release workflow's merge gate) | `scripts/check-runs-state.sh --sha <sha>\|--self-test` |
 | `lib/conventional.sh` | The Conventional Commits grammar, sourced by both of the above so they can't drift | (sourced, not run) |
+
+**Site** (run inside `site/`):
+
+```sh
+cd site && npm ci
+cd site && npm run dev      # http://localhost:4321
+cd site && npm run check    # type-check .astro and .ts — `astro build` does NOT type-check
+cd site && npm run build    # → dist/, then scripts/audit.sh
+cd site && npm test         # scripts/audit-selftest.sh
+```
+
+The site needs no Rust, no Swift and no libghostty. `npm run check` is the only thing that catches a
+type error — `astro build` strips types and exits 0 on one.
 
 ## Runtime model
 
@@ -204,16 +218,47 @@ is now the one place that computes it, and the app is the only caller that passe
   `env_clear()`. So the answer is always the `login-env captured` line in `daemon.log`, never the
   daemon's inherited environment. (It also tries `<cwd>/<program>` *before* `PATH` for a relative
   name, so a file named `claude` in a worktree would win — pre-existing, not currently guarded.)
+- **Site-only changes skip the macOS build, on pull requests.** `scripts/changed-scope.sh`
+  classifies a range as `product` or `site-only` (allowlist: only `site/**` is cheap — `docs/` is
+  not), and the macOS job is conditional on it. On a `push` to `main`, `BASE` resolves to
+  `origin/main`, which is the pushed SHA itself, so the diff is empty and the script fail-safes to
+  `product` — meaning every merge to `main`, including a site-only one, still runs the full macOS
+  build. That is the intended fail-safe, not a bug. Verify a change to the rule with
+  `scripts/changed-scope.sh --self-test`.
+- **The required check is a gate job, not the macOS job.** `required-build-gate` in `ci.yml` carries
+  the name `build + test (macOS, unsigned)`; the real job is `… — full`. Do **not** "simplify" this
+  into two jobs sharing the required name: an `if:`-skipped job still files a check run with
+  conclusion `skipped`, `check-runs-state.sh` picks the latest run per required name and counts
+  `skipped` as failed, so the release merge gate would fail on a race. The name string is what
+  `main`'s ruleset matches, so it must not change. With `concurrency: cancel-in-progress: true`, a
+  superseded run's gate still executes under `always()` and can file a `failure` check run under the
+  required name on the same head SHA. Ordering makes this harmless in practice. `!cancelled()` is
+  **not** the fix — it would let the required context report `skipped`, which `check-runs-state.sh`
+  counts as failed, which is strictly worse.
+- **`deploy-site.yml` must never gain a `pull_request` trigger.** It holds `pages: write` and
+  `id-token: write`, in the same repo as `DOPPLER_TOKEN` and the signing path.
 
 ## CI
 
-- `.github/workflows/ci.yml` (**CI**) — on push to `main` + PRs, `runs-on: macos-15`: select Xcode 16,
-  install zig (Homebrew) + Rust, cache/build libghostty, `cargo test --workspace --locked`,
-  `swift test` (ClowderCore), assemble the unsigned `Clowder.app`, upload it as an artifact. **Must be green.**
+- `.github/workflows/ci.yml` (**CI**) — on push to `main`, PRs, and `workflow_dispatch` (so
+  `release.yml` can start it on its bump branch). Jobs: `changes` classifies the range as `product` or
+  `site-only` (`scripts/changed-scope.sh`); `commit-lint` runs Conventional Commits plus the three
+  scripts' own `--self-test`s (PRs and dispatches only — commits on `main` were already checked on
+  their PR); `build-and-test-macos` (name `build + test (macOS, unsigned) — full`, `runs-on:
+  macos-15`, only when scope is `product`) selects Xcode 16, installs zig (Homebrew) + Rust,
+  caches/builds libghostty, runs `cargo test --workspace --locked` (then the ignored, load-sensitive
+  tests serially), `swift test` (ClowderCore), assembles the unsigned `Clowder.app`, and uploads it
+  as an artifact; `site-ci` (name `build + check (site)`) builds and type-checks `site/`
+  unconditionally, cheap and not required; `required-build-gate` (name `build + test (macOS,
+  unsigned)`) is **the** required check — see Gotchas for why it is a separate job. **It must be
+  green.**
 - `.github/workflows/release.yml` (**Release**) — **manually dispatched** (Actions → Release → Run
   workflow), never on a tag. Computes the next version from the Conventional Commit types since the
   last `v*` tag, opens + merges a `chore: vX.Y.Z` bump PR, then builds, tags, and publishes. Does
   nothing when no `feat`/`fix`/`perf` commits have landed. See `docs/versioning.md`.
+- `.github/workflows/deploy-site.yml` (**Deploy site to GitHub Pages**) — pushes to `main` touching
+  `site/**`, a daily `schedule:`, and `workflow_dispatch` (which `release.yml` fires after the tap
+  publish, so a release does not wait for the daily run). Never on pull requests.
 - Anything touching libghostty/the app requires full Xcode; the libghostty build is cached by the
   pin/patch hash.
 
@@ -222,6 +267,20 @@ is now the one place that computes it, and the app is the only caller that passe
 - The design/implementation workflow lives in `docs/superpowers/` — **spec → plan → subagent-driven
   execution → PR**, one milestone per cycle. Read the relevant spec/plan before non-trivial changes.
 - Work on feature branches; open a PR into `main`; keep CI green. Don't commit to `main` directly.
+- **Every commit must be signed.** `main`'s ruleset carries a `required_signatures` rule with no
+  bypass actors, so a single unsigned commit anywhere on a branch blocks the merge — there is no
+  admin override to fall back on. The maintainer's global config already does this
+  (`commit.gpgsign = true`, `gpg.format = ssh`, `user.signingkey = ~/.ssh/id_ed25519.pub`), so
+  ordinary `git commit` signs without ceremony. Two consequences worth knowing:
+  - **`git filter-branch` silently strips every signature.** It re-creates commits with
+    `git commit-tree` and no `-S`, so a branch that was fully signed comes back fully unsigned and
+    nothing warns you. This has already happened once here. To reword or rewrite history, use
+    `git rebase -f --gpg-sign <base>`, which re-signs as it replays.
+  - **`git log --format=%G?` reports `N` on a correctly signed commit** unless
+    `gpg.ssh.allowedSignersFile` is configured — with SSH signing, git cannot verify without it, and
+    reports the signature as absent rather than unverifiable. Do not trust `%G?` here. Check for the
+    header directly (`git cat-file commit <sha> | grep -q gpgsig`), or ask GitHub
+    (`gh api repos/defiantsoftware/clowder/commits/<sha> --jq .commit.verification`).
 - **Commit messages are Conventional Commits** — `type(scope): subject`, with `type` one of `feat`,
   `fix`, `docs`, `test`, `refactor`, `perf`, `ci`, `chore`, `build`, `style`, `revert`; scope
   optional and free-form (`daemon`, `app`, `m10c`, `proto,daemon` are all fine); `!` before the colon

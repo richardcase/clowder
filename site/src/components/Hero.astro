@@ -1,0 +1,154 @@
+---
+import CopyCommand from './CopyCommand.astro';
+import AppShot from './AppShot.astro';
+import fleet from '../assets/screenshots/fleet.png';
+import { site } from '../data/site';
+import { getRelease } from '../data/release';
+
+const release = await getRelease();
+---
+
+<header class="hero">
+  <div class="hero__glow" aria-hidden="true"></div>
+
+  <div class="shell hero__inner">
+    <p class="pill hero__pill">
+      <span class="pill__dot"></span>
+      v{release.version} · macOS
+    </p>
+
+    <h1 class="hero__title">Run a fleet of coding agents.<br /><em>Never lose track of one.</em></h1>
+
+    <p class="lede hero__lede">
+      Clowder is a native macOS terminal that orchestrates <strong>Claude Code</strong>,
+      <strong>Codex</strong> and plain shell agents — each isolated in its own git worktree — and
+      tells you the moment one needs your attention.
+    </p>
+
+    <div class="hero__cta">
+      <CopyCommand command={site.installCmd} hero label="Install with Homebrew" />
+      <a class="hero__alt" href={release.dmgUrl}>
+        Or download the .dmg
+        <span aria-hidden="true">↓</span>
+      </a>
+    </div>
+
+    <p class="hero__trust">
+      macOS {site.minMacOS}+ · {site.arch} · Signed &amp; notarized by Apple · ~{release.dmgSizeMb} MB
+    </p>
+
+    <div class="hero__mock">
+      <AppShot
+        src={fleet}
+        priority
+        alt="The Clowder app: a sidebar listing seven agents across the demo-api project, beside a terminal showing an agent's isolated git worktree path, its clowder/rate-limit-health branch, and a coloured diff of the change it made."
+        caption="Seven agents in one window. The terminal shows one agent's isolated worktree — note the branch per agent in the git log."
+      />
+    </div>
+  </div>
+</header>
+
+<style>
+  .hero {
+    position: relative;
+    padding-block: clamp(3.5rem, 8vw, 6rem) 0;
+    overflow: hidden;
+  }
+
+  .hero__glow {
+    position: absolute;
+    inset: -30% 0 auto 50%;
+    translate: -50% 0;
+    width: min(1100px, 130vw);
+    aspect-ratio: 1;
+    background: radial-gradient(
+      circle at 50% 45%,
+      color-mix(in srgb, var(--accent) 13%, transparent),
+      transparent 62%
+    );
+    pointer-events: none;
+    z-index: -1;
+  }
+
+  .hero__inner {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    text-align: center;
+  }
+
+  .hero__pill {
+    margin-bottom: 1.6rem;
+  }
+
+  .pill__dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-glow);
+  }
+
+  .hero__title {
+    font-size: clamp(2.1rem, 6.2vw, 4.1rem);
+    max-width: 16ch;
+  }
+
+  .hero__title em {
+    font-style: normal;
+    color: var(--accent);
+  }
+
+  .hero__lede {
+    margin-top: 1.4rem;
+    text-align: center;
+  }
+
+  .hero__lede strong {
+    color: var(--text);
+    font-weight: 600;
+  }
+
+  .hero__cta {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.85rem;
+    margin-top: 2.4rem;
+    /* Wide enough that the full install command never truncates — it is the
+       primary call to action and a clipped command is worse than useless. */
+    width: min(100%, 640px);
+  }
+
+  .hero__cta > :global(.cmd) {
+    width: 100%;
+    text-align: left;
+  }
+
+  .hero__alt {
+    font-size: 0.87rem;
+    color: var(--text-dim);
+    text-decoration: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+  }
+
+  .hero__alt:hover {
+    color: var(--accent);
+  }
+
+  .hero__trust {
+    margin-top: 1.5rem;
+    font-family: var(--font-mono);
+    font-size: 0.71rem;
+    letter-spacing: 0.02em;
+    color: var(--text-faint);
+    text-wrap: balance;
+  }
+
+  .hero__mock {
+    width: 100%;
+    margin-top: clamp(3rem, 7vw, 5rem);
+  }
+</style>

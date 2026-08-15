@@ -1,0 +1,123 @@
+---
+// Site chrome only. This renders the <footer> element, which must sit outside
+// <main> to be exposed as a top-level `contentinfo` landmark — nested inside it,
+// screen-reader landmark navigation cannot reach it. The closing CTA that used to
+// live here is page content and moved to CallToAction.astro.
+import { site } from '../data/site';
+import { getRelease } from '../data/release';
+
+const release = await getRelease();
+
+// Safe to resolve at build time because deploy.yml rebuilds on a daily cron, so
+// this can never be more than a day stale. On a site that only built on push it
+// would be the same hardcoded-year bug wearing a different hat.
+const year = new Date().getFullYear();
+---
+
+<footer class="footer">
+  <div class="shell footer__inner">
+    <div class="footer__brand">
+      <span class="mark" aria-hidden="true">C</span>
+      <div>
+        <p class="footer__name">Clowder</p>
+        <p class="footer__desc">Cross-platform agent-orchestrator terminal</p>
+      </div>
+    </div>
+
+    <nav class="footer__nav" aria-label="Footer">
+      <a href="#features">Features</a>
+      <a href="#architecture">How it works</a>
+      <a href="#install">Install</a>
+      <a href="#faq">FAQ</a>
+      <a href={site.tapRepo}>Homebrew tap</a>
+    </nav>
+
+    <div class="footer__legal">
+      <p>&copy; {year} {site.copyrightHolder}. Proprietary — all rights reserved.</p>
+      <p>
+        v{release.version} · Built with <a href="https://ghostty.org">libghostty</a>.
+      </p>
+    </div>
+  </div>
+</footer>
+
+<style>
+  .footer {
+    border-top: 1px solid var(--border);
+    padding-block: 2.5rem;
+    background: var(--bg-raised);
+  }
+
+  .footer__inner {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 1.5rem 2rem;
+    align-items: start;
+  }
+
+  .footer__brand {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+  }
+
+  .mark {
+    display: grid;
+    place-items: center;
+    width: 34px;
+    height: 34px;
+    flex: none;
+    border-radius: 9px;
+    background: var(--accent-deep);
+    color: #fff;
+    font-weight: 700;
+    font-size: 1.05rem;
+    line-height: 1;
+  }
+
+  .footer__name {
+    font-weight: 650;
+    font-size: 0.95rem;
+    line-height: 1.3;
+  }
+
+  .footer__desc {
+    font-size: 0.78rem;
+    color: var(--text-faint);
+    line-height: 1.3;
+  }
+
+  .footer__nav {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem 1.3rem;
+    font-size: 0.85rem;
+  }
+
+  .footer__nav a {
+    color: var(--text-dim);
+    text-decoration: none;
+  }
+
+  .footer__nav a:hover {
+    color: var(--accent);
+  }
+
+  .footer__legal {
+    grid-column: 1 / -1;
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    gap: 0.5rem 1.5rem;
+    padding-top: 1.5rem;
+    border-top: 1px solid var(--border);
+    font-size: 0.76rem;
+    color: var(--text-faint);
+  }
+
+  @media (max-width: 640px) {
+    .footer__inner {
+      grid-template-columns: 1fr;
+    }
+  }
+</style>

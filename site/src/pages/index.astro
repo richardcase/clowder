@@ -1,0 +1,28 @@
+---
+import Base from '../layouts/Base.astro';
+import Nav from '../components/Nav.astro';
+import Hero from '../components/Hero.astro';
+import Features from '../components/Features.astro';
+import Screenshots from '../components/Screenshots.astro';
+import Architecture from '../components/Architecture.astro';
+import Install from '../components/Install.astro';
+import Faq from '../components/Faq.astro';
+import CallToAction from '../components/CallToAction.astro';
+import Footer from '../components/Footer.astro';
+import { site } from '../data/site';
+---
+
+<Base title={`${site.name} — ${site.tagline}`}>
+  <span id="top"></span>
+  <Nav />
+  <main id="main">
+    <Hero />
+    <Features />
+    <Screenshots />
+    <Architecture />
+    <Install />
+    <Faq />
+    <CallToAction />
+  </main>
+  <Footer />
+</Base>

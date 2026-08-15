@@ -1,0 +1,54 @@
+---
+// The closing pitch. Split out of Footer.astro so that component holds only the
+// <footer> element: this band is page content and belongs inside <main>, whereas
+// the footer is site chrome and has to sit outside it to be a landmark.
+import CopyCommand from './CopyCommand.astro';
+import { site } from '../data/site';
+---
+
+<section class="cta">
+  <div class="shell cta__inner">
+    <h2>Stop babysitting terminals.</h2>
+    <p class="lede" style="text-align: center;">
+      One command, and your whole fleet lives in one window.
+    </p>
+    <div class="cta__cmd">
+      <CopyCommand command={site.installCmd} hero />
+    </div>
+  </div>
+</section>
+
+<style>
+  .cta {
+    border-top: 1px solid var(--border);
+    padding-block: clamp(4rem, 8vw, 6rem);
+    background:
+      radial-gradient(
+        ellipse 60% 100% at 50% 100%,
+        color-mix(in srgb, var(--accent) 10%, transparent),
+        transparent
+      ),
+      var(--bg);
+  }
+
+  .cta__inner {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    text-align: center;
+  }
+
+  .cta h2 {
+    max-width: 18ch;
+  }
+
+  .cta .lede {
+    margin-top: 0.9rem;
+  }
+
+  .cta__cmd {
+    width: min(100%, 480px);
+    margin-top: 2rem;
+    text-align: left;
+  }
+</style>
