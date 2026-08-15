@@ -6,19 +6,20 @@ const release = await getRelease();
 
 <nav class="nav" aria-label="Primary">
   <div class="shell nav__inner">
-    <a class="nav__brand" href="#top">
+    <a class="nav__brand" href="/#top">
       <span class="mark" aria-hidden="true">C</span>
       <span class="nav__name">Clowder</span>
       <span class="nav__ver">v{release.version}</span>
     </a>
 
     <div class="nav__links">
-      <a href="#features">Features</a>
-      <a href="#architecture">How it works</a>
-      <a href="#faq">FAQ</a>
+      <a href="/#features">Features</a>
+      <a href="/#architecture">How it works</a>
+      <a href="/#faq">FAQ</a>
+      <a href="/whats-new">What's new</a>
     </div>
 
-    <a class="nav__cta" href="#install">Install</a>
+    <a class="nav__cta" href="/#install">Install</a>
   </div>
 </nav>
 
@@ -112,10 +113,10 @@ const release = await getRelease();
      architecture section for anyone who did not think to keep scrolling — and
      those answer the questions that decide whether someone installs.
 
-     Wrapping rather than adding a disclosure menu is deliberate: three in-page
-     anchors do not justify a new interactive component, with the keyboard, focus
-     and aria-expanded handling that would have to be right to match the rest of
-     this page.
+     Wrapping rather than adding a disclosure menu is deliberate: four links —
+     three in-page anchors and one route — do not justify a new interactive
+     component, with the keyboard, focus and aria-expanded handling that would
+     have to be right to match the rest of this page.
 
      The cost is real, though, because this nav is sticky: a second row is
      permanently subtracted from an already short viewport. Hence the tightened

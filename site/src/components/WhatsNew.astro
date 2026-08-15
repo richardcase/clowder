@@ -1,0 +1,150 @@
+---
+/**
+ * The homepage teaser for the newest release. Deliberately carries NO DATE.
+ *
+ * A date here would seem like an improvement — it is the same information the
+ * full changelog shows — but the two places serve opposite jobs. On
+ * /whats-new a date is a record: it answers "when did this ship" for
+ * something a visitor already decided to read. Here it is a signal read at a
+ * glance, and a signal that only ever says "we ship often" cuts the other way
+ * the moment releases pause: the same mechanism that broadcasts a healthy
+ * cadence broadcasts neglect, automatically, with nobody deciding to. A
+ * version number and a couple of bullets age gracefully — dropping straight
+ * to uninformative instead of to a visible red flag. Do not add one back.
+ *
+ * Bullets are pulled from the raw markdown body rather than rendered via
+ * `render()`: the full release note is a whole `<ul>`, and this band wants
+ * only the first two or three items as plain sentences, not a nested list
+ * inside a list. The sort mirrors whats-new.astro's numeric-not-lexicographic
+ * comparator (string order puts 0.9.0 above 0.10.0) — duplicated rather than
+ * shared, since one file needs the full sorted collection and this one only
+ * ever needs the single newest entry.
+ */
+import { getCollection } from 'astro:content';
+
+const key = (v: string) => v.split('.').map(Number);
+const cmp = (a: string, b: string) => {
+  const [x, y] = [key(a), key(b)];
+  for (let i = 0; i < Math.max(x.length, y.length); i++) {
+    const d = (y[i] ?? 0) - (x[i] ?? 0);
+    if (d !== 0) return d;
+  }
+  return 0;
+};
+
+const entries = await getCollection('releases');
+const [latest] = entries.sort((a, b) => cmp(a.data.version, b.data.version));
+
+// Join a wrapped bullet's continuation lines (indented, no leading `-`) before
+// taking the first three — without this, a bullet that wraps onto a second
+// line in the source truncates mid-sentence instead of showing the whole item.
+function bullets(markdown: string): string[] {
+  const items: string[] = [];
+  let current: string | null = null;
+  for (const line of markdown.split('\n')) {
+    const start = line.match(/^-\s+(.*)$/);
+    if (start) {
+      if (current !== null) items.push(current.trim());
+      current = start[1];
+    } else if (current !== null && /^\s+\S/.test(line)) {
+      current += ` ${line.trim()}`;
+    } else if (current !== null && line.trim() === '') {
+      items.push(current.trim());
+      current = null;
+    }
+  }
+  if (current !== null) items.push(current.trim());
+  return items;
+}
+
+// Minimal inline markdown -> HTML: only the two forms the release notes use
+// (code spans, bold). Not a general renderer — the full body already gets one
+// via `render()` on /whats-new.
+const inline = (text: string) =>
+  text
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+
+const items = latest ? bullets(latest.body ?? '').slice(0, 3) : [];
+---
+
+{
+  latest && (
+    <section class="section section--tight whats-new" aria-labelledby="whats-new-heading">
+      <div class="shell whats-new__inner">
+        <div class="whats-new__copy">
+          <p class="eyebrow">Just shipped</p>
+          <h2 id="whats-new-heading">v{latest.data.version}</h2>
+          <ul class="whats-new__list">
+            {items.map((item) => (
+              <li set:html={inline(item)} />
+            ))}
+          </ul>
+          <a class="whats-new__link" href="/whats-new">
+            See what's new
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+              <path d="M9 6l6 6-6 6" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+          </a>
+        </div>
+      </div>
+    </section>
+  )
+}
+
+<style>
+  .whats-new {
+    border-top: 1px solid var(--border);
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-raised);
+  }
+
+  .whats-new__inner {
+    max-width: var(--measure);
+  }
+
+  .whats-new h2 {
+    font-size: 1.3rem;
+    margin-top: 0.6rem;
+  }
+
+  .whats-new__list {
+    margin-top: 1rem;
+    padding-left: 1.2rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    font-size: 0.93rem;
+    color: var(--text-dim);
+  }
+
+  .whats-new__list :global(code) {
+    color: var(--accent);
+    word-break: break-word;
+  }
+
+  .whats-new__list :global(strong) {
+    color: var(--text);
+    font-weight: 600;
+  }
+
+  .whats-new__link {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    margin-top: 1.3rem;
+    font-size: 0.9rem;
+    font-weight: 600;
+    text-decoration: none;
+  }
+
+  .whats-new__link svg {
+    width: 16px;
+    height: 16px;
+    transition: translate 0.15s ease;
+  }
+
+  .whats-new__link:hover svg {
+    translate: 3px 0;
+  }
+</style>
