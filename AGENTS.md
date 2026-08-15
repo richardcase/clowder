@@ -218,9 +218,13 @@ is now the one place that computes it, and the app is the only caller that passe
   `env_clear()`. So the answer is always the `login-env captured` line in `daemon.log`, never the
   daemon's inherited environment. (It also tries `<cwd>/<program>` *before* `PATH` for a relative
   name, so a file named `claude` in a worktree would win — pre-existing, not currently guarded.)
-- **Site-only changes skip the macOS build.** `scripts/changed-scope.sh` classifies a range as
-  `product` or `site-only` (allowlist: only `site/**` is cheap — `docs/` is not), and the macOS job
-  is conditional on it. Verify a change to the rule with `scripts/changed-scope.sh --self-test`.
+- **Site-only changes skip the macOS build, on pull requests.** `scripts/changed-scope.sh`
+  classifies a range as `product` or `site-only` (allowlist: only `site/**` is cheap — `docs/` is
+  not), and the macOS job is conditional on it. On a `push` to `main`, `BASE` resolves to
+  `origin/main`, which is the pushed SHA itself, so the diff is empty and the script fail-safes to
+  `product` — meaning every merge to `main`, including a site-only one, still runs the full macOS
+  build. That is the intended fail-safe, not a bug. Verify a change to the rule with
+  `scripts/changed-scope.sh --self-test`.
 - **The required check is a gate job, not the macOS job.** `required-build-gate` in `ci.yml` carries
   the name `build + test (macOS, unsigned)`; the real job is `… — full`. Do **not** "simplify" this
   into two jobs sharing the required name: an `if:`-skipped job still files a check run with
