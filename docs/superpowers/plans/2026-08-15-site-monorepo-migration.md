@@ -947,7 +947,8 @@ passed`. After Step 1: `audit-selftest: 19 passed, 0 failed` (8 existing + 11 ne
 cd site && npm run build && cd ..
 ```
 
-Expected: the build ends with `audit: passed`, now listing five `ok` lines. If `no product source
+Expected: the build ends with `audit: passed`, now listing four `ok` lines — one each for checks 1
+and 2, and two for check 3, which is a pair of greps. If `no product source
 files` fails on a real build, a legitimate output has an extension on the list — narrow the list
 rather than deleting the check.
 
