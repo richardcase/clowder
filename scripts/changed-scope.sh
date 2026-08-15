@@ -15,6 +15,19 @@
 #        scripts/changed-scope.sh --self-test
 set -euo pipefail
 
+# cs_drain: discard the rest of stdin. Called before every early return in cs_classify, below,
+# for one reason: this function is always the read end of a pipe from `git diff`, and once the
+# verdict is known there is no correctness reason to keep reading. But `return`ing while `git
+# diff` is still mid-write closes our read end early; the next write it attempts gets SIGPIPE,
+# and under `set -o pipefail` that non-zero *writer* exit becomes the whole pipeline's exit
+# status even though we already echoed the correct verdict. Draining keeps the read end open
+# until `git diff` reaches EOF on its own, so it always exits 0. `|| true` because a downstream
+# reader (here, /dev/null) can never itself trigger a SIGPIPE we'd need to swallow, but keeping
+# this a no-fail statement means a future change to what `cs_drain` reads into can't reintroduce
+# the same problem via `set -e`. See self-test's "…, huge diff, no SIGPIPE" cases — the existing
+# 1-2 line fixtures are far too small to exceed a pipe buffer and could not have caught this.
+cs_drain() { cat >/dev/null || true; }
+
 # cs_classify <branch> < <newline-separated paths> -> `product` | `site-only`
 cs_classify() {
   local branch="${1:-}" path any=0
@@ -23,7 +36,7 @@ cs_classify() {
   # so it would classify as product anyway — but that is a property of the current file set, not a
   # guarantee, and the failure mode is a release merging on a check that built nothing.
   case "$branch" in
-    release/*) echo product; return 0 ;;
+    release/*) cs_drain; echo product; return 0 ;;
   esac
 
   # The `|| [ -n "$path" ]` matters: `read` returns non-zero on a final line with no trailing
@@ -33,7 +46,7 @@ cs_classify() {
     any=1
     case "$path" in
       site/*) ;;
-      *) echo product; return 0 ;;
+      *) cs_drain; echo product; return 0 ;;
     esac
   done
 
@@ -80,6 +93,45 @@ crates/clowder-proto/src/lib.rs'
 '
   # Release branches never take the cheap path, whatever they touch.
   check product   'release branch'         release/v0.7.0 'site/README.md'
+
+  # Regression coverage for cs_drain (see its comment above `cs_classify`): an early return
+  # that leaves `git diff` still writing gets that writer SIGPIPE'd, and `set -o pipefail` turns
+  # that non-zero *writer* exit into this whole pipeline's exit status — even though the correct
+  # verdict already reached stdout. `check`, above, only asserts stdout, so it cannot catch this;
+  # the fixtures there are also only 1-2 lines, nowhere near a pipe buffer. These fixtures are
+  # ~100KB (comfortably over the few-KB buffer that triggers it), and this helper asserts the
+  # exit status too.
+  check_no_sigpipe() {
+    local want="$1" name="$2" branch="$3" paths="$4" got status
+    if got="$(printf '%s\n' "$paths" | cs_classify "$branch")"; then
+      status=0
+    else
+      status=$?
+    fi
+    if [ "$status" -ne 0 ]; then
+      echo "  FAIL  $name — exited $status (want 0; SIGPIPE would be 141); stdout was '$got'" >&2
+      fail=$((fail + 1))
+    elif [ "$got" != "$want" ]; then
+      echo "  FAIL  $name — wanted $want, got $got" >&2
+      fail=$((fail + 1))
+    else
+      echo "  ok    $name ($got, exit $status)"
+      pass=$((pass + 1))
+    fi
+  }
+
+  # Mid-stream case: the first path is already non-site, so cs_classify knows the verdict after
+  # line 1 — everything after that is exactly what a buggy early `return` would leave stranded,
+  # unread, in the pipe.
+  local huge_mixed
+  huge_mixed="crates/clowder-daemon/src/main.rs"$'\n'"$(printf 'site/file-%d.txt\n' $(seq 1 5000))"
+  check_no_sigpipe product 'product, huge diff, no SIGPIPE' feature "$huge_mixed"
+
+  # release/* case: this one returns before reading anything from stdin at all — a second,
+  # easier-to-miss instance of the same bug, distinct from the mid-stream case above.
+  local huge_release
+  huge_release="$(printf 'site/file-%d.txt\n' $(seq 1 5000))"
+  check_no_sigpipe product 'release branch, huge diff, no SIGPIPE' release/v0.7.0 "$huge_release"
 
   echo "changed-scope: $pass passed, $fail failed"
   [ "$fail" -eq 0 ]
