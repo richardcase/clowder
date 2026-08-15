@@ -264,12 +264,18 @@ jobs:
       - name: Wait for the required checks
         env:
           HEAD_SHA: ${{ steps.commit.outputs.head_sha }}
-          # A check that never appears means CI did not start at all — a different failure with a
-          # different fix, so it gets its own much shorter deadline rather than burning the full
-          # budget before reporting it.
-          APPEAR_TIMEOUT_MIN: '10'
-          # ~35 min for the macOS build plus macos-15 queueing. The job cap is 120 and the merge
-          # step can take ~12 more, so this leaves headroom.
+          # A check that never appears used to mean CI did not start at all. That is no longer the
+          # whole story: the required context `build + test (macOS, unsigned)` is now carried by
+          # `required-build-gate` in ci.yml, which `needs: [changes, build-and-test-macos]` — and
+          # GitHub does not create a dependent job (or its check run) until its `needs` all
+          # complete. So the context legitimately does not exist until the ~35-45 min macOS build
+          # finishes; 10m would fail every release before the build ever gets a chance. Do not
+          # "tidy" this back down without re-reading this comment.
+          APPEAR_TIMEOUT_MIN: '60'
+          # ~35 min for the macOS build plus macos-15 queueing. That is the same build that gates
+          # required-build-gate's check run (see APPEAR_TIMEOUT_MIN above), so it must appear before
+          # it can pass — but the gate job itself runs in seconds once its needs complete. The job
+          # cap is 120 and the merge step can take ~12 more, so this still leaves headroom.
           PASS_TIMEOUT_MIN: '75'
           POLL_SECONDS: '20'
         run: |
@@ -317,9 +323,12 @@ jobs:
             now=$(date +%s)
             if [ "$missing" -gt 0 ] && [ "$now" -ge "$appear_deadline" ]; then
               awk -F'\t' '$2 == "missing" { print "::error::never reported: " $1 }' <<<"$report"
-              echo "::error::CI did not start on $BRANCH within ${APPEAR_TIMEOUT_MIN}m. The 'Start CI'"
-              echo "::error::dispatch is what makes the required checks run and it needs actions:write —"
-              echo "::error::check ci.yml still accepts workflow_dispatch. See docs/versioning.md."
+              echo "::error::a required check is still missing on $BRANCH after ${APPEAR_TIMEOUT_MIN}m."
+              echo "::error::The required context now appears only once required-build-gate's needs"
+              echo "::error::(including the macOS build) complete, so this can mean either: the 'Start"
+              echo "::error::CI' dispatch failed to kick off a run (it needs actions:write — check"
+              echo "::error::ci.yml still accepts workflow_dispatch), or the macOS build has run far"
+              echo "::error::longer than its usual ~35-45m. See docs/versioning.md."
               exit 1
             fi
             if [ "$now" -ge "$pass_deadline" ]; then
