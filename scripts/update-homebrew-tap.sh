@@ -32,17 +32,32 @@ export GH_TOKEN="$HOMEBREW_TAP_TOKEN"
 NOTES="$ROOT/site/src/content/releases/v$VERSION.md"
 BODY="$(mktemp)"; trap 'rm -f "$BODY"' EXIT
 
-if [ -f "$NOTES" ]; then
-  "$ROOT/scripts/check-release-notes.sh" --file "$NOTES" >/dev/null
-  # Strip the frontmatter block; publish the prose.
-  awk 'BEGIN{n=0} /^---[[:space:]]*$/{n++; next} n>=2' "$NOTES" > "$BODY"
-else
-  # DELIBERATELY NOT FATAL. This runs at step 17 of the release job — AFTER step 14 tags the commit
-  # and step 15 publishes the GitHub Release. Aborting here would strand a signed, notarized,
-  # tagged, published release with no installable artifact on the tap, over a missing markdown
-  # file. Enforcement belongs in the bump job, where failing costs nothing.
+# DELIBERATELY NOT FATAL, in every branch below — missing file, guard-rejected file, or a file that
+# yields nothing once frontmatter is stripped. This runs at step 17 of the release job — AFTER
+# step 14 tags the commit and step 15 publishes the GitHub Release. Aborting here for ANY of those
+# reasons would strand a signed, notarized, tagged, published release with no installable artifact
+# on the tap, over a markdown file. Enforcement (rejecting bad notes, requiring a fragment at all)
+# belongs in the bump job, where failing costs nothing; here it can only warn and fall back to the
+# stub body. A guard-rejected file is a real problem someone must go chase — hence the distinct
+# warning text below — just not one worth destroying a published release over.
+if [ ! -f "$NOTES" ]; then
   echo "::warning::no release notes at $NOTES — publishing the stub body"
   printf 'Clowder %s\n' "$VERSION" > "$BODY"
+elif ! "$ROOT/scripts/check-release-notes.sh" --file "$NOTES" >/dev/null 2>&1; then
+  echo "::warning::release notes at $NOTES failed the content guard — publishing the stub body instead"
+  printf 'Clowder %s\n' "$VERSION" > "$BODY"
+else
+  # Strip the frontmatter block; publish the prose. `n<2` on the match guards the counter so a bare
+  # `---` markdown horizontal rule *inside* the body (after the closing frontmatter fence) is no
+  # longer mistaken for a third frontmatter delimiter and silently dropped — it used to count every
+  # `---`-only line unconditionally.
+  awk 'n<2 && /^---[[:space:]]*$/{n++; next} n>=2' "$NOTES" > "$BODY"
+  if [ ! -s "$BODY" ]; then
+    # Guard passed but nothing survived frontmatter-stripping (e.g. no frontmatter fence at all, so
+    # the n>=2 gate never opens) — publish the stub rather than a silently empty release body.
+    echo "::warning::release notes at $NOTES produced an empty body after stripping frontmatter — publishing the stub body instead"
+    printf 'Clowder %s\n' "$VERSION" > "$BODY"
+  fi
 fi
 
 # 1. Host the DMG on the PUBLIC tap's Releases (so brew can fetch it unauthenticated). Idempotent:
