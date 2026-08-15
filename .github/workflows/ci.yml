@@ -16,6 +16,33 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Decides whether this change needs the macOS build. Pure bash so the rule is unit-testable —
+  # see scripts/changed-scope.sh --self-test, which runs in commit-lint below.
+  changes:
+    name: classify change scope
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      scope: ${{ steps.classify.outputs.scope }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # merge-base needs real history; the default depth-1 checkout has none.
+          fetch-depth: 0
+
+      - id: classify
+        env:
+          # Same reasoning as commit-lint: on `pull_request` actions/checkout checks out the merge
+          # ref, so HEAD is not the branch tip. On a dispatch or push there is no PR context.
+          BASE: ${{ github.event.pull_request.base.sha || 'origin/main' }}
+          HEAD_REF: ${{ github.event.pull_request.head.sha || github.sha }}
+          BRANCH: ${{ github.event.pull_request.head.ref || github.ref_name }}
+        run: |
+          scope="$(scripts/changed-scope.sh "$BASE" "$HEAD_REF" "$BRANCH")"
+          echo "scope=$scope" >> "$GITHUB_OUTPUT"
+          echo "change scope: **$scope**" >> "$GITHUB_STEP_SUMMARY"
+
   # Cheap, parallel gate: a bad commit subject fails in seconds without burning macOS minutes.
   # PR-only — commits reaching `main` have already been through this on their PR.
   commit-lint:
@@ -51,8 +78,16 @@ jobs:
       - name: check-runs-state.sh self-tests
         run: scripts/check-runs-state.sh --self-test
 
-  build-and-test:
-    name: build + test (macOS, unsigned)
+      # Same reasoning again: the scope classifier decides whether the macOS build runs at all, and
+      # a wrong answer either burns 10x-rate minutes or lets a change reach main unbuilt. Fixtures
+      # make it a required check.
+      - name: changed-scope.sh self-tests
+        run: scripts/changed-scope.sh --self-test
+
+  build-and-test-macos:
+    name: build + test (macOS, unsigned) — full
+    needs: changes
+    if: needs.changes.outputs.scope == 'product'
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
@@ -125,3 +160,41 @@ jobs:
           # (pointing at `dist/Clowder.app` would strip the top `.app` dir, yielding an unusable bundle).
           path: dist
           if-no-files-found: error
+
+  # THE REQUIRED CHECK. It always runs, so the required context always reports exactly one check
+  # run, and it reports success only if the real build succeeded or was legitimately not needed.
+  #
+  # Why a gate rather than two jobs sharing this name: an `if:`-skipped job still produces a check
+  # run, with conclusion `skipped`. Two jobs with this name would therefore file TWO check runs
+  # under it, and scripts/check-runs-state.sh picks the latest by (started_at, id) and counts
+  # `skipped` as FAILED — so the release merge gate would fail on a coin flip.
+  required-build-gate:
+    name: build + test (macOS, unsigned)
+    needs: [changes, build-and-test-macos]
+    # Without always(), this job would itself be skipped whenever build-and-test-macos is skipped,
+    # which recreates the exact problem it exists to solve.
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require the macOS build to have passed, or to have been genuinely unnecessary
+        env:
+          SCOPE: ${{ needs.changes.outputs.scope }}
+          BUILD: ${{ needs.build-and-test-macos.result }}
+        run: |
+          echo "scope=$SCOPE build=$BUILD"
+
+          if [ "$SCOPE" = 'site-only' ] && [ "$BUILD" = 'skipped' ]; then
+            echo "site-only change — the macOS build was not required." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if [ "$SCOPE" = 'product' ] && [ "$BUILD" = 'success' ]; then
+            echo "product change — the macOS build passed." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # Anything else is a state we did not design for: a cancelled build, a failed one, or a
+          # scope/result pair that cannot legitimately occur. Refuse rather than guess — this check
+          # is what a release merges on.
+          echo "::error::refusing to pass: scope=$SCOPE build=$BUILD"
+          exit 1
