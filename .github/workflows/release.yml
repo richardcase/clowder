@@ -188,9 +188,26 @@ jobs:
             -f ref="refs/heads/$BRANCH" -f sha="$BASE_SHA" >/dev/null
           echo "created $BRANCH at $BASE_SHA"
 
+      # Skipped for a pre-release (release.yml dispatched with `prerelease: rc1` etc, producing a
+      # version like 0.7.0-rc1). Collecting here would DELETE every accumulated fragment into
+      # v0.7.0-rc1.md; the real final 0.7.0 release that follows would then find nothing left to
+      # collect and publish "Maintenance and fixes.", with the actual notes stranded in an rc file
+      # that is never published to the tap (see the Homebrew-tap step's own prerelease guard,
+      # further down in the `release` job) and that no user can install. Same guard, same reason.
+      - name: Collect the release notes
+        if: needs.plan.outputs.prerelease != 'true'
+        run: scripts/collect-release-notes.sh "$VERSION"
+
       # createCommitOnBranch is used rather than `git commit` or the REST git-data API because
       # GitHub SIGNS commits made by this mutation, and main's ruleset requires signed commits.
       # (The REST API's `signature` field is caller-supplied — it does not sign for you.)
+      #
+      # The file list comes from the working tree rather than being hardcoded: collecting notes
+      # DELETES fragments, which the old three-addition literal could not express at all, and a
+      # hand-maintained list silently drops anything new that set-version.sh starts touching. When
+      # the collect step above was skipped (pre-release), the working tree only carries the
+      # VERSION/Cargo.* changes and gh-file-changes.sh reports exactly those — nothing further to
+      # special-case here.
       - name: Commit the bump
         id: commit
         run: |
@@ -199,20 +216,14 @@ jobs:
             --arg branch "$BRANCH" \
             --arg oid "$BASE_SHA" \
             --arg headline "chore: v$VERSION" \
-            --arg v  "$(base64 -w0 VERSION)" \
-            --arg ct "$(base64 -w0 Cargo.toml)" \
-            --arg cl "$(base64 -w0 Cargo.lock)" \
+            --argjson changes "$(scripts/gh-file-changes.sh)" \
             '{
               query: "mutation($input: CreateCommitOnBranchInput!) { createCommitOnBranch(input: $input) { commit { oid } } }",
               variables: { input: {
                 branch: { repositoryNameWithOwner: $repo, branchName: $branch },
                 expectedHeadOid: $oid,
                 message: { headline: $headline },
-                fileChanges: { additions: [
-                  { path: "VERSION",    contents: $v  },
-                  { path: "Cargo.toml", contents: $ct },
-                  { path: "Cargo.lock", contents: $cl }
-                ]}
+                fileChanges: $changes
               }}
             }' > "$RUNNER_TEMP/commit.json"
           sha="$(gh api graphql --input "$RUNNER_TEMP/commit.json" --jq .data.createCommitOnBranch.commit.oid)"
