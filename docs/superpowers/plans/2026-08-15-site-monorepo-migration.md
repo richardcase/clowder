@@ -184,7 +184,9 @@ cs_classify() {
     release/*) echo product; return 0 ;;
   esac
 
-  while IFS= read -r path; do
+  # The `|| [ -n "$path" ]` matters: `read` returns non-zero on a final line with no trailing
+  # newline, which would silently drop it and misclassify a one-file change as `product`.
+  while IFS= read -r path || [ -n "$path" ]; do
     [ -n "$path" ] || continue
     any=1
     case "$path" in
@@ -202,7 +204,7 @@ self_test() {
   local pass=0 fail=0
   check() {
     local want="$1" name="$2" branch="$3" paths="$4" got
-    got="$(printf '%s' "$paths" | cs_classify "$branch")"
+    got="$(printf '%s\n' "$paths" | cs_classify "$branch")"
     if [ "$got" = "$want" ]; then
       echo "  ok    $name ($got)"
       pass=$((pass + 1))
@@ -507,9 +509,10 @@ Append before `required-build-gate` (ordering is cosmetic; jobs run on their `ne
   # ruleset change with release-gating consequences, and this does not need to be one.
   site-ci:
     name: build + check (site)
-    needs: changes
-    # Runs on a product change too: a product change can still touch site/, and this job is cheap.
-    if: always() && needs.changes.result == 'success'
+    # Deliberately unconditional — no `needs: changes`, no `if:`. It is ubuntu and cheap, a product
+    # change can touch site/ too, and from Milestone 2 the site reads scripts/lib/product.sh, so a
+    # product change really can break the site build. Gating it on scope would serialize it behind
+    # `changes` for no benefit and hide exactly the breakage it is here to catch.
     runs-on: ubuntu-latest
     permissions:
       contents: read
