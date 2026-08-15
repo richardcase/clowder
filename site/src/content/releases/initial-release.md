@@ -3,8 +3,8 @@ version: '0.3.0'
 date: '2026-07-31'
 ---
 
-The first public builds of Clowder: a native macOS terminal that runs a fleet of coding agents, each
-in its own git worktree, and tells you which one needs you.
+The first public builds of Clowder (v0.1.0 through v0.3.0): a native macOS terminal that runs a
+fleet of coding agents, each in its own git worktree, and tells you which one needs you.
 
 - Run Claude Code, OpenAI Codex or a plain shell against any git or jj project, all in one window.
 - Every agent gets its own git worktree or jj workspace, so agents never collide with each other or
