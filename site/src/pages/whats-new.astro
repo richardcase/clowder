@@ -7,10 +7,27 @@ import Base from '../layouts/Base.astro';
 import Nav from '../components/Nav.astro';
 import Footer from '../components/Footer.astro';
 import { site } from '../data/site';
-import { cmp } from '../data/semver';
+import { getRelease } from '../data/release';
+import { cmp, isNewer } from '../data/semver';
 
 const entries = await getCollection('releases');
-const releases = entries.sort((a, b) => cmp(a.data.version, b.data.version));
+
+// Never list a release the Install button can't yet serve. The release workflow's `bump` job
+// writes this page's next entry (site/src/content/releases/vX.Y.Z.md) in the same commit that
+// bumps VERSION on `main` — a commit that now touches `site/**` and so triggers
+// deploy-site.yml, well before the separate `release` job's update-homebrew-tap.sh actually
+// publishes the matching DMG (40-90 minutes later). Without this filter, a visitor in that
+// window — or indefinitely, if the publish step fails outright — would see this page announce a
+// version the download link still can't serve. `getRelease()` resolves the public Homebrew tap
+// (memoized, so this reuses whatever Footer/Hero/Install/Nav on the same page already resolved)
+// and is the actual source of truth for what's downloadable, so filtering entries to
+// `<= that version` keeps display honest. This is NOT a build-time assertion that VERSION
+// matches the tap — that would fail every normal build in the gap between a bump merge and the
+// tap publish, which is expected, not an error.
+const available = (await getRelease()).version;
+const releases = entries
+  .filter((r) => !isNewer(r.data.version, available))
+  .sort((a, b) => cmp(a.data.version, b.data.version));
 const rendered = await Promise.all(releases.map(async (r) => ({ ...r, Body: (await render(r)).Content })));
 ---
 

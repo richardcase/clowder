@@ -20,10 +20,19 @@
  * ../data/semver.
  */
 import { getCollection } from 'astro:content';
-import { cmp } from '../data/semver';
+import { getRelease } from '../data/release';
+import { cmp, isNewer } from '../data/semver';
 
 const entries = await getCollection('releases');
-const [latest] = entries.sort((a, b) => cmp(a.data.version, b.data.version));
+
+// Never tease a release the Install button can't yet serve. See the matching comment in
+// ../pages/whats-new.astro for the timing this guards against — the same bump commit that adds
+// this release's note deploys the site well before the DMG is actually published, so this filter
+// keeps the homepage from announcing v(next) next to an Install button still serving v(current).
+const available = (await getRelease()).version;
+const [latest] = entries
+  .filter((r) => !isNewer(r.data.version, available))
+  .sort((a, b) => cmp(a.data.version, b.data.version));
 
 // Join a wrapped bullet's continuation lines (indented, no leading `-`) before
 // taking the first three — without this, a bullet that wraps onto a second
