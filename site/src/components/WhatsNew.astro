@@ -15,22 +15,12 @@
  * Bullets are pulled from the raw markdown body rather than rendered via
  * `render()`: the full release note is a whole `<ul>`, and this band wants
  * only the first two or three items as plain sentences, not a nested list
- * inside a list. The sort mirrors whats-new.astro's numeric-not-lexicographic
- * comparator (string order puts 0.9.0 above 0.10.0) — duplicated rather than
- * shared, since one file needs the full sorted collection and this one only
- * ever needs the single newest entry.
+ * inside a list. The sort uses the same numeric-not-lexicographic comparator
+ * as whats-new.astro (string order puts 0.9.0 above 0.10.0), shared via
+ * ../data/semver.
  */
 import { getCollection } from 'astro:content';
-
-const key = (v: string) => v.split('.').map(Number);
-const cmp = (a: string, b: string) => {
-  const [x, y] = [key(a), key(b)];
-  for (let i = 0; i < Math.max(x.length, y.length); i++) {
-    const d = (y[i] ?? 0) - (x[i] ?? 0);
-    if (d !== 0) return d;
-  }
-  return 0;
-};
+import { cmp } from '../data/semver';
 
 const entries = await getCollection('releases');
 const [latest] = entries.sort((a, b) => cmp(a.data.version, b.data.version));
