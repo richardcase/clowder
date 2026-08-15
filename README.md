@@ -148,6 +148,9 @@ Repo layout:
 | `scripts/` | `build-app.sh`, `build-libghostty.sh`, `set-version.sh`, `gen-icon.swift` |
 | `docs/` | Design specs/plans (`superpowers/`), `versioning.md`, `building-libghostty.md`, `code-signing.md`, `homebrew.md` |
 
+The marketing site for [getclowder.app](https://getclowder.app) lives in [`site/`](site/) — see
+[`site/README.md`](site/README.md).
+
 ## Versioning & releases
 
 The top-level [`VERSION`](VERSION) file is the single source of truth; `scripts/set-version.sh <X.Y.Z>`

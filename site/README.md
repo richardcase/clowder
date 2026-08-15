@@ -5,14 +5,19 @@ agent-orchestrator terminal for macOS.
 
 Built with [Astro](https://astro.build) and deployed to GitHub Pages.
 
+This site lives inside the private `clowder` repo under `site/`. It has its own `package.json` and
+CI job and needs no Rust, Swift or libghostty toolchain. The two rules below are enforced by
+`scripts/audit.sh`, which also refuses to publish product source files or private marker strings —
+see `scripts/audit-selftest.sh` for exactly what that means.
+
 ## Develop
 
 ```sh
-npm install
+npm ci
 npm run dev      # http://localhost:4321
+npm run check    # type-check .astro and .ts — `astro build` does NOT type-check
 npm run build    # → dist/, then scripts/audit.sh
-npm run check    # type-check .astro and .ts
-npm run test     # scripts/audit-selftest.sh
+npm test         # scripts/audit-selftest.sh
 ```
 
 `npm run check` is worth running before pushing. **`astro build` does not type-check** — it
@@ -24,8 +29,9 @@ that catches one. CI runs it on every pull request.
 `src/data/release.ts` reads the latest release from the **public Homebrew tap**
 (`defiantsoftware/homebrew-clowder`) at build time and exports the version, the direct `.dmg` URL and
 its size. A daily `schedule:` trigger in
-[`.github/workflows/deploy.yml`](.github/workflows/deploy.yml) rebuilds the site, so a new Clowder
-release propagates here without anyone editing a file.
+[`.github/workflows/deploy-site.yml`](../.github/workflows/deploy-site.yml) — at the repo root, not
+in this directory — rebuilds the site, so a new Clowder release propagates here without anyone
+editing a file.
 
 If the GitHub API call fails, the build falls back to a pinned version and logs a warning rather
 than failing the deploy.
