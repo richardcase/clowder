@@ -434,6 +434,7 @@ jobs:
     timeout-minutes: 120
     permissions:
       contents: write   # create the tag and the GitHub Release
+      actions: write    # to dispatch deploy-site.yml once the tap release is published
     env:
       VERSION: ${{ needs.plan.outputs.version }}
       TAG: ${{ needs.plan.outputs.tag }}
