@@ -63,7 +63,10 @@ originally asked for.
 ```
 plan     compute the version; guard rails; dry_run stops here
   ↓
-bump     set-version.sh → signed commit → PR → start CI → wait → merge   (skipped if VERSION is already correct)
+bump     set-version.sh → collect-release-notes.sh → signed commit → PR → start CI → wait → merge
+           (skipped if VERSION is already correct; note collection itself is skipped for a
+           `prerelease` run — an rc has no notes file, and `update-homebrew-tap.sh` warns and falls
+           back to a stub body rather than failing when one is absent)
   ↓
 release  build → sign → notarize → TAG → publish → Homebrew cask bump
 ```
@@ -179,4 +182,9 @@ gh api -X PUT repos/defiantsoftware/clowder/actions/permissions/workflow \
 # The `release` label marks the bump PR so it is excluded from its own release notes
 # (see .github/release.yml) and so the guard rail can find an already-open one.
 gh label create release -c 0E8A16 -d "Automated release version bump"
+
+# The escape hatch for a feat/fix PR with no user-visible effect (a CI fix, a refactor of the
+# release tooling) — scripts/check-release-notes.sh accepts this label in place of a fragment under
+# site/src/content/unreleased/. Must exist before the first PR that needs it.
+gh label create no-release-note -c BFD4F2 -d "Change needs no release note"
 ```

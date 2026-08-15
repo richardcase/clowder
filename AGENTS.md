@@ -302,3 +302,14 @@ is now the one place that computes it, and the app is the only caller that passe
   PRs merge with a merge commit, so **every** commit on the branch keeps its
   subject in `main`'s history — CI checks them individually. Run
   `scripts/check-commit-messages.sh` before pushing.
+- **Every `feat`/`fix` PR adds a release-note fragment** to `site/src/content/unreleased/` — one file,
+  one or two sentences, one user-facing capability described in plain language (`Connect the app to a
+  Clowder daemon on another machine over TLS.`), not a CLI surface dump and not a change record. If
+  the change is genuinely internal and no user could perceive it — a CI fix, a refactor of the release
+  tooling — add the `no-release-note` label instead of inventing a note; because `labeled` is not
+  among the default `pull_request` activity types `ci.yml` reacts to, adding the label after the fact
+  needs a manual re-run of the `commit-lint` job (and isn't wired to also re-run the macOS build, which
+  would otherwise rebuild on every label toggle). `scripts/check-release-notes.sh` enforces both the
+  requirement and the content: this repo is private and the site is public, so a note that leaks a
+  `#123` PR reference, a milestone scope like `m11a`, or a link to the private repo fails the guard —
+  see the script's own comments for the full pattern rationale.
