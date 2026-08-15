@@ -173,20 +173,24 @@ jobs:
       # set-version.sh runs `cargo update --workspace`, which only re-resolves the lockfile (never
       # compiles, and Cargo.lock is target-independent, so ubuntu is fine). If it touched anything
       # else, a stale lockfile is being silently repaired inside a release — stop and look.
+      #
+      # `git status`, not `git diff --name-only`: diff only sees tracked changes, so an untracked
+      # file left in the runner workspace, or an index-only change, would slip past silently. That
+      # gap matters now that gh-file-changes.sh (the "Commit the bump" step, below) enumerates via
+      # `git status --untracked-files=all` — anything invisible to THIS assertion is exactly what
+      # that script WOULD still fold into the signed commit unremarked.
+      #
+      # MUST run before "Collect the release notes": that step deliberately adds a 4th file and some
+      # deletions, which would otherwise fail this assertion for the right reason but a confusing
+      # message ("unexpected files changed" on a release that is working correctly).
       - name: Assert the bump touched exactly three files
         run: |
-          changed="$(git diff --name-only | sort | tr '\n' ' ')"
+          changed="$(git status --porcelain=v1 --untracked-files=all | cut -c4- | sort | tr '\n' ' ')"
           if [ "$changed" != "Cargo.lock Cargo.toml VERSION " ]; then
             echo "::error::unexpected files changed: $changed"
-            git diff --stat
+            git status --porcelain=v1 --untracked-files=all
             exit 1
           fi
-
-      - name: Create the release branch
-        run: |
-          gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" \
-            -f ref="refs/heads/$BRANCH" -f sha="$BASE_SHA" >/dev/null
-          echo "created $BRANCH at $BASE_SHA"
 
       # Skipped for a pre-release (release.yml dispatched with `prerelease: rc1` etc, producing a
       # version like 0.7.0-rc1). Collecting here would DELETE every accumulated fragment into
@@ -194,9 +198,21 @@ jobs:
       # collect and publish "Maintenance and fixes.", with the actual notes stranded in an rc file
       # that is never published to the tap (see the Homebrew-tap step's own prerelease guard,
       # further down in the `release` job) and that no user can install. Same guard, same reason.
+      #
+      # Runs BEFORE "Create the release branch" on purpose: collection needs no branch to exist, and
+      # if the content guard inside it rejects the collected notes, failing here leaves nothing to
+      # clean up. Failing after branch creation instead would leave `release/vX.Y.Z` pushed with
+      # nothing committed to it, and the `plan` job's guard rails refuse the next dispatch until
+      # someone deletes that branch by hand.
       - name: Collect the release notes
         if: needs.plan.outputs.prerelease != 'true'
         run: scripts/collect-release-notes.sh "$VERSION"
+
+      - name: Create the release branch
+        run: |
+          gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" \
+            -f ref="refs/heads/$BRANCH" -f sha="$BASE_SHA" >/dev/null
+          echo "created $BRANCH at $BASE_SHA"
 
       # createCommitOnBranch is used rather than `git commit` or the REST git-data API because
       # GitHub SIGNS commits made by this mutation, and main's ruleset requires signed commits.

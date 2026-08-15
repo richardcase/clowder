@@ -90,6 +90,21 @@ jobs:
       - name: check-release-notes.sh self-tests
         run: scripts/check-release-notes.sh --self-test
 
+      # Same reasoning again, with a sharper edge: this is what builds the FILE LIST for the bump
+      # job's signed `createCommitOnBranch` mutation. A wrong answer here does not fail loudly — it
+      # reaches `main` as a signed commit (e.g. a modification reported as a deletion), which is far
+      # harder to walk back than a failed build. See the "called from a subdirectory" self-test case
+      # for the exact bug this caught in review.
+      - name: gh-file-changes.sh self-tests
+        run: scripts/gh-file-changes.sh --self-test
+
+      # Same reasoning as check-release-notes.sh above: this is what turns accumulated fragments
+      # into the file a release actually publishes, and it DELETES the consumed fragments as part of
+      # doing so — a bug here can silently drop or corrupt release notes, or delete fragments without
+      # ever writing the file they were collected into.
+      - name: collect-release-notes.sh self-tests
+        run: scripts/collect-release-notes.sh --self-test
+
       - name: Release notes
         env:
           BASE: ${{ github.event.pull_request.base.sha || 'origin/main' }}
