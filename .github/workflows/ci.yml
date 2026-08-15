@@ -161,6 +161,55 @@ jobs:
           path: dist
           if-no-files-found: error
 
+  # The site's own checks, ported from clowder-site's ci.yml. Ubuntu-only and cheap, so it runs
+  # whenever the site changes. NOT in main's required set: adding a third required context is a
+  # ruleset change with release-gating consequences, and this does not need to be one.
+  site-ci:
+    name: build + check (site)
+    # Deliberately unconditional — no `needs: changes`, no `if:`. It is ubuntu and cheap, a product
+    # change can touch site/ too, and from Milestone 2 the site reads scripts/lib/product.sh, so a
+    # product change really can break the site build. Gating it on scope would serialize it behind
+    # `changes` for no benefit and hide exactly the breakage it is here to catch.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: site
+    steps:
+      - uses: actions/checkout@v4
+
+      # Before the build, for the reason documented in site/scripts/audit-selftest.sh: audit.sh's
+      # dangerous failure mode is a silent pass, so a green build is not evidence the guards ran
+      # unless the self-test ran first. Pure bash, so it needs no dependencies.
+      - name: Verify the build guards actually detect violations
+        run: ./scripts/audit-selftest.sh
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: 'site/.nvmrc'
+          cache: 'npm'
+          cache-dependency-path: 'site/package-lock.json'
+
+      - name: Install
+        run: npm ci
+
+      # Type errors do not fail `astro build` — Astro strips types rather than checking them — so
+      # without this step nothing would ever catch one.
+      - name: Type-check
+        run: npm run check
+
+      # `npm run build` chains scripts/audit.sh, so the private-repo and base-path guards run here.
+      #
+      # GITHUB_TOKEN authenticates the release lookup in src/data/release.ts. Unauthenticated
+      # api.github.com is capped at 60 requests/hour per IP and runner IPs are shared, so without it
+      # the build intermittently falls back to the pinned version.
+      - name: Build
+        run: npm run build
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   # THE REQUIRED CHECK. It always runs, so the required context always reports exactly one check
   # run, and it reports success only if the real build succeeded or was legitimately not needed.
   #
