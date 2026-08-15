@@ -1,0 +1,8 @@
+# Release-note fragments live here, one file per user-facing change.
+#
+# One or two sentences describing what a user can now do that they could not before.
+# Plain language, one capability per file. No CLI surface dumps, no pull request numbers,
+# no milestone scopes — scripts/check-release-notes.sh rejects those.
+#
+# scripts/collect-release-notes.sh consumes them at release time and deletes them; this file
+# keeps the directory in git afterwards.
