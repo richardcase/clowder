@@ -61,32 +61,48 @@ fragment mechanism, and everything depends on 0.
 
 ### Milestone 0 — migrate the site into this repo
 
-**Import with history.** `git subtree add --prefix=site <clowder-site> main`. Then run
-`scripts/check-commit-messages.sh` on the branch *before* pushing: the import replays roughly 29
-commit subjects through a lint they were never graded by. They look Conventional on inspection
-(`fix:`, `feat:`, `build:`), but if any trips the check, fall back to a squashed import — the full
-history stays readable in the archived source repo.
+**Import as a plain copy, not a subtree.** `git subtree add` was the first choice and it is wrong
+here. The import drags `clowder-site`'s fifteen non-merge commits into the pull request's lint range,
+and four of them fail `scripts/check-commit-messages.sh` — `Initial commit`, `Bump esbuild and
+astro`, `Add Astro marketing site for Clowder`, `Replace the UI illustration with real Clowder
+screenshots`. That is the required `commit messages (conventional commits)` check, so the migration
+PR could not merge. `--squash` does not rescue it either: it still leaves a non-merge `Squashed
+'site/' content from …` commit in the range.
+
+So the tree is copied in under one Conventional commit. The history stays in `clowder-site`, which
+is archived rather than deleted precisely so it remains readable.
 
 **Path-filtered CI that keeps the required check honest.** `main`'s ruleset requires exactly two
 contexts: `build + test (macOS, unsigned)` and `commit messages (conventional commits)`. The first is
 `runs-on: macos-15`, a 10× minute multiplier against Team's 3,000/month, so a site typo must not
-trigger it. Use the dual-job pattern — the one `clowder-site`'s own `ci.yml` comment prescribes when
-it warns against narrowing a required check's trigger ("pair it with an always-passing fallback job
-reporting the same check name"):
+trigger it. `clowder-site`'s own `ci.yml` warns against narrowing a required check's trigger and
+prescribes pairing it with "an always-passing fallback job reporting the same check name". **That
+advice is unsafe in this repo**, and it is worth being precise about why, because it is the single
+easiest thing here to get wrong:
+
+`scripts/check-runs-state.sh` treats `skipped` and `neutral` as non-success — deliberately, on the
+principle that a check which did not execute has vouched for nothing — and it gates the release
+workflow's bump-PR merge. An `if:`-skipped job **still files a check run**, with conclusion
+`skipped`. So two jobs sharing `name: build + test (macOS, unsigned)` would file *two* check runs
+under the required name, one `skipped` and one `success`; `classify()` selects the latest per name by
+`max_by([started_at, id])`, so which one wins is a race, and losing it fails the release.
+
+The safe shape is a gate job. The real work is renamed, and a cheap job that always runs carries the
+required name and asserts on the real job's `result`:
 
 ```yaml
 changes:              # did anything outside site/ change?
-build-and-test:       # name: build + test (macOS, unsigned)   if: product changed
-build-and-test-noop:  # name: build + test (macOS, unsigned)   if: !product changed, runs-on: ubuntu
+build-and-test-macos: # name: build + test (macOS, unsigned) — full   if: product changed
+required-build-gate:  # name: build + test (macOS, unsigned)          if: always(), runs-on: ubuntu
 ```
 
-Two jobs, one `name:`, mutually exclusive `if:` — exactly one reports the required context, always as
-a real success.
+One check run under the required name, deterministic, and `skipped` never appears under it. The
+context *string* is unchanged, and `check-runs-state.sh` reads the required set live from the
+ruleset, so no ruleset edit is needed.
 
-**It must be a no-op job, not a skipped one.** `scripts/check-runs-state.sh` deliberately treats
-`skipped` as non-success, on the principle that a check which did not execute has vouched for
-nothing, and it gates the release workflow's bump-PR merge. An `if:`-skipped macOS job would
-therefore fail every release. This is the single easiest thing to get wrong here.
+The classification itself lives in `scripts/changed-scope.sh` with a `--self-test` rather than in
+workflow YAML, for the reason that library of self-tested scripts exists: a rule that can only be
+exercised by a real pull request is a rule that ships wrong.
 
 `release/**` branches are treated as always-product, so the bump PR always gets the real build. It
 touches `VERSION` and `Cargo.lock` so it would qualify anyway — but that is an accident of the
@@ -122,7 +138,11 @@ once the certificate re-provisions, which can take up to an hour and is the visi
 deleting it — it keeps the public history and the pre-cutover state.
 
 **Guard the new boundary.** `site/scripts/audit.sh` keeps both existing checks; the private-repo link
-check is *more* relevant now, not less. Add a third: nothing outside `site/` may appear in `dist/`.
+check is *more* relevant now, not less. Add a third guarding the new boundary. "Nothing outside
+`site/` may appear in `dist/`" is the intent, but not literally checkable — `dist/` records no
+provenance — so the tractable form is a leakage scan: product source extensions (`.rs`, `.swift`,
+`.toml`, `.plist`, `.sh`, …) and marker strings that must never be published (`DOPPLER_TOKEN`,
+`HOMEBREW_TAP_TOKEN`, `clowder_proto`, …).
 The practical risk is low, since Astro bundles only what is imported, but the entire private tree now
 sits beside the build. Fixtures go in `audit-selftest.sh`, per that file's own rule that a guard
 whose failure mode is a silent pass is worse than no guard.
@@ -233,9 +253,13 @@ curation this avoids.
 **Publish product facts as a JSON asset on the tap release.** Necessary in the two-repo design, and
 pointless in this one — `LSMinimumSystemVersion` is a literal in a shell script in this tree.
 
-**Path-filter the macOS job by skipping it.** The obvious implementation, and it breaks every
-release, because `check-runs-state.sh` counts `skipped` as non-success by design. Hence the no-op
+**Path-filter the macOS job by skipping it, or by pairing it with a same-named fallback job.** Both
+are the obvious implementations and both break releases, because an `if:`-skipped job still files a
+`skipped` check run and `check-runs-state.sh` counts that as non-success by design. Hence the gate
 job.
+
+**`git subtree add` to preserve the site's history.** Four of its fifteen commit subjects fail the
+required commit-message lint. See Milestone 0.
 
 **Hard-fail the deploy on stale screenshots.** Takes the live site down over a cosmetic lag.
 
@@ -258,7 +282,7 @@ job.
 
 - `npm ci && npm run check && npm run build` from `site/`; `audit.sh` passes against `site/dist`
 - a pull request touching only `site/README.md` reports `build + test (macOS, unsigned)` as **success
-  from the ubuntu no-op job**, consuming no macOS minutes
+  from the gate job**, consuming no macOS minutes, with exactly **one** check run under that name
 - a pull request touching only `crates/` reports the same context from the real job
 - `scripts/check-runs-state.sh --sha <site-only PR head>` classifies the no-op as success — this is
   literally what a release's merge gate will do
