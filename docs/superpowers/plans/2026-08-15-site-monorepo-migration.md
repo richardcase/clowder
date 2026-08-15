@@ -752,7 +752,22 @@ Expected — the new step reuses this guard verbatim:
 Both halves matter. A pre-release never touches the tap, and neither does an unsigned run — so in
 both cases the tap release is unchanged and there is nothing new for the site to read.
 
-- [ ] **Step 2: Add the dispatch step immediately after the tap update**
+- [ ] **Step 2: Grant the `release` job `actions: write`**
+
+Without this the dispatch 403s on every run — and because the step below is `continue-on-error`, the
+release goes green while the site is never refreshed. The `bump` job already carries this scope for
+exactly the same reason (`release.yml:150`), and the comment beside it states the governing rule:
+workflow-level `permissions:` makes every unlisted scope `none`.
+
+In the `release` job's `permissions:` block, which is `contents: write` alone:
+
+```yaml
+    permissions:
+      contents: write
+      actions: write      # to dispatch deploy-site.yml so the site picks up the new tap release
+```
+
+- [ ] **Step 3: Add the dispatch step immediately after the tap update**
 
 Insert between `Update Homebrew tap` and `Remove temp signing keychain`.
 
@@ -775,7 +790,7 @@ Insert between `Update Homebrew tap` and `Remove temp signing keychain`.
         run: gh workflow run deploy-site.yml --ref main
 ```
 
-- [ ] **Step 3: Verify the YAML still parses and the step landed in the right job**
+- [ ] **Step 4: Verify the YAML still parses and the step landed in the right job**
 
 ```bash
 python3 -c "
@@ -789,7 +804,7 @@ print('dispatch after it:', names[names.index(i[0])+1])
 
 Expected: the dispatch step's name printed immediately after the Homebrew step.
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
 git add .github/workflows/release.yml
