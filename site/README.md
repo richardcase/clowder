@@ -1,4 +1,4 @@
-# clowder-site
+# site
 
 Marketing site for [Clowder](https://getclowder.app) — a cross-platform
 agent-orchestrator terminal for macOS.
@@ -36,7 +36,7 @@ editing a file.
 If the GitHub API call fails, the build falls back to a pinned version and logs a warning rather
 than failing the deploy.
 
-## Two rules for anyone editing this repo
+## Two rules for anyone editing this directory
 
 1. **Never link to `github.com/defiantsoftware/clowder`.** That repository is private — the link
    404s for every visitor. Public-facing links go to the Homebrew tap instead.
@@ -49,8 +49,8 @@ Both are checked by `scripts/audit.sh`, which runs against `dist/` after a build
 
 ## Deploying
 
-Pushes to `main` deploy automatically. The repo's **Settings ▸ Pages ▸ Source** must be set to
-**GitHub Actions** for the first deploy to publish.
+Pushes to `main` that touch `site/**` deploy automatically. The repo's **Settings ▸ Pages ▸ Source**
+must be set to **GitHub Actions** for the first deploy to publish.
 
 ## Screenshots
 
