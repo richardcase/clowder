@@ -1,0 +1,10 @@
+{
+  "extends": "astro/tsconfigs/strict",
+  "include": [".astro/types.d.ts", "**/*"],
+  "exclude": ["dist"],
+  "compilerOptions": {
+    // The build-time data modules read process.env, which needs Node's types.
+    // Astro's own presets deliberately do not pull these in.
+    "types": ["node"]
+  }
+}

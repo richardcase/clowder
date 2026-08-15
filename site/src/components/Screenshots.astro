@@ -1,0 +1,92 @@
+---
+import AppShot from './AppShot.astro';
+import split from '../assets/screenshots/split.png';
+import palette from '../assets/screenshots/palette.png';
+---
+
+<section class="section shots" id="screenshots">
+  <div class="shell">
+    <div class="section-head">
+      <p class="eyebrow">A closer look</p>
+      <h2>Everything stays one keystroke away</h2>
+    </div>
+
+    <div class="shots__list">
+      <article class="shot-row">
+        <div class="shot-row__copy">
+          <h3>Split a companion shell</h3>
+          <p>
+            <kbd class="kbd">⌘D</kbd> splits the focused pane and drops you into a shell already rooted
+            in that agent's worktree — same branch, same files. Run the tests yourself while the agent
+            keeps working beside you.
+          </p>
+        </div>
+        <AppShot
+          src={split}
+          alt="Clowder with a split pane: the agent's terminal showing a diff on the left, and a companion shell on the right, both in the same worktree."
+        />
+      </article>
+
+      <article class="shot-row shot-row--flip">
+        <div class="shot-row__copy">
+          <h3>Drive it all from <kbd class="kbd">⌘K</kbd></h3>
+          <p>
+            The command palette covers the whole surface: create a worktree, register a project,
+            restart an agent, split a pane — and <strong>Next Attention</strong>, which jumps straight
+            to whichever agent is waiting on you. Every binding is remappable.
+          </p>
+        </div>
+        <AppShot
+          src={palette}
+          alt="Clowder's command palette open over the app, listing New Worktree, Add Project, Restart Agent, Next Attention, Split Right, Split Down and Close Pane."
+        />
+      </article>
+    </div>
+  </div>
+</section>
+
+<style>
+  .shots {
+    border-top: 1px solid var(--border);
+  }
+
+  .shots__list {
+    display: flex;
+    flex-direction: column;
+    gap: clamp(3rem, 7vw, 5rem);
+  }
+
+  .shot-row {
+    display: grid;
+    grid-template-columns: minmax(240px, 0.72fr) 1.28fr;
+    gap: clamp(1.5rem, 4vw, 3rem);
+    align-items: center;
+  }
+
+  .shot-row--flip .shot-row__copy {
+    order: 2;
+  }
+
+  .shot-row__copy p {
+    margin-top: 0.7rem;
+    font-size: 0.93rem;
+    color: var(--text-dim);
+    text-wrap: pretty;
+  }
+
+  .shot-row__copy strong {
+    color: var(--text);
+    font-weight: 600;
+  }
+
+  @media (max-width: 880px) {
+    .shot-row,
+    .shot-row--flip {
+      grid-template-columns: 1fr;
+    }
+
+    .shot-row--flip .shot-row__copy {
+      order: 0;
+    }
+  }
+</style>

@@ -1,0 +1,148 @@
+---
+import { getRelease } from '../data/release';
+
+const release = await getRelease();
+---
+
+<nav class="nav" aria-label="Primary">
+  <div class="shell nav__inner">
+    <a class="nav__brand" href="#top">
+      <span class="mark" aria-hidden="true">C</span>
+      <span class="nav__name">Clowder</span>
+      <span class="nav__ver">v{release.version}</span>
+    </a>
+
+    <div class="nav__links">
+      <a href="#features">Features</a>
+      <a href="#architecture">How it works</a>
+      <a href="#faq">FAQ</a>
+    </div>
+
+    <a class="nav__cta" href="#install">Install</a>
+  </div>
+</nav>
+
+<style>
+  .nav {
+    position: sticky;
+    top: 0;
+    z-index: 50;
+    background: color-mix(in srgb, var(--bg) 82%, transparent);
+    backdrop-filter: saturate(160%) blur(12px);
+    border-bottom: 1px solid var(--border);
+  }
+
+  .nav__inner {
+    display: flex;
+    align-items: center;
+    gap: 1.5rem;
+    height: 58px;
+  }
+
+  .nav__brand {
+    display: flex;
+    align-items: center;
+    gap: 0.55rem;
+    text-decoration: none;
+    color: inherit;
+    flex: none;
+  }
+
+  .mark {
+    display: grid;
+    place-items: center;
+    width: 26px;
+    height: 26px;
+    border-radius: 7px;
+    background: var(--accent-deep);
+    color: #fff;
+    font-weight: 700;
+    font-size: 0.82rem;
+    line-height: 1;
+  }
+
+  .nav__name {
+    font-weight: 650;
+    font-size: 0.95rem;
+    letter-spacing: -0.01em;
+  }
+
+  .nav__ver {
+    font-family: var(--font-mono);
+    font-size: 0.65rem;
+    color: var(--text-faint);
+    padding-top: 0.15rem;
+  }
+
+  .nav__links {
+    display: flex;
+    gap: 1.4rem;
+    margin-left: auto;
+    font-size: 0.87rem;
+  }
+
+  .nav__links a {
+    color: var(--text-dim);
+    text-decoration: none;
+    transition: color 0.15s ease;
+  }
+
+  .nav__links a:hover {
+    color: var(--text);
+  }
+
+  .nav__cta {
+    flex: none;
+    font-size: 0.83rem;
+    font-weight: 600;
+    text-decoration: none;
+    padding: 0.44rem 0.95rem;
+    border-radius: 8px;
+    background: var(--accent);
+    color: #04191a;
+    transition: filter 0.15s ease;
+  }
+
+  .nav__cta:hover {
+    filter: brightness(1.1);
+  }
+
+  /* Narrow screens: the links wrap to a second row rather than disappearing.
+     They used to be `display: none` here, which left no route to the FAQ or the
+     architecture section for anyone who did not think to keep scrolling — and
+     those answer the questions that decide whether someone installs.
+
+     Wrapping rather than adding a disclosure menu is deliberate: three in-page
+     anchors do not justify a new interactive component, with the keyboard, focus
+     and aria-expanded handling that would have to be right to match the rest of
+     this page.
+
+     The cost is real, though, because this nav is sticky: a second row is
+     permanently subtracted from an already short viewport. Hence the tightened
+     type and padding below — measured, the header goes 59px -> 80px, so the links
+     come back for 21px rather than the ~40px a full-height second row would take. */
+  @media (max-width: 700px) {
+    .nav__inner {
+      flex-wrap: wrap;
+      height: auto;
+      gap: 0.35rem 1rem;
+      padding-block: 0.5rem;
+    }
+
+    .nav__cta {
+      margin-left: auto;
+    }
+
+    .nav__links {
+      /* Ordered last and given a full-width basis so it forms its own row
+         beneath the brand and the CTA, whatever their widths. */
+      order: 3;
+      flex-basis: 100%;
+      margin-left: 0;
+      gap: 1.1rem;
+      font-size: 0.82rem;
+      /* Only bites below roughly 300px, but a third row beats a clipped link. */
+      flex-wrap: wrap;
+    }
+  }
+</style>

@@ -1,0 +1,208 @@
+---
+interface Props {
+  command: string;
+  /** Visually larger treatment, for the hero's primary call to action. */
+  hero?: boolean;
+  label?: string;
+}
+
+const { command, hero = false, label } = Astro.props;
+---
+
+<div class:list={['cmd', hero && 'cmd--hero']}>
+  {label && <span class="cmd__label">{label}</span>}
+  <div class="cmd__row">
+    <code class="cmd__text"><span class="cmd__prompt" aria-hidden="true">$</span>{command}</code>
+    <button class="cmd__copy" type="button" data-command={command}>
+      {/*
+        The visible label is hidden from assistive tech so the button's accessible
+        name stays "Copy command to clipboard" even while the visible text swaps to
+        "Copied". A name that changes under a focused button gets announced again
+        on top of the status message below, which is two interruptions for one act.
+      */}
+      <span class="cmd__copy-text" aria-hidden="true">Copy</span>
+      <span class="sr-only">Copy command to clipboard</span>
+    </button>
+  </div>
+
+  {/*
+    Rendered empty and present from first paint. A live region injected or filled
+    at load announces itself spuriously, and one added to the DOM at click time is
+    missed altogether by some screen readers.
+  */}
+  <span class="sr-only cmd__status" role="status" aria-live="polite"></span>
+</div>
+
+<style>
+  .cmd {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+
+  .cmd__label {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--text-faint);
+  }
+
+  .cmd__row {
+    display: flex;
+    align-items: stretch;
+    gap: 0.5rem;
+    background: var(--surface);
+    border: 1px solid var(--border-bright);
+    border-radius: var(--radius);
+    padding: 0.4rem 0.4rem 0.4rem 0.9rem;
+    overflow: hidden;
+  }
+
+  .cmd--hero .cmd__row {
+    background: linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--surface-2) 90%, transparent),
+      var(--surface)
+    );
+    box-shadow:
+      0 0 0 1px color-mix(in srgb, var(--accent) 14%, transparent),
+      0 18px 40px -22px rgba(0, 0, 0, 0.9);
+    padding-block: 0.55rem;
+  }
+
+  .cmd__text {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    min-width: 0;
+    overflow-x: auto;
+    white-space: nowrap;
+    scrollbar-width: none;
+    font-size: 0.86rem;
+    color: var(--text);
+  }
+
+  .cmd__text::-webkit-scrollbar {
+    display: none;
+  }
+
+  .cmd--hero .cmd__text {
+    font-size: clamp(0.72rem, 1.6vw, 0.92rem);
+  }
+
+  .cmd__prompt {
+    color: var(--accent);
+    user-select: none;
+    flex: none;
+  }
+
+  /* On a phone the longest command overflows its row by ~130px. The row scrolls,
+     but `scrollbar-width: none` means nothing says so, so the command reads as
+     truncated — copyable but not readable, on the page's primary call to action.
+     Wrapping it is the honest fix.
+
+     Breaks land on spaces: `overflow-wrap` only intervenes when a single token is
+     itself too wide, and the longest here (defiantsoftware/clowder/clowder) is
+     not. Nobody has to guess whether a line break hides a space. */
+  @media (max-width: 560px) {
+    .cmd__row {
+      align-items: flex-start;
+    }
+
+    .cmd__text {
+      display: block;
+      overflow-x: visible;
+      white-space: normal;
+      overflow-wrap: anywhere;
+      line-height: 1.45;
+    }
+
+    .cmd__prompt {
+      margin-right: 0.5rem;
+    }
+
+    .cmd__copy {
+      align-self: flex-start;
+    }
+  }
+
+  .cmd__copy {
+    flex: none;
+    align-self: center;
+    font-family: var(--font-mono);
+    font-size: 0.74rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    padding: 0.5rem 0.85rem;
+    border-radius: 8px;
+    background: var(--surface-2);
+    border: 1px solid var(--border-bright);
+    color: var(--text-dim);
+    transition:
+      background 0.15s ease,
+      color 0.15s ease,
+      border-color 0.15s ease;
+  }
+
+  .cmd__copy:hover {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #04191a;
+  }
+
+  .cmd__copy[data-copied] {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #04191a;
+  }
+</style>
+
+<script>
+  // One delegated listener covers every CopyCommand on the page.
+  document.addEventListener('click', async (event) => {
+    const button = (event.target as HTMLElement | null)?.closest<HTMLButtonElement>('.cmd__copy');
+    if (!button) return;
+
+    const command = button.dataset.command;
+    const textEl = button.querySelector('.cmd__copy-text');
+    if (!command || !textEl) return;
+
+    // The visible label change is invisible to assistive tech by design, so the
+    // status region is the only announcement a screen reader gets. It has to
+    // cover the failure path too — that is exactly when someone needs telling
+    // what happened, since nothing landed on the clipboard.
+    const statusEl = button.closest('.cmd')?.querySelector('.cmd__status');
+
+    try {
+      await navigator.clipboard.writeText(command);
+      textEl.textContent = 'Copied';
+      if (statusEl) statusEl.textContent = 'Copied command to clipboard';
+    } catch {
+      // Clipboard API needs a secure context and can be blocked outright;
+      // say so rather than showing a success state that never happened.
+      textEl.textContent = 'Press ⌘C';
+      const range = document.createRange();
+      const code = button.closest('.cmd__row')?.querySelector('.cmd__text');
+      if (code) {
+        range.selectNodeContents(code);
+        const selection = window.getSelection();
+        selection?.removeAllRanges();
+        selection?.addRange(range);
+      }
+      if (statusEl) {
+        statusEl.textContent = 'Could not copy automatically. The command is selected — press Command C.';
+      }
+    }
+
+    button.dataset.copied = 'true';
+    window.setTimeout(() => {
+      textEl.textContent = 'Copy';
+      delete button.dataset.copied;
+      // Cleared so the next copy is a fresh change to the region. Leaving the
+      // same text in place means an identical second copy announces nothing.
+      if (statusEl) statusEl.textContent = '';
+    }, 2000);
+  });
+</script>

@@ -1,0 +1,20 @@
+{
+  "name": "clowder-site",
+  "type": "module",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "astro dev",
+    "build": "astro build && ./scripts/audit.sh",
+    "preview": "astro preview",
+    "check": "astro check",
+    "test": "./scripts/audit-selftest.sh"
+  },
+  "devDependencies": {
+    "@astrojs/check": "^0.9.10",
+    "@astrojs/sitemap": "^3.7.3",
+    "@types/node": "^26.2.0",
+    "astro": "^7.2.1",
+    "typescript": "^6.0.3"
+  }
+}

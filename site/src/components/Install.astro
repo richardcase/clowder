@@ -1,0 +1,325 @@
+---
+import CopyCommand from './CopyCommand.astro';
+import { site } from '../data/site';
+import { getRelease } from '../data/release';
+
+const release = await getRelease();
+---
+
+<section class="section" id="install">
+  <div class="shell">
+    <div class="section-head">
+      <p class="eyebrow">Install</p>
+      <h2>Get Clowder on macOS</h2>
+      <p class="lede" style="margin-top: 1rem;">
+        Two ways in. Homebrew is the one to use — it keeps you on the latest signed build with a
+        single <code>brew upgrade</code>.
+      </p>
+    </div>
+
+    <div class="install">
+      <!-- Primary path -->
+      <article class="step step--primary">
+        <header class="step__head">
+          <span class="step__num">1</span>
+          <h3>Install with Homebrew</h3>
+          <span class="badge badge--rec">Recommended</span>
+        </header>
+        <CopyCommand command={site.installCmd} />
+        <p class="step__note">
+          Installs <code>Clowder.app</code> into <code>/Applications</code> and puts the bundled
+          <code>clowder</code> CLI on your <code>PATH</code>. The tap and the cask are public — you
+          do not need any credentials.
+        </p>
+      </article>
+
+      <!-- Alternative path -->
+      <article class="step">
+        <header class="step__head">
+          <span class="step__num">2</span>
+          <h3>Or download the disk image</h3>
+        </header>
+        <a class="dmg" href={release.dmgUrl}>
+          <span class="dmg__icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
+              <path d="M12 3.5v11m0 0 4-4m-4 4-4-4" stroke-linecap="round" stroke-linejoin="round"
+              ></path>
+              <path d="M4 16.5v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" stroke-linecap="round"></path>
+            </svg>
+          </span>
+          <span class="dmg__body">
+            <strong>Clowder-{release.version}-macos.dmg</strong>
+            <span>~{release.dmgSizeMb} MB · {site.arch}</span>
+          </span>
+        </a>
+        <p class="step__note">
+          Open it and drag <strong>Clowder</strong> into <strong>Applications</strong>.
+        </p>
+      </article>
+    </div>
+
+    <!-- Requirements + trust -->
+    <div class="facts">
+      <div class="fact">
+        <span class="fact__k">Requires</span>
+        <span class="fact__v">macOS {site.minMacOS} {site.minMacOSName} or later</span>
+      </div>
+      <div class="fact">
+        <span class="fact__k">Architecture</span>
+        <span class="fact__v">{site.arch} only</span>
+      </div>
+      <div class="fact fact--good">
+        <span class="fact__k">Gatekeeper</span>
+        <span class="fact__v">
+          Signed with a Developer ID and notarized by Apple — it just opens. No
+          <code>xattr</code> workaround needed.
+        </span>
+      </div>
+    </div>
+
+    <!-- First run + housekeeping -->
+    <div class="after">
+      <div class="after__col">
+        <h3>First run</h3>
+        <ol class="steps-list">
+          <li>Open <strong>Clowder</strong>. It starts and supervises its own daemon — nothing else to set up.</li>
+          <li>Press <kbd class="kbd">⌘N</kbd> and pick a project, a task, and an adapter.</li>
+          <li>Split a companion shell with <kbd class="kbd">⌘D</kbd>; <kbd class="kbd">⌘L</kbd> Lands the agent when it's done.</li>
+        </ol>
+      </div>
+
+      <div class="after__col">
+        <h3>Keeping it current</h3>
+        <CopyCommand command={site.upgradeCmd} label="Upgrade" />
+        <div style="height: 0.75rem;"></div>
+        <CopyCommand command={site.uninstallCmd} label="Uninstall" />
+      </div>
+    </div>
+  </div>
+</section>
+
+<style>
+  .install {
+    display: grid;
+    /* minmax(0, …) rather than a bare fr. An `fr` track floors at min-content, so
+       any child that refuses to shrink — a long unbreakable command string, a
+       fixed-minimum nested grid — sets the track width and pushes the whole page
+       into horizontal scroll on a phone. */
+    grid-template-columns: minmax(0, 1.15fr) minmax(0, 0.85fr);
+    gap: 1rem;
+    align-items: start;
+  }
+
+  .step {
+    /* Grid items default to min-width: auto, i.e. they will not go narrower than
+       their min-content width. Without this the minmax above is undone from the
+       inside. */
+    min-width: 0;
+    padding: 1.5rem 1.4rem;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--bg-raised);
+    height: 100%;
+  }
+
+  .step--primary {
+    border-color: color-mix(in srgb, var(--accent) 30%, transparent);
+    background: linear-gradient(
+      160deg,
+      color-mix(in srgb, var(--accent) 7%, var(--bg-raised)),
+      var(--bg-raised)
+    );
+  }
+
+  .step__head {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.6rem;
+    margin-bottom: 1.1rem;
+  }
+
+  .step__num {
+    display: grid;
+    place-items: center;
+    width: 24px;
+    height: 24px;
+    flex: none;
+    border-radius: 50%;
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    font-weight: 700;
+    background: var(--surface-2);
+    border: 1px solid var(--border-bright);
+    color: var(--text-dim);
+  }
+
+  .step--primary .step__num {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #04191a;
+  }
+
+  .badge--rec {
+    margin-left: auto;
+    font-family: var(--font-mono);
+    font-size: 0.6rem;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    padding: 0.22rem 0.5rem;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--accent) 16%, transparent);
+    border: 1px solid color-mix(in srgb, var(--accent) 34%, transparent);
+    color: var(--accent);
+  }
+
+  .step__note {
+    margin-top: 0.9rem;
+    font-size: 0.86rem;
+    color: var(--text-dim);
+  }
+
+  .step__note code,
+  .fact code {
+    color: var(--accent);
+  }
+
+  .step__note strong {
+    color: var(--text);
+  }
+
+  /* ---------- dmg button ---------- */
+
+  .dmg {
+    display: flex;
+    align-items: center;
+    gap: 0.85rem;
+    padding: 0.8rem 0.95rem;
+    border-radius: var(--radius);
+    border: 1px solid var(--border-bright);
+    background: var(--surface);
+    text-decoration: none;
+    color: inherit;
+    transition:
+      border-color 0.18s ease,
+      background 0.18s ease;
+  }
+
+  .dmg:hover {
+    border-color: var(--accent);
+    background: var(--surface-2);
+  }
+
+  .dmg__icon {
+    display: grid;
+    place-items: center;
+    width: 34px;
+    height: 34px;
+    flex: none;
+    border-radius: 8px;
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    color: var(--accent);
+  }
+
+  .dmg__icon svg {
+    width: 19px;
+    height: 19px;
+  }
+
+  .dmg__body {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+
+  .dmg__body strong {
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    font-weight: 600;
+    color: var(--text);
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .dmg__body span {
+    font-size: 0.72rem;
+    color: var(--text-faint);
+  }
+
+  /* ---------- facts ---------- */
+
+  .facts {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 1px;
+    margin-top: 1rem;
+    background: var(--border);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+  }
+
+  .fact {
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+    padding: 1.1rem 1.2rem;
+    background: var(--bg-raised);
+  }
+
+  .fact__k {
+    font-family: var(--font-mono);
+    font-size: 0.63rem;
+    letter-spacing: 0.13em;
+    text-transform: uppercase;
+    color: var(--text-faint);
+  }
+
+  .fact__v {
+    font-size: 0.87rem;
+    color: var(--text-dim);
+  }
+
+  .fact--good .fact__v {
+    color: var(--text);
+  }
+
+  /* ---------- after ---------- */
+
+  .after {
+    display: grid;
+    grid-template-columns: 1.15fr 0.85fr;
+    gap: clamp(1.5rem, 4vw, 3rem);
+    margin-top: clamp(2.5rem, 5vw, 3.5rem);
+  }
+
+  .after h3 {
+    margin-bottom: 0.9rem;
+  }
+
+  .steps-list {
+    margin: 0;
+    padding-left: 1.15rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.55rem;
+    font-size: 0.9rem;
+    color: var(--text-dim);
+  }
+
+  .steps-list strong {
+    color: var(--text);
+    font-weight: 600;
+  }
+
+  .steps-list::marker {
+    color: var(--accent);
+  }
+
+  @media (max-width: 800px) {
+    .install,
+    .after {
+      grid-template-columns: minmax(0, 1fr);
+    }
+  }
+</style>

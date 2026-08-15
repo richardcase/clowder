@@ -1,0 +1,139 @@
+---
+/**
+ * The honest section. Two entries here deliberately state limitations that
+ * marketing copy would rather omit — the daemon-restart gap and the
+ * closed-source licence. Anyone evaluating a tool that runs unattended agents
+ * against their repos deserves to find that out here, not afterwards.
+ */
+
+const faqs = [
+  {
+    q: 'Is Clowder open source?',
+    a: 'No. Clowder is proprietary and the source repository is private. The app itself is free to install, and the Homebrew tap that serves it is public.',
+  },
+  {
+    q: 'Does it work on Linux or Windows?',
+    a: 'Not yet. The daemon is cross-platform Rust, but the client is a native SwiftUI app, so today Clowder is macOS only.',
+  },
+  {
+    q: 'Which agents can it run?',
+    a: 'Claude Code, OpenAI Codex, and a plain shell. You pick the adapter when you spawn an agent. Clowder drives whichever CLI you already have installed and authenticated.',
+  },
+  {
+    q: 'Will it touch my working tree?',
+    a: 'No. Each agent works in its own git worktree or jj workspace, created outside your repository under <code>~/.local/share/clowder/worktrees</code>. Your checkout is never modified. You can point that somewhere else with <code>[worktrees] base</code> in <code>~/.config/clowder/config.toml</code>.',
+  },
+  {
+    q: 'What happens to my agents when I close the window?',
+    a: 'They keep running. The daemon owns the PTYs and outlives the window, and the app reconnects when you come back. Agents do <strong>not</strong> yet survive a restart of the daemon itself — that is a known gap, along with scrollback reflow on resize.',
+  },
+  {
+    q: 'How do I update?',
+    a: 'Run <code>brew upgrade --cask clowder</code>. Each final release auto-bumps the cask, so upgrades arrive without you tracking versions.',
+  },
+] as const;
+---
+
+<section class="section faq" id="faq">
+  <div class="shell">
+    <div class="section-head">
+      <p class="eyebrow">Questions</p>
+      <h2>Before you install</h2>
+    </div>
+
+    <div class="faq__list">
+      {
+        faqs.map((faq) => (
+          <details class="qa">
+            <summary>
+              <span>{faq.q}</span>
+              <span class="qa__chev" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="m6 9 6 6 6-6" stroke-linecap="round" stroke-linejoin="round" />
+                </svg>
+              </span>
+            </summary>
+            <p set:html={faq.a} />
+          </details>
+        ))
+      }
+    </div>
+  </div>
+</section>
+
+<style>
+  .faq__list {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    background: var(--border);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+  }
+
+  .qa {
+    background: var(--bg-raised);
+  }
+
+  .qa summary {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    padding: 1.1rem 1.3rem;
+    cursor: pointer;
+    list-style: none;
+    font-weight: 550;
+    font-size: 0.97rem;
+    color: var(--text);
+    transition: color 0.15s ease;
+  }
+
+  .qa summary::-webkit-details-marker {
+    display: none;
+  }
+
+  .qa summary:hover {
+    color: var(--accent);
+  }
+
+  .qa__chev {
+    flex: none;
+    display: grid;
+    place-items: center;
+    width: 22px;
+    height: 22px;
+    color: var(--text-faint);
+    transition: rotate 0.2s ease;
+  }
+
+  .qa__chev svg {
+    width: 15px;
+    height: 15px;
+  }
+
+  .qa[open] .qa__chev {
+    rotate: 180deg;
+    color: var(--accent);
+  }
+
+  .qa > p {
+    padding: 0 1.3rem 1.3rem;
+    margin: 0;
+    max-width: var(--measure);
+    font-size: 0.92rem;
+    color: var(--text-dim);
+    text-wrap: pretty;
+  }
+
+  .qa :global(code) {
+    color: var(--accent);
+    word-break: break-all;
+  }
+
+  .qa :global(strong) {
+    color: var(--text);
+    font-weight: 650;
+  }
+</style>

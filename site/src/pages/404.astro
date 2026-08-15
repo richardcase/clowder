@@ -1,0 +1,72 @@
+---
+import Base from '../layouts/Base.astro';
+import Nav from '../components/Nav.astro';
+import { site } from '../data/site';
+---
+
+<Base
+  title={`Page not found — ${site.name}`}
+  description="That page does not exist."
+  noindex
+>
+  <Nav />
+  <main id="main" class="notfound">
+    <div class="shell notfound__inner">
+      <p class="notfound__code" aria-hidden="true">404</p>
+      <h1>That page doesn't exist.</h1>
+      <p class="lede">
+        The link may be out of date, or the address may have a typo. Everything about
+        Clowder lives on one page.
+      </p>
+      <a class="notfound__home" href="/">Go to the homepage</a>
+    </div>
+  </main>
+</Base>
+
+<style>
+  /* Deliberately short. A 404 that tries to sell is worse than one that gets out
+     of the way, so this is a heading, a line, and a way back. */
+  .notfound {
+    display: flex;
+    align-items: center;
+    min-height: 70vh;
+    padding: 4rem 0 6rem;
+  }
+
+  .notfound__inner {
+    text-align: center;
+  }
+
+  .notfound__code {
+    font-family: var(--font-mono);
+    font-size: clamp(4rem, 14vw, 8rem);
+    line-height: 1;
+    margin: 0 0 0.5rem;
+    color: var(--surface-2);
+    letter-spacing: -0.02em;
+  }
+
+  .notfound h1 {
+    margin: 0 0 1rem;
+  }
+
+  .notfound .lede {
+    margin-inline: auto;
+    max-width: 46ch;
+  }
+
+  .notfound__home {
+    display: inline-block;
+    margin-top: 2rem;
+    padding: 0.7rem 1.3rem;
+    border-radius: var(--radius);
+    background: var(--accent);
+    color: #04191a;
+    font-weight: 600;
+    text-decoration: none;
+  }
+
+  .notfound__home:hover {
+    background: color-mix(in srgb, var(--accent) 85%, white);
+  }
+</style>
