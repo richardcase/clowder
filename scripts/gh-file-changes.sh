@@ -48,8 +48,16 @@ b64() {
 # newline-delimited, C-quoted format), and porcelain=v1 covers added/modified/deleted files whether
 # staged or not, plus untracked files, in one pass.
 file_changes() {
-  local root="$1" ref="${2:-HEAD}"
-  local head resolved
+  local root_arg="$1" ref="${2:-HEAD}"
+  local root head resolved
+  # Resolve to the repo TOPLEVEL rather than trusting the argument: `git status --porcelain` paths
+  # are always toplevel-relative, never cwd-relative. Joining them onto anything else — e.g. a
+  # subdirectory passed in by a caller — silently looks up the wrong absolute path, so an existing,
+  # modified file reads as absent and gets reported as a DELETION instead of an addition. Today's
+  # only caller passes the repo root already, so this cannot fire in practice, but nothing enforced
+  # that, and getting it wrong here means a modification landing in the signed bump commit as a
+  # deletion. See the "called from a subdirectory" self-test case below.
+  root="$(git -C "$root_arg" rev-parse --show-toplevel)"
   head="$(git -C "$root" rev-parse HEAD)"
   resolved="$(git -C "$root" rev-parse "$ref")"
   # `git status` has no notion of "against an arbitrary ref" — it only ever reports the checked-out
@@ -301,6 +309,43 @@ self_test() {
     ok "JSON shape matches createCommitOnBranch's fileChanges input"
   else
     bad "JSON shape matches createCommitOnBranch's fileChanges input" "got: $got"
+  fi
+
+  # --- called from a subdirectory of the repo still resolves against the toplevel, not cwd ---
+  # Regression coverage for the root-resolution bug found in review: passing a subdirectory used to
+  # join toplevel-relative `git status` paths onto the wrong base, so a real modification silently
+  # became a reported deletion.
+  repo subdir-root
+  printf 'v1\n' >"$REPO/a.txt"
+  mkdir -p "$REPO/sub"
+  commit_all seed
+  printf 'v2\n' >"$REPO/a.txt"
+  got="$(file_changes "$REPO/sub")"
+  if [ "$(jq '.additions | length' <<<"$got")" = 1 ] && [ "$(jq '.deletions | length' <<<"$got")" = 0 ] \
+      && [ "$(jq -r '.additions[0].path' <<<"$got")" = "a.txt" ]; then
+    ok "called from a subdirectory still resolves against the repo toplevel (stays an addition, not a deletion)"
+  else
+    bad "called from a subdirectory" "got: $got"
+  fi
+
+  # --- base64 output is genuinely single-line even for content long enough to trigger wrapping ---
+  # Regression coverage from mutation testing: every other fixture here is under 57 bytes, so a
+  # mutant that deletes `tr -d '\n'` from b64() survived — nothing exercised the GNU-vs-BSD wrapping
+  # difference that function exists to paper over. GNU `base64` without `-w0` wraps at 76 output
+  # columns, which corresponds to 57 input bytes; this fixture is well past that.
+  repo big-fixture
+  printf 'seed\n' >"$REPO/a.txt"
+  commit_all seed
+  big_content="$(printf 'x%.0s' $(seq 1 500))"
+  printf '%s\n' "$big_content" >"$REPO/big.txt"
+  got="$(file_changes "$REPO")"
+  contents="$(jq -r '.additions[0].contents' <<<"$got")"
+  decoded="$(printf '%s' "$contents" | base64 -d)"
+  if [ "$(printf '%s' "$contents" | wc -l | tr -d ' ')" = 0 ] && [ "$decoded" = "$big_content" ]; then
+    ok "base64 of a >57-byte file is a single line and round-trips"
+  else
+    bad "base64 of a >57-byte file is a single line and round-trips" \
+      "contents had $(printf '%s' "$contents" | wc -l | tr -d ' ') embedded newline(s); decode matched: $([ "$decoded" = "$big_content" ] && echo yes || echo no)"
   fi
 
   # --- ref other than the checked-out HEAD is refused, not silently misreported ---
