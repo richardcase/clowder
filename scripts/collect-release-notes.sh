@@ -56,6 +56,8 @@ version_ok() {
 #
 # NUL-delimited (not newline) because a fragment's slug is a free-form filename and nothing stops
 # one containing a space; `find -print0` / `sort -z` is the only combination that survives that.
+# `LC_ALL=C` pins byte-order collation so the release this produces does not depend on which
+# machine — a contributor's laptop locale vs. CI's — happened to run the release.
 # A missing directory prints nothing rather than erroring: a release after the previous one already
 # swept every fragment (or before this feature existed at all) is not a failure, it is the common
 # case. Restricted to *.md so `.gitkeep` — and anything else that is not a fragment — is never
@@ -64,7 +66,7 @@ version_ok() {
 fragments_in() {
   local dir="$1"
   [ -d "$dir" ] || return 0
-  find "$dir" -maxdepth 1 -type f -name '*.md' -print0 | sort -z
+  find "$dir" -maxdepth 1 -type f -name '*.md' -print0 | LC_ALL=C sort -z
 }
 
 # collect <version> <fragment-dir> <out-file> -> writes out-file, deletes consumed fragments
@@ -116,9 +118,16 @@ collect() {
   mkdir -p "$(dirname "$out_file")"
   mv "$tmp" "$out_file"
 
-  for frag in "${files[@]}"; do
-    rm -f "$frag"
-  done
+  # Guarded on count, not bare `"${files[@]}"`: under `set -u`, bash 3.2 (the maintainer's
+  # `/bin/bash`) treats an empty array's `[@]` expansion as an unbound variable and aborts — exactly
+  # the no-fragments path this script exists to make legitimate, not exceptional. Same idiom as
+  # scripts/sign-app.sh's `${kc[@]+"${kc[@]}"}` (see its comment); a plain length check reads more
+  # naturally here since the loop body wants ordinary `"${files[@]}"`, not a single expansion site.
+  if [ "${#files[@]}" -gt 0 ]; then
+    for frag in "${files[@]}"; do
+      rm -f "$frag"
+    done
+  fi
 }
 
 # ----------------------------------------------------------------------------- self-test
@@ -126,6 +135,17 @@ self_test() {
   local pass=0 fail=0 tmp
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' RETURN
+
+  # A pass here is only evidence for the bash that ran it — bash's own empty-array-under-`set -u`
+  # behaviour changed between 3.2 (macOS's `/bin/bash`, still the maintainer's default) and later
+  # versions, so a bug in that exact class can pass under one and abort under the other with no
+  # summary line at all (found in review: the fragment-deletion loop crashed on bash 3.2 while this
+  # suite was 17/17 on Homebrew bash 5). Printing the version makes that visible in the log instead
+  # of silent; it does not by itself prove portability; run this explicitly with `/bin/bash
+  # scripts/collect-release-notes.sh --self-test` — not just `bash …` — since `bash` may not
+  # resolve to 3.2 even on macOS. See the fix-round note in task-4-report.md for what else was
+  # considered here (a self re-exec under /bin/bash) and why it was rejected.
+  echo "collect-release-notes: self-test running under bash $BASH_VERSION ($0)"
 
   ok()   { echo "  ok    $1"; pass=$((pass + 1)); }
   bad()  { echo "  FAIL  $1 — $2" >&2; fail=$((fail + 1)); }
