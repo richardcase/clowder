@@ -1,6 +1,6 @@
 # site
 
-Marketing site for [Clowder](https://getclowder.app) — a cross-platform
+Product marketing site for [Clowder](https://getclowder.app) — a cross-platform
 agent-orchestrator terminal for macOS.
 
 Built with [Astro](https://astro.build) and deployed to GitHub Pages.
