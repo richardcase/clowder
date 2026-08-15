@@ -40,6 +40,28 @@ check() {
   fi
 }
 
+# Build a fixture dir containing a file named $3 (with innocuous content), then assert audit.sh's
+# exit status matches $1. check() above always writes index.html, so it cannot express a fixture
+# whose *filename* is the violation.
+check_file() {
+  local want="$1" name="$2" filename="$3"
+  local dir="$WORK/$name"
+  mkdir -p "$dir"
+  printf '<html></html>\n' > "$dir/index.html"
+  printf 'nothing to see here\n' > "$dir/$filename"
+
+  local got
+  if "$AUDIT" "$dir" >/dev/null 2>&1; then got=pass; else got=fail; fi
+
+  if [[ "$got" == "$want" ]]; then
+    echo "  ok    $name (audit $got, as expected)"
+    pass=$((pass + 1))
+  else
+    echo "  FAIL  $name — expected audit to $want, but it $got" >&2
+    fail=$((fail + 1))
+  fi
+}
+
 echo "audit-selftest: verifying audit.sh actually detects violations"
 
 # --- check 1: private source repo links --------------------------------------
@@ -67,6 +89,28 @@ check pass root-absolute-asset '<img src="/favicon.svg"><link href="/style.css">
 # --- a wholly clean page must pass -------------------------------------------
 check pass clean-page \
   '<a href="https://github.com/defiantsoftware/homebrew-clowder">tap</a><img src="/favicon.svg">'
+
+# --- check 3: private-source leakage -----------------------------------------
+check_file fail leaked-rust    'main.rs'
+check_file fail leaked-swift   'App.swift'
+check_file fail leaked-cargo   'Cargo.toml'
+check_file fail leaked-script  'build-app.sh'
+check_file fail leaked-plist   'Info.plist'
+
+# Files the site legitimately publishes must not trip it. .webmanifest and .xml in particular are
+# real build outputs (manifest.webmanifest.ts and the sitemap integration).
+check_file pass site-manifest  'manifest.webmanifest'
+check_file pass site-sitemap   'sitemap-index.xml'
+check_file pass site-css       'style.css'
+
+check fail leaked-token-name \
+  '<script>const t = "HOMEBREW_TAP_TOKEN";</script>'
+check fail leaked-rust-symbol \
+  '<p>uses clowder_proto internally</p>'
+
+# The product NAME is obviously fine — only the internal symbols are not.
+check pass product-name-is-fine \
+  '<h1>Clowder</h1><p>a terminal for coding agents</p>'
 
 echo "audit-selftest: $pass passed, $fail failed"
 [[ $fail -eq 0 ]]

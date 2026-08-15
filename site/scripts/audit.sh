@@ -56,6 +56,36 @@ else
   echo "  ok  no stale '/clowder-site' base-path prefixes"
 fi
 
+# --- 3. private-source leakage -----------------------------------------------
+# The site now lives inside the private product repo, so a bad import or a build-time file read
+# could publish something that was never meant to be public. dist/ carries no provenance, so this
+# checks for what leaked source would look like rather than where it came from.
+#
+# Milestone 2 makes site.ts read scripts/lib/product.sh at build time — a deliberate read from
+# outside site/. This guard exists so the next one is not silently broader.
+leaked=$(find "$DIST" -type f \
+  \( -name '*.rs' -o -name '*.swift' -o -name '*.toml' -o -name '*.lock' \
+     -o -name '*.plist' -o -name '*.sh' -o -name '*.a' -o -name '*.entitlements' \) || true)
+if [[ -n "$leaked" ]]; then
+  echo "audit: FAIL — product source files in the published site:" >&2
+  echo "$leaked" | sort -u >&2
+  status=1
+else
+  echo "  ok  no product source files in the build"
+fi
+
+# Marker strings that only appear in the private tree or in CI configuration. A published page
+# containing any of these means something read further than it should have.
+markers='HOMEBREW_TAP_TOKEN|DOPPLER_TOKEN|APPLE_ID_PASSWORD|clowder_proto|ghostty_surface_'
+matches=$(grep -rIoE "$markers" "$DIST" || true)
+if [[ -n "$matches" ]]; then
+  echo "audit: FAIL — private markers in the published site:" >&2
+  echo "$matches" | sort -u >&2
+  status=1
+else
+  echo "  ok  no private source markers in the build"
+fi
+
 if [[ $status -eq 0 ]]; then
   echo "audit: passed"
 fi
