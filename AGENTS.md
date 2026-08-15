@@ -267,6 +267,20 @@ is now the one place that computes it, and the app is the only caller that passe
 - The design/implementation workflow lives in `docs/superpowers/` — **spec → plan → subagent-driven
   execution → PR**, one milestone per cycle. Read the relevant spec/plan before non-trivial changes.
 - Work on feature branches; open a PR into `main`; keep CI green. Don't commit to `main` directly.
+- **Every commit must be signed.** `main`'s ruleset carries a `required_signatures` rule with no
+  bypass actors, so a single unsigned commit anywhere on a branch blocks the merge — there is no
+  admin override to fall back on. The maintainer's global config already does this
+  (`commit.gpgsign = true`, `gpg.format = ssh`, `user.signingkey = ~/.ssh/id_ed25519.pub`), so
+  ordinary `git commit` signs without ceremony. Two consequences worth knowing:
+  - **`git filter-branch` silently strips every signature.** It re-creates commits with
+    `git commit-tree` and no `-S`, so a branch that was fully signed comes back fully unsigned and
+    nothing warns you. This has already happened once here. To reword or rewrite history, use
+    `git rebase -f --gpg-sign <base>`, which re-signs as it replays.
+  - **`git log --format=%G?` reports `N` on a correctly signed commit** unless
+    `gpg.ssh.allowedSignersFile` is configured — with SSH signing, git cannot verify without it, and
+    reports the signature as absent rather than unverifiable. Do not trust `%G?` here. Check for the
+    header directly (`git cat-file commit <sha> | grep -q gpgsig`), or ask GitHub
+    (`gh api repos/defiantsoftware/clowder/commits/<sha> --jq .commit.verification`).
 - **Commit messages are Conventional Commits** — `type(scope): subject`, with `type` one of `feat`,
   `fix`, `docs`, `test`, `refactor`, `perf`, `ci`, `chore`, `build`, `style`, `revert`; scope
   optional and free-form (`daemon`, `app`, `m10c`, `proto,daemon` are all fine); `!` before the colon
