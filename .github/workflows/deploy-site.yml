@@ -1,0 +1,76 @@
+name: Deploy site to GitHub Pages
+
+# NOTE: until the domain cutover, defiantsoftware/clowder-site still serves getclowder.app. This
+# workflow can be dispatched to verify the build, but Pages is not yet enabled on this repo, so the
+# `deploy` job will fail until it is. That is expected and is the cutover's first step.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'site/**'
+      - '.github/workflows/deploy-site.yml'
+  # The version and download URL are read from the public Homebrew tap at build time, so a daily
+  # rebuild keeps the site current after a Clowder release without anyone editing this repo.
+  schedule:
+    - cron: '0 6 * * *'
+  # release.yml dispatches this after publishing to the tap, so a release does not wait for the
+  # daily run to be advertised.
+  workflow_dispatch:
+
+# Deliberately NOT `pull_request`. pages:write and id-token:write must never be reachable from pull
+# request code — which matters more here than it did in clowder-site, because this repo also holds
+# DOPPLER_TOKEN and the signing path.
+
+# Allow only one concurrent deployment, but let a running one finish so a half-published site is
+# never left behind.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # Set at job level rather than on the withastro/action step: env propagation into a composite
+    # action's own steps is not something to rely on.
+    #
+    # This authenticates the release lookup in site/src/data/release.ts. Unauthenticated
+    # api.github.com allows 60 requests/hour per IP and runner IPs are shared, so without it the
+    # daily rebuild can silently fall back to the pinned version.
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Runs before the build because audit.sh's dangerous failure mode is a silent pass: a pattern
+      # that matches nothing still exits 0. Without this, a green deploy is not evidence the guards
+      # ran. No npm needed — it is pure bash against throwaway fixtures.
+      - name: Verify the build guards actually detect violations
+        run: ./scripts/audit-selftest.sh
+        working-directory: site
+
+      - name: Build with Astro
+        uses: withastro/action@v6
+        with:
+          # The Astro project is not at the repo root any more.
+          path: site
+          # withastro/action has no node-version-file input, so this duplicates site/.nvmrc rather
+          # than reading it. CI builds on site/.nvmrc — keep the two in step, or pull requests get
+          # validated on a different Node than deploys.
+          node-version: 24
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5
