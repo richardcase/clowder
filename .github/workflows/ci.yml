@@ -84,6 +84,21 @@ jobs:
       - name: changed-scope.sh self-tests
         run: scripts/changed-scope.sh --self-test
 
+      # Same reasoning as the self-tests above, and one more: this guard is what stops a private
+      # repo link or an internal milestone scope reaching a public page, so a green run has to be
+      # evidence it actually ran.
+      - name: check-release-notes.sh self-tests
+        run: scripts/check-release-notes.sh --self-test
+
+      - name: Release notes
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || 'origin/main' }}
+          HEAD_REF: ${{ github.event.pull_request.head.sha || github.sha }}
+          # Comma-joined so the script needs no `gh` call and stays unit-testable. Empty outside a
+          # pull request, which is correct: the bump commit is `chore:` and requires no note.
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: scripts/check-release-notes.sh "$BASE" "$HEAD_REF"
+
   build-and-test-macos:
     name: build + test (macOS, unsigned) — full
     needs: changes
