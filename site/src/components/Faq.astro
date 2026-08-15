@@ -1,9 +1,15 @@
 ---
 /**
- * The honest section. Two entries here deliberately state limitations that
- * marketing copy would rather omit — the daemon-restart gap and the
- * closed-source licence. Anyone evaluating a tool that runs unattended agents
- * against their repos deserves to find that out here, not afterwards.
+ * The honest section. Several entries here deliberately state things marketing
+ * copy would rather omit or round off — the closed-source licence, and the
+ * daemon-restart entry below, which states BOTH halves of a fact that is easy
+ * to get half right: the PTY process genuinely does not survive a daemon
+ * restart, but `reconcile()` respawns every recorded agent in the same
+ * worktree with its conversation resumed (`--continue`) and its split layout
+ * restored. Reporting only the first half reads as "you lose your work,"
+ * which is wrong; reporting only the second reads as seamless, which
+ * overstates it. Anyone evaluating a tool that runs unattended agents against
+ * their repos deserves the accurate version, not the flattering one.
  */
 
 const faqs = [
@@ -25,7 +31,7 @@ const faqs = [
   },
   {
     q: 'What happens to my agents when I close the window?',
-    a: 'They keep running. The daemon owns the PTYs and outlives the window, and the app reconnects when you come back. Agents do <strong>not</strong> yet survive a restart of the daemon itself — that is a known gap, along with scrollback reflow on resize.',
+    a: 'They keep running. The daemon owns the PTYs and outlives the window, and the app reconnects when you come back. If the daemon itself restarts — a crash, or an app relaunch — the underlying process does not survive that, but the daemon respawns every agent it had recorded in the same worktree, resumes its conversation, and restores the split layout, so in practice you come back to where you left off rather than to nothing. A known gap that remains: scrollback does not yet reflow when you resize a pane.',
   },
   {
     q: 'How do I update?',
