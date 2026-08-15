@@ -640,6 +640,23 @@ jobs:
           fi
           scripts/update-homebrew-tap.sh
 
+      # The tap release is what the site reads, and it is only published by the step above — after
+      # the bump PR merged and its own push-triggered deploy already ran against the previous
+      # version. Without this the site advertises the old release until the next daily rebuild.
+      #
+      # `workflow_dispatch` is the documented exception to "refs pushed with GITHUB_TOKEN do not
+      # start workflow runs" — the same reason ci.yml accepts it.
+      #
+      # Deliberately not a failure: the release itself has already succeeded and been published by
+      # this point, and the daily schedule is the backstop. Failing here would report a broken
+      # release that is not broken.
+      - name: Refresh the site (it reads the tap release)
+        if: ${{ steps.signing.outputs.enabled == 'true' && needs.plan.outputs.prerelease != 'true' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run deploy-site.yml --ref main
+
       - name: Remove temp signing keychain
         if: ${{ always() && steps.signing.outputs.enabled == 'true' }}
         run: security delete-keychain "$RUNNER_TEMP/clowder-signing.keychain-db" || true
