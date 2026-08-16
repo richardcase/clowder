@@ -320,11 +320,13 @@ is now the one place that computes it, and the app is the only caller that passe
   notices. It separately fails when a release-note fragment added in the PR shares distinctive wording
   with an *open* gap's issue title — not a verdict on the claim itself, but a prompt: that overlap
   usually means the gap is about to close and the FAQ entry needs the same treatment in the same PR.
-  `no-copy-review` is the escape hatch, read from `PR_LABELS` the same way `no-release-note` is above,
-  and reported in the job summary; adding it after the fact doesn't retrigger CI either, for the same
-  reason — add the label, then re-run the failed `commit-lint` job by hand. The check watches
-  limitation claims and deliberately not `Features.astro`'s positive ones: a positive claim stays true
-  as the product grows, but a limitation claim is true only until someone fixes the thing — and the
+  `no-copy-review` is the escape hatch, read from `PR_LABELS` the same way `no-release-note` is above.
+  Nothing writes `GITHUB_STEP_SUMMARY` for it — a failure is stderr output in the failed `commit-lint`
+  step's own log, not a job summary entry. Adding the label after the fact doesn't retrigger CI either,
+  for the same reason as `no-release-note` — add the label, then re-run the failed `commit-lint` job by
+  hand. The check watches limitation claims and deliberately not `Features.astro`'s positive ones: a
+  positive claim stays true as the product grows, but a limitation claim is true only until someone
+  fixes the thing — and the
   person fixing it is deep in Rust, not reading marketing copy. Of the four corrections this site has
   needed across the two milestones before this check existed, none touched `Features.astro` and both
   FAQ corrections were limitations — evidence for scoping the gate there rather than "improving" it to
