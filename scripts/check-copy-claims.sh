@@ -139,9 +139,8 @@ contradicts() {
   return 1
 }
 
-# issue_state <number> -> prints "state<TAB>title" on stdout (state lowercased "open"/"closed"), or
-# fails with a non-zero exit and the underlying tool's own error on stderr. The ONE function in this
-# script that touches the network — everything above is pure so --self-test needs no connectivity.
+# _issue_lookup_once <number> -> one attempt, stdout "state<TAB>title" on success, stderr + non-zero
+# on failure. Factored out of issue_state so the retry wrapper below has exactly one thing to retry.
 # CHECK_COPY_CLAIMS_ISSUE_STATE_CMD lets a caller (the self-test, or an operator debugging offline)
 # point this at a stub instead of `gh`; state and title travel together so a single lookup serves
 # both the gap-closure check and the contradiction check's title-matching, rather than fetching the
@@ -151,14 +150,70 @@ contradicts() {
 # to it) — the offline-debugging use case is real and the long, script-specific name already makes
 # an accidental collision implausible; gating it would remove that use case for a marginal further
 # reduction in an already-small risk.
-issue_state() {
-  local n="$1" raw
+_issue_lookup_once() {
+  local n="$1"
   if [ -n "${CHECK_COPY_CLAIMS_ISSUE_STATE_CMD:-}" ]; then
     "$CHECK_COPY_CLAIMS_ISSUE_STATE_CMD" "$n"
     return $?
   fi
-  raw="$(gh issue view "$n" --json state,title --jq '(.state | ascii_downcase) + "\t" + .title')" || return 1
-  printf '%s\n' "$raw"
+  gh issue view "$n" --json state,title --jq '(.state | ascii_downcase) + "\t" + .title'
+}
+
+# is_definitive_miss <error-text> -> 0 if the error text says the issue genuinely does not exist, 1
+# for anything else. `gh issue view` talks to the GraphQL API, not REST, so there is no bare "404" —
+# a nonexistent issue instead comes back as this exact GraphQL error (verified against a live `gh
+# issue view 999999`: `GraphQL: Could not resolve to an issue or pull request with the number of
+# 999999. (repository.issue)`). That is this script's equivalent of site/src/data/release.ts's
+# definitive 4xx: retrying it just spends the delay arriving at the same answer. Everything else —
+# HTTP 401/403/5xx, a secondary rate limit, a DNS blip, a bare network error — is transient and
+# worth retrying, the same split fetchOnce() makes against a real HTTP status.
+is_definitive_miss() {
+  case "$1" in
+    *'Could not resolve to an issue or pull request'*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# issue_state <number> -> prints "state<TAB>title" on stdout (state lowercased "open"/"closed"), or
+# fails with a non-zero exit and the underlying error on stderr. The ONE function in this script that
+# touches the network — everything above is pure so --self-test needs no connectivity.
+#
+# Retries a transient failure twice (three attempts total) before giving up, with a short delay
+# between attempts — the spec calls for this (Milestone 3: "retries twice and then fails") so a
+# single 403, secondary rate limit, or DNS blip does not hard-fail `commit-lint` on every open PR at
+# once. A definitive miss (see is_definitive_miss) is NOT retried: retrying it cannot change the
+# answer, and doing so anyway would just make a genuinely-absent issue read as a real API problem in
+# the log. CHECK_COPY_CLAIMS_RETRY_DELAYS overrides the delay ladder (space-separated seconds) so
+# --self-test can exercise the retry paths without real sleeps.
+issue_state() {
+  local n="$1" raw err err_file attempt=1
+  local delays=(${CHECK_COPY_CLAIMS_RETRY_DELAYS:-2 5})
+  local max_attempts=$(( ${#delays[@]} + 1 ))
+
+  # No `trap ... RETURN` here on purpose: a RETURN trap set inside a function replaces the CALLER's
+  # own RETURN trap process-wide for the rest of the run (verified — a trap set in an inner function
+  # fires in place of the outer function's own trap when the outer function later returns, with the
+  # inner function's now out-of-scope locals, tripping `set -u`). self_test relies on its own
+  # `trap ... RETURN` to clean up its tmp dir, so issue_state cleans up explicitly at every return
+  # instead of installing a trap that would clobber it.
+  err_file="$(mktemp)"
+
+  while :; do
+    if raw="$(_issue_lookup_once "$n" 2>"$err_file")"; then
+      rm -f "$err_file"
+      printf '%s\n' "$raw"
+      return 0
+    fi
+    err="$(cat "$err_file")"
+    if is_definitive_miss "$err" || [ "$attempt" -ge "$max_attempts" ]; then
+      rm -f "$err_file"
+      printf '%s\n' "$err" >&2
+      return 1
+    fi
+    echo "copy-claims: lookup of #$n failed (attempt $attempt/$max_attempts), retrying in ${delays[$((attempt - 1))]}s: $err" >&2
+    sleep "${delays[$((attempt - 1))]}"
+    attempt=$((attempt + 1))
+  done
 }
 
 # ------------------------------------------------------------------ thin orchestration (impure)
@@ -267,8 +322,62 @@ self_test() {
     esac
   }
   CHECK_COPY_CLAIMS_ISSUE_STATE_CMD=stub_issue_state
+  # Zero delay so the retry-path cases below (and any incidental retry through stub_issue_state's
+  # default `return 1` arm) run instantly rather than sleeping for real seconds.
+  CHECK_COPY_CLAIMS_RETRY_DELAYS='0 0'
 
   echo "check-copy-claims: verifying the pure core"
+
+  # ---- issue_state: retries a transient failure, does not retry a definitive one (Finding 1) ----
+  #
+  # Call counts are tallied through a FILE, not a shell variable: issue_state's own retry loop calls
+  # _issue_lookup_once inside a `$(...)` command substitution, which is a subshell, so a variable the
+  # stub increments there is discarded the instant that subshell exits — the parent's copy never
+  # moves. A file survives the subshell boundary the same way $tmp already does for the fixtures
+  # above. (Caught by running this exact shape stand-alone before landing it: with a plain variable,
+  # every attempt logged as "call 1" and the retry count read back as 0.)
+  local out2 got calls_file="$tmp/retry-calls"
+
+  bump_calls() { printf '%s' "$(($(cat "$calls_file") + 1))" > "$calls_file"; cat "$calls_file"; }
+
+  stub_flaky_then_ok() {
+    local n; n="$(bump_calls)"
+    if [ "$n" -lt 3 ]; then
+      echo "simulated transient failure (DNS blip)" >&2
+      return 1
+    fi
+    printf 'open\tSome Title\n'
+  }
+  printf '0' > "$calls_file"
+  CHECK_COPY_CLAIMS_ISSUE_STATE_CMD=stub_flaky_then_ok
+  if out2="$(issue_state 1 2>/dev/null)"; then got=pass; else got=fail; fi
+  if [ "$got" = pass ] && [ "$out2" = "$(printf 'open\tSome Title')" ] && [ "$(cat "$calls_file")" -eq 3 ]; then got=pass; else got=fail; fi
+  check "issue_state: retries a transient failure twice, succeeds on the 3rd attempt" pass "$got"
+
+  stub_always_fails() {
+    bump_calls >/dev/null
+    echo "simulated transient failure (503)" >&2
+    return 1
+  }
+  printf '0' > "$calls_file"
+  CHECK_COPY_CLAIMS_ISSUE_STATE_CMD=stub_always_fails
+  if issue_state 1 >/dev/null 2>&1; then got=fail; else got=pass; fi
+  if [ "$got" = pass ] && [ "$(cat "$calls_file")" -eq 3 ]; then got=pass; else got=fail; fi
+  check "issue_state: a persistent transient failure fails after 3 attempts (2 retries)" pass "$got"
+
+  stub_definitive_miss() {
+    bump_calls >/dev/null
+    echo 'GraphQL: Could not resolve to an issue or pull request with the number of 1. (repository.issue)' >&2
+    return 1
+  }
+  printf '0' > "$calls_file"
+  CHECK_COPY_CLAIMS_ISSUE_STATE_CMD=stub_definitive_miss
+  if issue_state 1 >/dev/null 2>&1; then got=fail; else got=pass; fi
+  if [ "$got" = pass ] && [ "$(cat "$calls_file")" -eq 1 ]; then got=pass; else got=fail; fi
+  check "issue_state: a definitive miss (issue genuinely absent) is NOT retried" pass "$got"
+
+  unset -f stub_flaky_then_ok stub_always_fails stub_definitive_miss bump_calls
+  CHECK_COPY_CLAIMS_ISSUE_STATE_CMD=stub_issue_state
 
   # ---- contradicts: prefix matching (required cases) ----
   local got
@@ -487,6 +596,7 @@ EOF
 
   unset -f stub_issue_state
   unset CHECK_COPY_CLAIMS_ISSUE_STATE_CMD
+  unset CHECK_COPY_CLAIMS_RETRY_DELAYS
 
   echo "check-copy-claims: $pass passed, $fail failed"
   [ "$fail" -eq 0 ]
