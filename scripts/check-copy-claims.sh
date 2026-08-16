@@ -260,9 +260,8 @@ issue_state() {
 # check_gap_closure <faq-file>
 #   stdout: "issue<TAB>state<TAB>title<TAB>gapWords" per gap: annotation (state "open"/"closed") —
 #           reused by the contradiction check below so each gap issue is fetched exactly once.
-#   stderr: one line per problem (a closed gap, or a lookup failure), or a note when there are no
-#           gap: annotations at all.
-#   returns 1 if any gap is closed or its lookup failed, 0 otherwise.
+#   stderr: one line per problem — a closed gap, a lookup failure, or zero gap: annotations at all.
+#   returns 1 if any gap is closed, its lookup failed, or there are zero gap: annotations; 0 otherwise.
 check_gap_closure() {
   local faq="$1" gaps status=0 issue question words result state title
   # Explicit `if !` check, not a bare `gaps="$(parse_gaps "$faq")"` relied on for `set -e` to catch:
@@ -278,8 +277,15 @@ check_gap_closure() {
     return 1
   fi
   if [ -z "$gaps" ]; then
-    echo "copy-claims: no gap: annotations in $faq — nothing to watch" >&2
-    return 0
+    # FAIL, not pass: this script's own header warns that a `gap:` nobody is watching is worse than
+    # no `gap:` at all, and a silent pass here is exactly that failure mode turned up to eleven — a
+    # reformat, a rewrite, or an unaware edit that drops every gap: annotation leaves this job GREEN
+    # while it guards nothing, with no signal anywhere that the guard is gone. Two are expected today
+    # (#55, #56); if a future PR genuinely removes the last one on purpose (both tracked limitations
+    # actually fixed), that PR can say so with the no-copy-review label like any other change here —
+    # the same escape hatch, not a silent zero-annotation pass carved out just for this case.
+    echo "copy-claims: FAIL — no gap: annotations in $faq; either every tracked limitation was fixed and this is expected (add the no-copy-review label), or a reformat/edit silently dropped them — this check exists precisely so a claim nobody is watching doesn't go unnoticed, and an empty result is indistinguishable from that until a human says otherwise" >&2
+    return 1
   fi
   while IFS=$'\t' read -r issue question words; do
     [ -n "$issue" ] || continue
@@ -701,9 +707,11 @@ const faqs = [
   },
 ] as const;
 EOF
-  if out="$(check_gap_closure "$faq" 2>&1)"; then got=pass; else got=fail; fi
+  # Zero gap: annotations FAILS (Minor 3) rather than passing silently: a reformat or an unaware edit
+  # that drops every annotation must not leave this job green while it guards nothing.
+  if out="$(check_gap_closure "$faq" 2>&1)"; then got=fail; else got=pass; fi
   if [ "$got" = pass ] && [[ "$out" == *"no gap:"* ]]; then got=pass; else got=fail; fi
-  check "check_gap_closure: no gap: annotations at all passes and says so" pass "$got"
+  check "check_gap_closure: zero gap: annotations FAILS rather than passing silently" pass "$got"
 
   cat > "$faq" <<'EOF'
 const faqs = [
