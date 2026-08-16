@@ -41,7 +41,8 @@ STOPWORDS=' agent agents terminal terminals daemon daemons pane panes window win
 
 # ------------------------------------------------------------------------- pure functions
 
-# parse_gaps <faq-file> -> prints "issue<TAB>question" per line, one per `gap:` annotation.
+# parse_gaps <faq-file> -> prints "issue<TAB>question<TAB>gapWords" per line, one per `gap:`
+# annotation. gapWords is empty when the entry carries no `gapWords:` line.
 #
 # Tracks the most recently seen `q: '...'` line so a `gap:` line under it can be reported with the
 # question it belongs to — a failure that only names an issue number sends whoever reads it hunting
@@ -49,6 +50,20 @@ STOPWORDS=' agent agents terminal terminals daemon daemons pane panes window win
 # after it) is rejected LOUDLY via die() rather than skipped: a `gap:` nobody is actually watching
 # because it failed to parse is worse than no `gap:` at all — it reads as "this is being tracked"
 # while tracking nothing.
+#
+# `gapWords: '...'` is an OPTIONAL second line under a `gap:`, carrying terms a release note would
+# plausibly use about that gap. It exists because issue titles are engineering jargon and release
+# notes are deliberately plain language (see AGENTS.md's release-note convention) — they systematically
+# don't share words, so title-only matching in check_fragment_contradictions can miss the exact case
+# it was built for (a partial fix landing while the tracking issue, correctly, stays open). A
+# `gapWords:` with no `gap:` immediately above it is rejected LOUDLY for the same reason a malformed
+# `gap:` is: it would read as "this is being tracked" while attaching to nothing.
+#
+# A `gap:` entry is buffered rather than printed the instant it's matched, specifically so a
+# `gapWords:` line immediately under it can still attach — printed output can't be edited after the
+# fact. The buffered entry is flushed (printed) on whichever comes first: the next `q:`, the next
+# `gap:`, the array's structural close, or a `gapWords:` line completing it (a `gap:` has at most one
+# `gapWords:`, so there's nothing further to wait for once it arrives).
 #
 # Two independent guards keep this from firing on content that has nothing to do with gap tracking
 # — both matter, and neither substitutes for the other:
@@ -67,7 +82,18 @@ STOPWORDS=' agent agents terminal terminals daemon daemons pane panes window win
 #     malformed one.
 parse_gaps() {
   local file="$1" question='' line value raw in_array=0
+  local pending_issue='' pending_question='' pending_words='' have_pending=0
   [ -f "$file" ] || die "no such file: $file"
+
+  # Flush the buffered gap: (+ optional gapWords:) entry, if any. A no-op when nothing is pending, so
+  # it's safe to call unconditionally at every point an entry might have ended.
+  flush() {
+    [ "$have_pending" -eq 1 ] || return 0
+    printf '%s\t%s\t%s\n' "$pending_issue" "$pending_question" "$pending_words"
+    have_pending=0
+    pending_words=''
+  }
+
   while IFS= read -r line; do
     if [ "$in_array" -eq 0 ]; then
       case "$line" in
@@ -78,10 +104,12 @@ parse_gaps() {
     # Structural close: first non-whitespace character is `]`, independent of what follows it on
     # the line (`as const;`, a trailing comment, nothing at all).
     if [[ "$line" =~ ^[[:space:]]*\] ]]; then
+      flush
       in_array=0
       continue
     fi
     if [[ "$line" =~ q:[[:space:]]*\'([^\']*)\' ]]; then
+      flush
       question="${BASH_REMATCH[1]}"
     elif [[ "$line" =~ ^[[:space:]]*gap:[[:space:]]*([^,/]*),?[[:space:]]*(//.*)?$ ]]; then
       # Capture the raw match into a plain variable BEFORE any further [[ =~ ]] test — a second
@@ -92,9 +120,20 @@ parse_gaps() {
       value="$(printf '%s' "$raw" | tr -d '[:space:]')"
       [[ "$value" =~ ^[0-9]+$ ]] \
         || die "malformed gap: annotation for '$question' in $file: '$raw' is not an issue number"
-      printf '%s\t%s\n' "$value" "$question"
+      flush
+      pending_issue="$value"
+      pending_question="$question"
+      have_pending=1
+    elif [[ "$line" =~ ^[[:space:]]*gapWords:[[:space:]]*\'([^\']*)\',?[[:space:]]*(//.*)?$ ]]; then
+      [ "$have_pending" -eq 1 ] \
+        || die "gapWords: annotation for '$question' in $file has no preceding gap: to attach to"
+      pending_words="${BASH_REMATCH[1]}"
+      flush
+    elif [[ "$line" =~ ^[[:space:]]*gapWords: ]]; then
+      die "malformed gapWords: annotation for '$question' in $file: expected a single-quoted string"
     fi
   done < "$file"
+  flush
 }
 
 # significant_words <title> -> prints the words worth matching on, one per line: lowercased, split on
@@ -219,13 +258,13 @@ issue_state() {
 # ------------------------------------------------------------------ thin orchestration (impure)
 
 # check_gap_closure <faq-file>
-#   stdout: "issue<TAB>state<TAB>title" per gap: annotation (state "open"/"closed") — reused by the
-#           contradiction check below so each gap issue is fetched exactly once.
+#   stdout: "issue<TAB>state<TAB>title<TAB>gapWords" per gap: annotation (state "open"/"closed") —
+#           reused by the contradiction check below so each gap issue is fetched exactly once.
 #   stderr: one line per problem (a closed gap, or a lookup failure), or a note when there are no
 #           gap: annotations at all.
 #   returns 1 if any gap is closed or its lookup failed, 0 otherwise.
 check_gap_closure() {
-  local faq="$1" gaps status=0 issue question result state title
+  local faq="$1" gaps status=0 issue question words result state title
   # Explicit `if !` check, not a bare `gaps="$(parse_gaps "$faq")"` relied on for `set -e` to catch:
   # this function is itself called as `gap_lines="$(check_gap_closure ...)" || status=1` from main,
   # and bash disables -e for the ENTIRE body of a function invoked in a context whose own exit
@@ -242,7 +281,7 @@ check_gap_closure() {
     echo "copy-claims: no gap: annotations in $faq — nothing to watch" >&2
     return 0
   fi
-  while IFS=$'\t' read -r issue question; do
+  while IFS=$'\t' read -r issue question words; do
     [ -n "$issue" ] || continue
     if ! result="$(issue_state "$issue")"; then
       echo "copy-claims: FAIL — could not look up #$issue (FAQ entry '$question'); a GitHub API error or an expired/missing token is the likely cause" >&2
@@ -251,7 +290,7 @@ check_gap_closure() {
     fi
     state="${result%%$'\t'*}"
     title="${result#*$'\t'}"
-    printf '%s\t%s\t%s\n' "$issue" "$state" "$title"
+    printf '%s\t%s\t%s\t%s\n' "$issue" "$state" "$title" "$words"
     if [ "$state" = "closed" ]; then
       echo "copy-claims: FAIL — FAQ entry '$question' is annotated gap: $issue, but #$issue is now closed; rewrite the answer in the same change that closed it" >&2
       status=1
@@ -261,23 +300,28 @@ check_gap_closure() {
 }
 
 # check_fragment_contradictions <gap-lines> <fragment-path>...
-#   gap-lines: "issue<TAB>state<TAB>title" per line, as produced by check_gap_closure. Only OPEN
-#   gaps are matched against — a closed gap has already failed check_gap_closure, so flagging it
-#   again here would just be noise stacked on the real failure.
-#   returns 1 if any fragment contradicts any open gap's title.
+#   gap-lines: "issue<TAB>state<TAB>title<TAB>gapWords" per line, as produced by check_gap_closure.
+#   Only OPEN gaps are matched against — a closed gap has already failed check_gap_closure, so
+#   flagging it again here would just be noise stacked on the real failure.
+#   returns 1 if any fragment contradicts any open gap's title (or its gapWords — see contradicts's
+#   caller below, which matches against the two concatenated).
 check_fragment_contradictions() {
   local gap_lines="$1" status=0
   shift
   [ -n "$gap_lines" ] || return 0
-  local frag text gissue gstate gtitle
+  local frag text gissue gstate gtitle gwords
   for frag in "$@"; do
     [ -n "$frag" ] || continue
     [ -f "$frag" ] || continue
     text="$(cat "$frag")"
-    while IFS=$'\t' read -r gissue gstate gtitle; do
+    while IFS=$'\t' read -r gissue gstate gtitle gwords; do
       [ -n "$gissue" ] || continue
       [ "$gstate" = "open" ] || continue
-      if contradicts "$text" "$gtitle"; then
+      # gwords is appended to the title before matching, not passed separately: significant_words
+      # already lowercases, splits on non-alnum, and drops stopwords/short words, so concatenating
+      # plain-language gapWords terms onto the title and running them through the same filter needs
+      # no new logic — see parse_gaps's gapWords: comment for why title matching alone can miss this.
+      if contradicts "$text" "$gtitle $gwords"; then
         echo "copy-claims: FAIL — $frag shares wording with open gap #$gissue ('$gtitle'); if this change closes that gap, update the FAQ entry in the same pull request" >&2
         status=1
       fi
@@ -470,7 +514,7 @@ as const;
 </style>
 EOF
   if out="$(parse_gaps "$faq" 2>&1)"; then got=pass; else got=fail; fi
-  if [ "$got" = pass ] && [ "$out" = "$(printf '55\tWhat happens to my agents when I close the window?')" ]; then got=pass; else got=fail; fi
+  if [ "$got" = pass ] && [ "$out" = "$(printf '55\tWhat happens to my agents when I close the window?\t')" ]; then got=pass; else got=fail; fi
   check "parse_gaps: array close survives ] and as const; on separate lines" pass "$got"
 
   # ---- parse_gaps: prose containing 'gap:' does not break the check (Finding 2) ----
@@ -490,7 +534,7 @@ const faqs = [
 ] as const;
 EOF
   if out="$(parse_gaps "$faq" 2>&1)"; then got=pass; else got=fail; fi
-  if [ "$got" = pass ] && [ "$out" = "$(printf '55\tWhat happens to my agents when I close the window?')" ]; then got=pass; else got=fail; fi
+  if [ "$got" = pass ] && [ "$out" = "$(printf '55\tWhat happens to my agents when I close the window?\t')" ]; then got=pass; else got=fail; fi
   check "parse_gaps: prose containing 'gap:' is not treated as an annotation" pass "$got"
 
   # ---- parse_gaps: a commented-out annotation is not live (Minor 3, resolved by the Finding 2 anchor) ----
@@ -506,6 +550,86 @@ EOF
   if out="$(parse_gaps "$faq" 2>&1)"; then got=pass; else got=fail; fi
   if [ "$got" = pass ] && [ -z "$out" ]; then got=pass; else got=fail; fi
   check "parse_gaps: a commented-out '// gap: 56,' is not a live annotation" pass "$got"
+
+  # ---- parse_gaps: gapWords: attaches to the preceding gap: (Finding 2) ----
+  cat > "$faq" <<'EOF'
+const faqs = [
+  {
+    q: 'What happens to my agents when I close the window?',
+    a: 'They keep running.',
+    gap: 55,
+    // Terms a release note would plausibly use about this gap.
+    gapWords: 'resume restore vanish',
+  },
+] as const;
+EOF
+  if out="$(parse_gaps "$faq" 2>&1)"; then got=pass; else got=fail; fi
+  if [ "$got" = pass ] && [ "$out" = "$(printf '55\tWhat happens to my agents when I close the window?\tresume restore vanish')" ]; then got=pass; else got=fail; fi
+  check "parse_gaps: gapWords: attaches to the preceding gap: annotation" pass "$got"
+
+  # ---- parse_gaps: gapWords: with no preceding gap: dies loudly, same philosophy as a malformed
+  # gap: — an annotation nobody is actually watching is worse than none at all. ----
+  cat > "$faq" <<'EOF'
+const faqs = [
+  {
+    q: 'Does it work on Linux or Windows?',
+    a: 'Not yet.',
+    gapWords: 'resume restore vanish',
+  },
+] as const;
+EOF
+  if out="$(parse_gaps "$faq" 2>&1)"; then rc=0; else rc=$?; fi
+  if [ "$rc" -ne 0 ] && [[ "$out" == *"no preceding gap:"* ]]; then got=pass; else got=fail; fi
+  check "parse_gaps: gapWords: with no preceding gap: dies loudly" pass "$got"
+
+  # ---- check_fragment_contradictions: gapWords catches what title-only matching cannot (Finding 2)
+  # ----
+  # The concrete miss this exists for: v0.4.0's real release note describes partial daemon-restart
+  # recovery in plain language while #55 ("M9c — PTY-host true zero-disruption agent survival") stays
+  # open — title-only matching shares ZERO words with that note (disruption/survival/pty all miss).
+  # gapWords carries the plain-language terms the note actually uses.
+  #
+  # gap_lines_gw is produced by the REAL check_gap_closure (stub_issue_state answers #55), not typed
+  # in by hand: a hand-rolled 4th field would still limp through the OLD, gapWords-unaware
+  # check_fragment_contradictions, because bash's `read` folds any extra fields into the last named
+  # variable — a 3-var `read` given 4 tab-separated fields quietly appends the 4th to gtitle instead
+  # of erroring. Routing through parse_gaps -> check_gap_closure is what makes the "does this actually
+  # need the fix" question honest: unfixed parse_gaps has no gapWords: handling at all, so this path
+  # is the one that genuinely can't fake a pass.
+  local faq_gw gap_lines_gw frag_hit frag_nohit
+  faq_gw="$tmp/faq-gapwords.astro"
+  cat > "$faq_gw" <<'EOF'
+const faqs = [
+  {
+    q: 'What happens to my agents when I close the window?',
+    a: 'They keep running.',
+    gap: 55,
+    gapWords: 'resume restore vanish',
+  },
+] as const;
+EOF
+  gap_lines_gw="$(check_gap_closure "$faq_gw" 2>/dev/null)"
+
+  frag_hit="$tmp/frag-hit.md"
+  cat > "$frag_hit" <<'EOF'
+If the daemon has to restart, the agents that were running come back on their own, with their
+conversation resumed and their split layout restored, instead of just vanishing.
+EOF
+  # Confirms the miss is real before confirming the fix: title alone (no gapWords) does not catch
+  # this fragment — if it did, the case below would prove nothing about gapWords specifically.
+  if contradicts "$(cat "$frag_hit")" 'M9c — PTY-host true zero-disruption agent survival'; then got=fail; else got=pass; fi
+  check "check_fragment_contradictions: title alone misses the v0.4.0-shaped note (the bug)" pass "$got"
+
+  if check_fragment_contradictions "$gap_lines_gw" "$frag_hit" >/dev/null 2>&1; then got=fail; else got=pass; fi
+  check "check_fragment_contradictions: gapWords catches the note title matching alone misses" pass "$got"
+
+  frag_nohit="$tmp/frag-nohit.md"
+  cat > "$frag_nohit" <<'EOF'
+Manage remote hosts from a dedicated Settings pane: add and pair them over TLS, then switch between
+local and remote from the sidebar connection chip.
+EOF
+  if check_fragment_contradictions "$gap_lines_gw" "$frag_nohit" >/dev/null 2>&1; then got=pass; else got=fail; fi
+  check "check_fragment_contradictions: unrelated fragment matches neither title nor gapWords" pass "$got"
 
   # ---- check_gap_closure: a malformed gap: must still fail loudly through the SAME calling shape
   # main() uses (`gap_lines="$(check_gap_closure ...)" || status=1`). A bare, unguarded assignment

@@ -351,6 +351,22 @@ shape as the release-note rule, so there is one mechanism to learn rather than t
    for a human, the label is the answer when the prompt is wrong, and the threshold is tuned against
    the real corpus rather than guessed.
 
+   **Title matching alone does not cover the case above** — that was this milestone's own mistake,
+   caught in the final review rather than before it shipped. v0.4.0's real release note ("the agents
+   that were running come back on their own... with their conversation resumed and their split layout
+   restored") shares **zero** significant words with #55's title ("M9c — PTY-host true zero-disruption
+   agent survival"): `disruption` 0, `survival` 0, `pty` 0. That is not a tuning gap; it is structural.
+   Milestone 1 *requires* release notes to be written in plain, user-facing language, while issue
+   titles are engineering jargon by convention — the two vocabularies are deliberately kept apart, so
+   they systematically don't overlap on the exact cases this check exists to catch. Widening the
+   stopword list cannot fix a problem that isn't about noise words.
+
+   What actually covers it: a `gap:` annotation may carry a second line, `gapWords: '...'`, naming
+   terms a release note would plausibly use about that gap in the product's own plain language. Those
+   terms are matched the same way the title is — concatenated onto it before the significant-words
+   filter runs — so `gapWords: 'resume restore vanish'` on #55 is what actually catches v0.4.0's note,
+   not the title.
+
 The check calls the issues API, so it **retries twice and then fails** rather than passing silently —
 the same reasoning that makes `check-runs-state.sh` treat a check that did not execute as failed. Its
 message names an API error as a possible cause, so nobody reads a blip as a real contradiction.
