@@ -57,6 +57,10 @@ jobs:
       # repo's issues API 403s without this, which the script reports indistinguishably from a
       # real API outage.
       issues: read
+      # `Resolve pull request labels` calls `gh pr view`, which goes through the pull request API
+      # rather than the issues API. Without this the label lookup 403s and BOTH escape hatches
+      # (`no-release-note`, `no-copy-review`) become unusable.
+      pull-requests: read
     steps:
       - uses: actions/checkout@v4
         with:
@@ -109,13 +113,37 @@ jobs:
       - name: collect-release-notes.sh self-tests
         run: scripts/collect-release-notes.sh --self-test
 
+      # Resolve the labels from the API rather than from `github.event.pull_request.labels`.
+      #
+      # That expression reads the event payload, which is FROZEN at the moment the run was created.
+      # Re-running a job replays the original payload, so a label added after the first failure is
+      # invisible on the re-run — making the documented escape ("add the label, then re-run the
+      # failed job") silently not work. Verified on PR #99: the label was added at 17:43:00Z and the
+      # re-run started at 17:43:31Z, yet the check still saw no labels, because the run itself was
+      # created at 12:28Z.
+      #
+      # Empty outside a pull request, which is still correct: the release bump commit is `chore:`
+      # and requires no note.
+      - name: Resolve pull request labels
+        id: labels
+        env:
+          PR: ${{ github.event.pull_request.number }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -z "$PR" ]; then
+            echo "names=" >> "$GITHUB_OUTPUT"
+            echo "not a pull request — no labels to resolve"
+            exit 0
+          fi
+          names="$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json labels --jq '[.labels[].name] | join(",")')"
+          echo "names=$names" >> "$GITHUB_OUTPUT"
+          echo "labels: ${names:-<none>}"
+
       - name: Release notes
         env:
           BASE: ${{ github.event.pull_request.base.sha || 'origin/main' }}
           HEAD_REF: ${{ github.event.pull_request.head.sha || github.sha }}
-          # Comma-joined so the script needs no `gh` call and stays unit-testable. Empty outside a
-          # pull request, which is correct: the bump commit is `chore:` and requires no note.
-          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          PR_LABELS: ${{ steps.labels.outputs.names }}
         run: scripts/check-release-notes.sh "$BASE" "$HEAD_REF"
 
       - name: check-copy-claims.sh self-tests
@@ -125,7 +153,7 @@ jobs:
         env:
           BASE: ${{ github.event.pull_request.base.sha || 'origin/main' }}
           HEAD_REF: ${{ github.event.pull_request.head.sha || github.sha }}
-          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          PR_LABELS: ${{ steps.labels.outputs.names }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: scripts/check-copy-claims.sh "$BASE" "$HEAD_REF"
 
