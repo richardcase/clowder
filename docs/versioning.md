@@ -104,7 +104,13 @@ distinct causes the workflow reports:
 
 - *a required check concluded non-success* — including `cancelled`, `skipped` and `neutral`, which
   GitHub's rulesets count as passing but a release deliberately does not: a check that did not
-  execute has not vouched for anything.
+  execute has not vouched for anything. `commit-lint` can land here specifically because of
+  `scripts/check-copy-claims.sh`: `ci.yml` dispatches on the bump branch via `workflow_dispatch`, so
+  `github.event.pull_request` is unset and `PR_LABELS` is empty on that run — the `no-copy-review`
+  escape hatch is unavailable on the bump SHA no matter what label the bump PR itself carries. A
+  genuinely closed gap failing here is arguably correct (fix the FAQ, re-dispatch); a transient API
+  problem failing here is just an unexplained release failure — re-run the `commit-lint` job by hand
+  once it clears.
 - *a required check is still missing* (60-minute deadline) — the `Start CI` dispatch is what makes
   the required checks run; check that `ci.yml` still accepts `workflow_dispatch`. Note that the
   required context `build + test (macOS, unsigned)` is now reported by `required-build-gate`, a job
