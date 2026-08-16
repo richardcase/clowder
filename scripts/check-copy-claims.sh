@@ -49,27 +49,41 @@ STOPWORDS=' agent agents terminal terminals daemon daemons pane panes window win
 # after it) is rejected LOUDLY via die() rather than skipped: a `gap:` nobody is actually watching
 # because it failed to parse is worse than no `gap:` at all — it reads as "this is being tracked"
 # while tracking nothing.
+#
+# Two independent guards keep this from firing on content that has nothing to do with gap tracking
+# — both matter, and neither substitutes for the other:
+#
+#   - The array boundary (in_array) is STRUCTURAL, not a literal-string match on `] as const;`. A
+#     literal match breaks the moment the file is reformatted so `]` and `as const;` land on
+#     separate lines: in_array would never return to 0, the scan would walk into the file's <style>
+#     block, and its CSS `gap` property (flex/grid spacing — this file has one) would die as a
+#     malformed annotation. Detecting the close as "first non-whitespace character is `]`" survives
+#     `as const;` moving, a trailing comment, or the semicolon changing.
+#   - The annotation line itself is ANCHORED to the whole line (`^...gap:...$`), not matched as a
+#     substring anywhere in it. An unanchored match treats prose like `a: 'There is a gap: between
+#     panes…'` as an annotation attempt, fails the numeric check, and dies on a copy edit that has
+#     nothing to do with gap tracking. Anchoring also means a commented-out `// gap: 56,` no longer
+#     matches at all (the line starts with `//`, not `gap:`) — it's just not an annotation, not a
+#     malformed one.
 parse_gaps() {
   local file="$1" question='' line value raw in_array=0
   [ -f "$file" ] || die "no such file: $file"
   while IFS= read -r line; do
-    # Scoped to the `const faqs = [ ... ] as const;` array literal only. Faq.astro is a whole .astro
-    # component: the same file's <style> block sets the CSS `gap` property (flex/grid spacing) on
-    # unrelated rules, and an unscoped scan treats "gap: 1px;" exactly like a `gap: <issue>`
-    # annotation — a real false positive, caught by running this against the actual FAQ file rather
-    # than only hand-built fixtures.
     if [ "$in_array" -eq 0 ]; then
       case "$line" in
         *'const faqs = ['*) in_array=1 ;;
       esac
       continue
     fi
-    case "$line" in
-      *'] as const;'*) in_array=0; continue ;;
-    esac
+    # Structural close: first non-whitespace character is `]`, independent of what follows it on
+    # the line (`as const;`, a trailing comment, nothing at all).
+    if [[ "$line" =~ ^[[:space:]]*\] ]]; then
+      in_array=0
+      continue
+    fi
     if [[ "$line" =~ q:[[:space:]]*\'([^\']*)\' ]]; then
       question="${BASH_REMATCH[1]}"
-    elif [[ "$line" =~ gap:[[:space:]]*([^,/]*) ]]; then
+    elif [[ "$line" =~ ^[[:space:]]*gap:[[:space:]]*([^,/]*),?[[:space:]]*(//.*)?$ ]]; then
       # Capture the raw match into a plain variable BEFORE any further [[ =~ ]] test — a second
       # regex test (the numeric check below) overwrites BASH_REMATCH even when it fails, so reading
       # BASH_REMATCH[1] again afterward for the error message would hit an unset element under
@@ -128,14 +142,19 @@ contradicts() {
 # issue_state <number> -> prints "state<TAB>title" on stdout (state lowercased "open"/"closed"), or
 # fails with a non-zero exit and the underlying tool's own error on stderr. The ONE function in this
 # script that touches the network — everything above is pure so --self-test needs no connectivity.
-# ISSUE_STATE_CMD lets a caller (the self-test, or an operator debugging offline) point this at a
-# stub instead of `gh`; state and title travel together so a single lookup serves both the
-# gap-closure check and the contradiction check's title-matching, rather than fetching the same
-# issue twice.
+# CHECK_COPY_CLAIMS_ISSUE_STATE_CMD lets a caller (the self-test, or an operator debugging offline)
+# point this at a stub instead of `gh`; state and title travel together so a single lookup serves
+# both the gap-closure check and the contradiction check's title-matching, rather than fetching the
+# same issue twice. Namespaced with the script's own name, not a generic ISSUE_STATE_CMD: a bare
+# name risks a stray environment variable silently swapping the real `gh` call for a stub in a REAL
+# run, not just under --self-test. Deliberately still honoured outside --self-test too (not gated
+# to it) — the offline-debugging use case is real and the long, script-specific name already makes
+# an accidental collision implausible; gating it would remove that use case for a marginal further
+# reduction in an already-small risk.
 issue_state() {
   local n="$1" raw
-  if [ -n "${ISSUE_STATE_CMD:-}" ]; then
-    "$ISSUE_STATE_CMD" "$n"
+  if [ -n "${CHECK_COPY_CLAIMS_ISSUE_STATE_CMD:-}" ]; then
+    "$CHECK_COPY_CLAIMS_ISSUE_STATE_CMD" "$n"
     return $?
   fi
   raw="$(gh issue view "$n" --json state,title --jq '(.state | ascii_downcase) + "\t" + .title')" || return 1
@@ -247,7 +266,7 @@ self_test() {
       *) return 1 ;;
     esac
   }
-  ISSUE_STATE_CMD=stub_issue_state
+  CHECK_COPY_CLAIMS_ISSUE_STATE_CMD=stub_issue_state
 
   echo "check-copy-claims: verifying the pure core"
 
@@ -319,6 +338,65 @@ const faqs = [
 EOF
   if out="$(parse_gaps "$faq" 2>&1)"; then got=pass; else got=fail; fi
   check "parse_gaps: CSS 'gap:' outside the array is not an annotation" pass "$got"
+
+  # ---- parse_gaps: array close survives reformatting (Finding 1) ----
+  # `]` and `as const;` on SEPARATE lines — a literal `*'] as const;'*` match never fires here, so
+  # in_array would stay 1 forever and the scan would walk into the CSS gap below and die. The
+  # structural check ("first non-whitespace char is ]") must close the array on the bare `]` line
+  # regardless of what (if anything) follows it.
+  cat > "$faq" <<'EOF'
+const faqs = [
+  {
+    q: 'What happens to my agents when I close the window?',
+    a: 'They keep running.',
+    gap: 55,
+  },
+]
+as const;
+---
+<style>
+  .faq__list {
+    gap: 1px;
+  }
+</style>
+EOF
+  if out="$(parse_gaps "$faq" 2>&1)"; then got=pass; else got=fail; fi
+  if [ "$got" = pass ] && [ "$out" = "$(printf '55\tWhat happens to my agents when I close the window?')" ]; then got=pass; else got=fail; fi
+  check "parse_gaps: array close survives ] and as const; on separate lines" pass "$got"
+
+  # ---- parse_gaps: prose containing 'gap:' does not break the check (Finding 2) ----
+  # An FAQ answer using the word "gap" in an ordinary sentence must not be mistaken for an
+  # annotation attempt — only a line that IS a gap: annotation (anchored, start to end) counts.
+  cat > "$faq" <<'EOF'
+const faqs = [
+  {
+    q: 'Will splits overlap?',
+    a: 'There is a gap: between panes so they never touch.',
+  },
+  {
+    q: 'What happens to my agents when I close the window?',
+    a: 'They keep running.',
+    gap: 55,
+  },
+] as const;
+EOF
+  if out="$(parse_gaps "$faq" 2>&1)"; then got=pass; else got=fail; fi
+  if [ "$got" = pass ] && [ "$out" = "$(printf '55\tWhat happens to my agents when I close the window?')" ]; then got=pass; else got=fail; fi
+  check "parse_gaps: prose containing 'gap:' is not treated as an annotation" pass "$got"
+
+  # ---- parse_gaps: a commented-out annotation is not live (Minor 3, resolved by the Finding 2 anchor) ----
+  cat > "$faq" <<'EOF'
+const faqs = [
+  {
+    q: 'Does it work on Linux or Windows?',
+    a: 'Not yet.',
+    // gap: 56,
+  },
+] as const;
+EOF
+  if out="$(parse_gaps "$faq" 2>&1)"; then got=pass; else got=fail; fi
+  if [ "$got" = pass ] && [ -z "$out" ]; then got=pass; else got=fail; fi
+  check "parse_gaps: a commented-out '// gap: 56,' is not a live annotation" pass "$got"
 
   # ---- check_gap_closure: a malformed gap: must still fail loudly through the SAME calling shape
   # main() uses (`gap_lines="$(check_gap_closure ...)" || status=1`). A bare, unguarded assignment
@@ -408,7 +486,7 @@ EOF
   check "check_gap_closure: issue_state failure fails, naming API error as a cause" pass "$got"
 
   unset -f stub_issue_state
-  unset ISSUE_STATE_CMD
+  unset CHECK_COPY_CLAIMS_ISSUE_STATE_CMD
 
   echo "check-copy-claims: $pass passed, $fail failed"
   [ "$fail" -eq 0 ]
