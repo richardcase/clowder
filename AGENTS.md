@@ -313,3 +313,23 @@ is now the one place that computes it, and the app is the only caller that passe
   requirement and the content: this repo is private and the site is public, so a note that leaks a
   `#123` PR reference, a milestone scope like `m11a`, or a link to the private repo fails the guard —
   see the script's own comments for the full pattern rationale.
+- **A FAQ entry that states a limitation carries `gap: <issue>`** (`site/src/components/Faq.astro`) —
+  a promise that the claim holds only while that issue stays open. `scripts/check-copy-claims.sh`
+  checks the issue's state on every PR and fails the moment it closes, so whoever closes the issue
+  rewrites the FAQ answer in the same change, instead of the site quietly going stale until someone
+  notices. It separately fails when a release-note fragment added in the PR shares distinctive wording
+  with an *open* gap's issue title — not a verdict on the claim itself, but a prompt: that overlap
+  usually means the gap is about to close and the FAQ entry needs the same treatment in the same PR.
+  `no-copy-review` is the escape hatch, read from `PR_LABELS` the same way `no-release-note` is above,
+  and reported in the job summary; adding it after the fact doesn't retrigger CI either, for the same
+  reason — add the label, then re-run the failed `commit-lint` job by hand. The check watches
+  limitation claims and deliberately not `Features.astro`'s positive ones: a positive claim stays true
+  as the product grows, but a limitation claim is true only until someone fixes the thing — and the
+  person fixing it is deep in Rust, not reading marketing copy. Of the four corrections this site has
+  needed across the two milestones before this check existed, none touched `Features.astro` and both
+  FAQ corrections were limitations — evidence for scoping the gate there rather than "improving" it to
+  cover all copy. The annotation itself only counts alone on its own line inside the `const faqs = [
+  … ]` array literal: prose that mentions `gap:` and a commented-out `gap:` line both don't count, and
+  the array boundary is detected structurally rather than by matching literal `] as const;`, because
+  `Faq.astro`'s `<style>` block legitimately has its own CSS `gap:` declarations that a literal match
+  would misread as annotations.

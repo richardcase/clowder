@@ -187,4 +187,9 @@ gh label create release -c 0E8A16 -d "Automated release version bump"
 # release tooling) — scripts/check-release-notes.sh accepts this label in place of a fragment under
 # site/src/content/unreleased/. Must exist before the first PR that needs it.
 gh label create no-release-note -c BFD4F2 -d "Change needs no release note"
+
+# The escape hatch for scripts/check-copy-claims.sh: a PR that touches a FAQ gap: entry or an
+# overlapping release-note fragment on purpose, with no correction needed. Same shape as
+# no-release-note above — must exist before the first PR that needs it.
+gh label create no-copy-review -c FBCA04 -d "Copy claims reviewed; no change needed"
 ```
