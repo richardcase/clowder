@@ -3,6 +3,10 @@
 // <main> to be exposed as a top-level `contentinfo` landmark — nested inside it,
 // screen-reader landmark navigation cannot reach it. The closing CTA that used to
 // live here is page content and moved to CallToAction.astro.
+//
+// The nav links are root-relative (`/#features`, not `#features`): this footer is
+// shared with /whats-new (Nav.astro has the same fix, for the same reason — a bare
+// fragment is dead from any route but the homepage).
 import { site } from '../data/site';
 import { getRelease } from '../data/release';
 
@@ -25,10 +29,11 @@ const year = new Date().getFullYear();
     </div>
 
     <nav class="footer__nav" aria-label="Footer">
-      <a href="#features">Features</a>
-      <a href="#architecture">How it works</a>
-      <a href="#install">Install</a>
-      <a href="#faq">FAQ</a>
+      <a href="/#features">Features</a>
+      <a href="/#architecture">How it works</a>
+      <a href="/#install">Install</a>
+      <a href="/#faq">FAQ</a>
+      <a href="/whats-new">What's new</a>
       <a href={site.tapRepo}>Homebrew tap</a>
     </nav>
 

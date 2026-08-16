@@ -237,6 +237,18 @@ is now the one place that computes it, and the app is the only caller that passe
   counts as failed, which is strictly worse.
 - **`deploy-site.yml` must never gain a `pull_request` trigger.** It holds `pages: write` and
   `id-token: write`, in the same repo as `DOPPLER_TOKEN` and the signing path.
+- **`getclowder.app` is fronted by Cloudflare, and Pages' "Enforce HTTPS" is deliberately off.**
+  GitHub cannot complete its ACME challenge for a proxied domain, so `https_enforced` stays `false`
+  by necessity — don't go looking for the toggle, and don't file it as a defect. TLS termination, the
+  HTTP→HTTPS redirect (**Always Use HTTPS**) and the encryption mode (**Full**/**Full (strict)**;
+  Flexible would leave the Cloudflare→Pages leg in plain HTTP) all live in Cloudflare. DNS resolves to
+  Cloudflare IPs, not the GitHub Pages apex range, which is how you can tell from outside.
+- **A failed site deploy does not retry itself.** `deploy-site.yml` fires on push, schedule and
+  dispatch — nothing re-runs a failed run. The 2026-08-15 cutover took the site down for ~20 minutes
+  exactly this way: the merge-triggered run failed because Pages was not yet enabled on this repo, the
+  domain was then moved across, and no deploy ran again until someone dispatched one by hand. After
+  any Pages or domain change, dispatch `deploy-site.yml` and confirm `https://getclowder.app` returns
+  200 before walking away.
 
 ## CI
 
@@ -290,3 +302,14 @@ is now the one place that computes it, and the app is the only caller that passe
   PRs merge with a merge commit, so **every** commit on the branch keeps its
   subject in `main`'s history — CI checks them individually. Run
   `scripts/check-commit-messages.sh` before pushing.
+- **Every `feat`/`fix` PR adds a release-note fragment** to `site/src/content/unreleased/` — one file,
+  one or two sentences, one user-facing capability described in plain language (`Connect the app to a
+  Clowder daemon on another machine over TLS.`), not a CLI surface dump and not a change record. If
+  the change is genuinely internal and no user could perceive it — a CI fix, a refactor of the release
+  tooling — add the `no-release-note` label instead of inventing a note; because `labeled` is not
+  among the default `pull_request` activity types `ci.yml` reacts to, adding the label after the fact
+  needs a manual re-run of the `commit-lint` job (and isn't wired to also re-run the macOS build, which
+  would otherwise rebuild on every label toggle). `scripts/check-release-notes.sh` enforces both the
+  requirement and the content: this repo is private and the site is public, so a note that leaks a
+  `#123` PR reference, a milestone scope like `m11a`, or a link to the private repo fails the guard —
+  see the script's own comments for the full pattern rationale.

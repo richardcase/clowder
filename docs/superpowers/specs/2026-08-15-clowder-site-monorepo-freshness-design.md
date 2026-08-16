@@ -129,13 +129,28 @@ already accepts it.
 **Do not** add a check that `VERSION` matches the tap's latest version. It becomes tempting once both
 are local, and it would fail the deploy during exactly that normal window.
 
-**Domain cutover.** GitHub allows one repository per custom domain, so this is a hard switch rather
-than a parallel run: merge with Pages still served from `clowder-site`; dispatch `deploy-site.yml`
-and confirm the artifact; remove the custom domain from `clowder-site` and disable its Pages; enable
-Pages on this repo with source *GitHub Actions* and set `getclowder.app`; re-tick **Enforce HTTPS**
-once the certificate re-provisions, which can take up to an hour and is the visible-downtime step.
+**Domain cutover** *(completed 2026-08-15; recorded here as it actually happened, because the
+original order caused an outage)*. GitHub allows one repository per custom domain, so this is a hard
+switch rather than a parallel run: merge with Pages still served from `clowder-site`; dispatch
+`deploy-site.yml` and confirm the artifact; remove the custom domain from `clowder-site` and disable
+its Pages; enable Pages on this repo with source *GitHub Actions* and set `getclowder.app`.
 `public/CNAME` moves with the source, so DNS is unchanged. Archive `clowder-site` rather than
 deleting it — it keeps the public history and the pre-cutover state.
+
+**Then dispatch `deploy-site.yml` immediately.** This is the step the original plan lacked, and its
+absence took the site down. PR #94 merged at 14:26:58 and `deploy-site.yml` fired three seconds
+later; `build` passed and `deploy` failed `404 — Ensure GitHub Pages has been enabled`, because Pages
+was not yet enabled here. Pages and the domain were then moved across, but **nothing re-triggered the
+deploy** — the merge-triggered run is spent and does not retry — so `getclowder.app` served 404 until
+a manual dispatch at 14:46:57.
+
+**There is no "re-tick Enforce HTTPS" step, and there cannot be.** `getclowder.app` is fronted by
+**Cloudflare** (DNS resolves to `104.21.28.148` / `172.67.146.190`; responses carry `server:
+cloudflare`). GitHub Pages cannot complete its ACME challenge for a proxied domain, so
+`https_enforced` stays `false` by necessity rather than oversight — do not go looking for the toggle.
+TLS termination, the HTTP→HTTPS redirect (**Always Use HTTPS**) and the encryption mode
+(**Full**/**Full (strict)** — never Flexible, which leaves the Cloudflare→Pages leg in plain HTTP)
+are all configured in Cloudflare, not in GitHub.
 
 **Guard the new boundary.** `site/scripts/audit.sh` keeps both existing checks; the private-repo link
 check is *more* relevant now, not less. Add a third guarding the new boundary. "Nothing outside
@@ -149,19 +164,44 @@ whose failure mode is a silent pass is worse than no guard.
 
 ### Milestone 1 — a public release-notes channel
 
-**Fragments.** Each user-facing change adds one file,
-`site/src/content/releases/unreleased/<slug>.md` — one or two sentences aimed at a visitor. One file
-per change, so parallel branches never conflict.
+**Audience.** `/whats-new` is written for an existing user deciding whether to upgrade, and doubles
+as a liveness signal — at six releases in twelve days, a dated feed is itself evidence the project
+ships. A fragment therefore states **one user-facing capability in plain language**: "connect the app
+to a Clowder daemon on another machine over TLS", not "added `clowder remote
+add|list|show|set|rm|probe|trust|untrust`". It is not a complete change record, and it is not
+marketing copy — the Features section is that, and Milestone 3 is what keeps it honest.
 
-They live under `site/` rather than `docs/` deliberately: Astro's content collections read them
-natively with no loader configuration pointed outside the project root. The tradeoff is a product
-artifact filed under the site tree, which is worth not fighting Astro's root boundary for.
+**Fragments.** Each user-facing change adds one file, `site/src/content/unreleased/<slug>.md` — one
+or two sentences. One file per change, so parallel branches never conflict.
+
+They are a **sibling** of `site/src/content/releases/`, never nested inside it. Nesting works only
+while the collection's glob pattern stays `*.md`; a later change to `**/*.md` would silently render
+in-flight notes as shipped releases, and the sibling layout costs nothing to avoid that.
+
+They live under `site/` rather than `docs/` because **everything that consumes them is site-scoped**:
+`deploy-site.yml` filters on `paths: [site/**]`, so notes under `docs/` would change the site's
+content without triggering a deploy; `scripts/changed-scope.sh` classifies `docs/` as `product`, so a
+notes-only change would burn a full macOS build; and the renderer lives there. (An earlier draft
+claimed Astro could not load from outside its root. That is false — the `glob` loader's `base` is
+"relative to the root directory, or an absolute file URL", and its own error message says *"Glob
+patterns cannot start with `../`. Set the `base` option to a parent directory instead."* Astro was
+never the constraint.) The price is `update-homebrew-tap.sh`, a release script, reading a path inside
+the marketing site.
 
 **A new `scripts/check-release-notes.sh`**, wired into the existing `commit-lint` job:
 
-- a pull request whose commits include a `feat` requires an added fragment; `fix` does not, since
-  most fixes are invisible to users, but may add one
-- escape hatch: a `no-release-note` label, reported in the job summary so skipping is a visible choice
+- a pull request whose commits include a `feat` **or** a `fix` requires an added fragment — **per pull
+  request, not per commit**, so three fixes need one note. Measured against real history, this is not
+  the burden it sounds: of ~157 `feat`/`fix` commits since v0.3.0, only seven are non-user-facing
+  (`fix(ci)` ×4, `fix(site)`, `fix(review)`, `fix(release)`).
+- escape hatch: a `no-release-note` label, reported in the job summary so skipping is a visible
+  choice. Labelling does **not** re-trigger CI — `labeled` is not among the default `pull_request`
+  activity types, and adding it would re-run the macOS build on every toggle — so the flow is: label,
+  then **Re-run failed jobs**, which re-runs `commit-lint` alone since nothing depends on it. The
+  label needs creating once, like the `release` label (see the one-time setup in `versioning.md`).
+- the failure message must say outright that an internal-only fix should take the label rather than
+  invent filler. Requiring a note on every `fix` creates pressure to write noise; the guidance belongs
+  where it is hit.
 - **content guard** — reject `github.com/richardcase/clowder`,
   `github.com/defiantsoftware/clowder([/"?#]|$)`, `#\d+` pull request references, and internal
   milestone tokens (`\bm\d+[a-z]?\b`). This is the private→public boundary: this repo is private and
@@ -175,25 +215,63 @@ It sources `scripts/lib/conventional.sh` rather than growing a second copy of th
 reason that library exists.
 
 **Collection at release time**, in `release.yml`'s `bump` job alongside `set-version.sh`, so it rides
-the existing signed-commit pull request: concatenate `unreleased/*.md` sorted into
-`site/src/content/releases/vX.Y.Z.md` with `version`/`date` frontmatter, delete the fragments, and
-run the content guard on the result before committing. No fragments writes `Maintenance and fixes.`
-rather than failing — a patch release of pure `fix` commits is legitimate and must not block.
+the existing signed-commit pull request. This is harder than it looks: the bump commit is **not** a
+`git commit`. It is a GraphQL `createCommitOnBranch` mutation — used precisely because GitHub signs
+commits made that way and `main`'s ruleset requires signatures — and it carries a **hardcoded list of
+three additions with no `deletions` field at all**. Collecting fragments needs one addition at a
+variable path and N deletions.
+
+So the mutation's file list is generalized rather than special-cased, via two scripts that keep the
+untestable surface down to wiring:
+
+- **`scripts/collect-release-notes.sh <version>`** concatenates `site/src/content/unreleased/*.md`
+  sorted into `site/src/content/releases/vX.Y.Z.md` with `version`/`date` frontmatter, deletes the
+  fragments and runs the content guard. No fragments writes `Maintenance and fixes.` rather than
+  failing — a patch release of pure `fix` commits is legitimate and must not block.
+- **`scripts/gh-file-changes.sh`** turns the working tree's changes against `HEAD` into the mutation's
+  `fileChanges` object. Both carry `--self-test`; both are pure functions, the shape
+  `check-runs-state.sh` already proves can be pinned with fixtures.
+
+Generalizing is also strictly more robust than today: the hardcoded list is hand-maintained, so
+anything new `set-version.sh` ever touched would be silently dropped from the bump commit.
 
 `bump` is skipped when `VERSION` is already correct, which is the documented re-dispatch path in
 `docs/versioning.md`, so the publish step reads the file from the tree rather than assuming this ran.
 
-**Publication.** `scripts/update-homebrew-tap.sh` reads
-`site/src/content/releases/v$VERSION.md`, strips frontmatter, hard-fails if it is absent, runs the
-content guard, and passes `--notes-file` instead of `--notes "Clowder $VERSION"`. It must **also**
-`gh release edit --notes-file` on the already-exists path: notes are currently set only at create
-time, so a re-run silently keeps the stub, where the DMG upload already has this idempotency via
-`--clobber`.
+**Publication — enforce early, degrade late.** `scripts/update-homebrew-tap.sh` runs at **step 17 of
+the `release` job, after step 14 tags the commit and step 15 publishes the GitHub Release.** So it
+must never abort the run: if the notes file is absent it **warns and falls back to the stub body**.
+Hard-failing there would strand a signed, notarized, tagged, published release with no installable
+artifact on the tap — exactly the broken state this document's own "when something goes wrong" advice
+exists to recover from — over a missing markdown file. Enforcement belongs in the `bump` job instead,
+where failing costs nothing because nothing has been published.
+
+Otherwise it strips frontmatter, runs the content guard, and passes `--notes-file` instead of
+`--notes "Clowder $VERSION"`. It must **also** `gh release edit --notes-file` on the already-exists
+path: notes are currently set only at create time, so a re-run silently keeps the stub, where the DMG
+upload already has this idempotency via `--clobber`.
 
 **Rendering.** `site/src/pages/whats-new.astro`, a content collection over
-`src/content/releases/v*.md` sorted by version, plus a "New in X.Y.Z" band on the homepage and a nav
-entry. Local files, so there is no API call, no retry ladder, no markdown parsing of an untrusted
-string and no injection surface.
+`src/content/releases/*.md` sorted by **parsed semver** (string order puts `0.9.0` above `0.10.0`),
+plus a "New in X.Y.Z" band on the homepage and a nav entry. Local files, so there is no API call, no
+retry ladder, no markdown parsing of an untrusted string and no injection surface.
+
+The homepage band carries **no date**. The same mechanism that signals a healthy cadence signals
+neglect the moment releases pause, automatically and with nobody deciding to do it; a version and a
+couple of headline items degrade to merely uninformative instead. Dates stay on `/whats-new`, where a
+changelog without them would be useless and the reader has the context to interpret them.
+
+**The Nav must be fixed first.** It links `#features`, `#architecture`, `#faq`, `#top`; the site is a
+single page today, so a real `/whats-new` route makes every one of those dead from that page. They
+become root-relative, and the homepage's own in-page scrolling is the regression to re-test.
+
+**Backfill.** 0.1.0, 0.2.0 and 0.3.0 all shipped on 2026-07-31, 0.3.0's release body has no bullets
+at all, and 0.1.0's is a 39-bullet dump of the entire initial codebase — three same-day entries would
+read as noise on a page whose job is signalling rhythm. They collapse into one "Initial release"
+entry; 0.4.0, 0.5.0 and 0.6.0 get their own, rewritten from their release bodies. Those bodies are
+PR-title dumps full of `richardcase/clowder` links and `m11a`-style scopes, so every backfilled file
+goes through the content guard before it is committed — the backfill is the guard's hardest real
+test.
 
 ### Milestone 2 — facts read from the tree
 
@@ -265,8 +343,10 @@ required commit-message lint. See Milestone 0.
 
 ## Known caveats
 
-- The cutover has real downtime while the TLS certificate re-provisions for the new repository, and
-  it cannot be run in parallel with the old site because a custom domain maps to one repository.
+- The cutover cannot be run in parallel with the old site, because a custom domain maps to one
+  repository. In the event the downtime came not from TLS but from the deploy: the merge-triggered
+  run failed before Pages existed here and nothing retried it, so the site was 404 for ~20 minutes
+  until a manual dispatch. TLS was never a factor — Cloudflare terminates it (see the cutover).
 - Site changes now bill Actions minutes against the org's private-repo allowance rather than being
   free on a public repo. The ubuntu jobs are cheap; the path filter is what keeps this true, and it
   is load-bearing rather than an optimization.

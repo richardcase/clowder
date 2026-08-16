@@ -1,0 +1,148 @@
+---
+// The full changelog. The homepage band (WhatsNew.astro) only ever shows the
+// newest release, on purpose — this page is where every prior one still lives,
+// with the date attached, so "when did X ship" has an answer.
+import { getCollection, render } from 'astro:content';
+import Base from '../layouts/Base.astro';
+import Nav from '../components/Nav.astro';
+import Footer from '../components/Footer.astro';
+import { site } from '../data/site';
+import { getRelease } from '../data/release';
+import { cmp, isNewer } from '../data/semver';
+
+const entries = await getCollection('releases');
+
+// Never list a release the Install button can't yet serve. The release workflow's `bump` job
+// writes this page's next entry (site/src/content/releases/vX.Y.Z.md) in the same commit that
+// bumps VERSION on `main` — a commit that now touches `site/**` and so triggers
+// deploy-site.yml, well before the separate `release` job's update-homebrew-tap.sh actually
+// publishes the matching DMG (40-90 minutes later). Without this filter, a visitor in that
+// window — or indefinitely, if the publish step fails outright — would see this page announce a
+// version the download link still can't serve. `getRelease()` resolves the public Homebrew tap
+// (memoized, so this reuses whatever Footer/Hero/Install/Nav on the same page already resolved)
+// and is the actual source of truth for what's downloadable, so filtering entries to
+// `<= that version` keeps display honest. This is NOT a build-time assertion that VERSION
+// matches the tap — that would fail every normal build in the gap between a bump merge and the
+// tap publish, which is expected, not an error.
+const available = (await getRelease()).version;
+const releases = entries
+  .filter((r) => !isNewer(r.data.version, available))
+  .sort((a, b) => cmp(a.data.version, b.data.version));
+const rendered = await Promise.all(releases.map(async (r) => ({ ...r, Body: (await render(r)).Content })));
+---
+
+<Base title={`What's new — ${site.name}`} description={`Every Clowder release, newest first.`}>
+  <span id="top"></span>
+  <Nav />
+  <main id="main">
+    <section class="section" id="whats-new">
+      <div class="shell">
+        <div class="section-head">
+          <p class="eyebrow">Changelog</p>
+          <h1>What's new</h1>
+          <p class="lede" style="margin-top: 1rem;">
+            Every release, newest first — what changed and when it shipped.
+          </p>
+        </div>
+
+        <ol class="releases">
+          {
+            rendered.map((release) => (
+              <li class="release" id={release.data.version}>
+                <div class="release__head">
+                  <h2>v{release.data.version}</h2>
+                  <time class="release__date" datetime={release.data.date}>
+                    {new Date(`${release.data.date}T00:00:00Z`).toLocaleDateString('en-US', {
+                      year: 'numeric',
+                      month: 'long',
+                      day: 'numeric',
+                      timeZone: 'UTC',
+                    })}
+                  </time>
+                </div>
+                <div class="release__body">
+                  <release.Body />
+                </div>
+              </li>
+            ))
+          }
+        </ol>
+      </div>
+    </section>
+  </main>
+  <Footer />
+</Base>
+
+<style>
+  .releases {
+    list-style: none;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    background: var(--border);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+  }
+
+  .release {
+    padding: 1.6rem 1.4rem;
+    background: var(--bg-raised);
+  }
+
+  .release__head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 1rem;
+    margin-bottom: 0.75rem;
+  }
+
+  .release__head h2 {
+    font-size: 1.15rem;
+  }
+
+  .release__date {
+    flex: none;
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    color: var(--text-faint);
+  }
+
+  .release__body {
+    max-width: var(--measure);
+    font-size: 0.93rem;
+    color: var(--text-dim);
+  }
+
+  .release__body :global(p) {
+    text-wrap: pretty;
+  }
+
+  .release__body :global(p + p) {
+    margin-top: 0.9rem;
+  }
+
+  .release__body :global(ul) {
+    margin-top: 0.9rem;
+    padding-left: 1.2rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.55rem;
+  }
+
+  .release__body :global(li) {
+    text-wrap: pretty;
+  }
+
+  .release__body :global(code) {
+    color: var(--accent);
+    word-break: break-word;
+  }
+
+  .release__body :global(strong) {
+    color: var(--text);
+    font-weight: 600;
+  }
+</style>

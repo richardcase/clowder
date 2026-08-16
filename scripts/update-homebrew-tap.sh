@@ -27,11 +27,48 @@ echo "==> clowder $VERSION  sha256=$SHA"
 
 export GH_TOKEN="$HOMEBREW_TAP_TOKEN"
 
+# The site is the primary channel for these — it reads the same files locally — but the tap release
+# is the only public record independent of it.
+NOTES="$ROOT/site/src/content/releases/v$VERSION.md"
+BODY="$(mktemp)"; trap 'rm -f "$BODY"' EXIT
+
+# DELIBERATELY NOT FATAL, in every branch below — missing file, guard-rejected file, or a file that
+# yields nothing once frontmatter is stripped. This runs at step 17 of the release job — AFTER
+# step 14 tags the commit and step 15 publishes the GitHub Release. Aborting here for ANY of those
+# reasons would strand a signed, notarized, tagged, published release with no installable artifact
+# on the tap, over a markdown file. Enforcement (rejecting bad notes, requiring a fragment at all)
+# belongs in the bump job, where failing costs nothing; here it can only warn and fall back to the
+# stub body. A guard-rejected file is a real problem someone must go chase — hence the distinct
+# warning text below — just not one worth destroying a published release over.
+if [ ! -f "$NOTES" ]; then
+  echo "::warning::no release notes at $NOTES — publishing the stub body"
+  printf 'Clowder %s\n' "$VERSION" > "$BODY"
+elif ! "$ROOT/scripts/check-release-notes.sh" --file "$NOTES" >/dev/null 2>&1; then
+  echo "::warning::release notes at $NOTES failed the content guard — publishing the stub body instead"
+  printf 'Clowder %s\n' "$VERSION" > "$BODY"
+else
+  # Strip the frontmatter block; publish the prose. `n<2` on the match guards the counter so a bare
+  # `---` markdown horizontal rule *inside* the body (after the closing frontmatter fence) is no
+  # longer mistaken for a third frontmatter delimiter and silently dropped — it used to count every
+  # `---`-only line unconditionally.
+  awk 'n<2 && /^---[[:space:]]*$/{n++; next} n>=2' "$NOTES" > "$BODY"
+  if [ ! -s "$BODY" ]; then
+    # Guard passed but nothing survived frontmatter-stripping (e.g. no frontmatter fence at all, so
+    # the n>=2 gate never opens) — publish the stub rather than a silently empty release body.
+    echo "::warning::release notes at $NOTES produced an empty body after stripping frontmatter — publishing the stub body instead"
+    printf 'Clowder %s\n' "$VERSION" > "$BODY"
+  fi
+fi
+
 # 1. Host the DMG on the PUBLIC tap's Releases (so brew can fetch it unauthenticated). Idempotent:
-#    create the release if missing, then upload/replace the asset.
+#    create the release if missing, then upload/replace the asset — and set the notes on BOTH paths,
+#    not just at create time, so a re-run (e.g. after Step 2's cask push failed) still picks up notes
+#    that did not exist yet on the first pass.
 echo "==> Uploading DMG to $TAP_REPO ($TAG)"
 if ! gh release view "$TAG" --repo "$TAP_REPO" >/dev/null 2>&1; then
-  gh release create "$TAG" --repo "$TAP_REPO" --title "$TAG" --notes "Clowder $VERSION"
+  gh release create "$TAG" --repo "$TAP_REPO" --title "$TAG" --notes-file "$BODY"
+else
+  gh release edit "$TAG" --repo "$TAP_REPO" --notes-file "$BODY"
 fi
 gh release upload "$TAG" "$DMG" --repo "$TAP_REPO" --clobber
 
@@ -39,7 +76,9 @@ gh release upload "$TAG" "$DMG" --repo "$TAP_REPO" --clobber
 CASK="$(sed -e "s/@@VERSION@@/$VERSION/" -e "s/@@SHA256@@/$SHA/" "$TEMPLATE")"
 
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+# Extend, not replace, the EXIT trap set above for $BODY — a second `trap ... EXIT` overwrites the
+# first rather than stacking, so without this the notes tempfile set up before Step 1 would leak.
+trap 'rm -rf "$WORK"; rm -f "$BODY"' EXIT
 git clone --depth 1 "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/${TAP_REPO}.git" "$WORK"
 
 mkdir -p "$WORK/Casks"
