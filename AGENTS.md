@@ -332,4 +332,11 @@ is now the one place that computes it, and the app is the only caller that passe
   … ]` array literal: prose that mentions `gap:` and a commented-out `gap:` line both don't count, and
   the array boundary is detected structurally rather than by matching literal `] as const;`, because
   `Faq.astro`'s `<style>` block legitimately has its own CSS `gap:` declarations that a literal match
-  would misread as annotations.
+  would misread as annotations. A `gap:` may also carry a `gapWords: '...'` line — plain-language terms
+  a release note would plausibly use about that gap. It exists because issue titles are engineering
+  jargon and release notes are deliberately plain (see the release-note convention above), so the two
+  vocabularies systematically don't overlap; #55 needed it (title-only matching shared zero words with
+  the real note it was meant to catch), #56 doesn't yet. **Whoever opens a new gap issue should pick a
+  distinctive title, or add `gapWords`, and check the annotation against the existing release notes
+  before it lands** — `significant_words`' stopword list is tuned to today's two titles, not evergreen,
+  so a future issue titled with a common 4+ letter word would fire on every unrelated PR.
