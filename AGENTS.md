@@ -237,6 +237,15 @@ is now the one place that computes it, and the app is the only caller that passe
   counts as failed, which is strictly worse.
 - **`deploy-site.yml` must never gain a `pull_request` trigger.** It holds `pages: write` and
   `id-token: write`, in the same repo as `DOPPLER_TOKEN` and the signing path.
+- **Re-running a job does NOT pick up a label you just added.** A re-run replays the run's *original*
+  event payload, so `github.event.pull_request.labels` still holds whatever was there when the run
+  was first created. Verified on PR #99: `no-release-note` was added at 17:43:00Z and the re-run
+  started at 17:43:31Z, yet the check saw no labels — because the run itself dated from 12:28Z. This
+  is why `commit-lint` resolves labels with `gh pr view` in a `Resolve pull request labels` step
+  rather than from the payload, and why that step needs `pull-requests: read`. If you ever move a
+  label read back to `github.event.*`, the `no-release-note` and `no-copy-review` escapes silently
+  stop working on re-runs — the only remaining ways to apply one would be pushing a commit or
+  closing and reopening the pull request.
 - **`getclowder.app` is fronted by Cloudflare, and Pages' "Enforce HTTPS" is deliberately off.**
   GitHub cannot complete its ACME challenge for a proxied domain, so `https_enforced` stays `false`
   by necessity — don't go looking for the toggle, and don't file it as a defect. TLS termination, the
@@ -306,10 +315,39 @@ is now the one place that computes it, and the app is the only caller that passe
   one or two sentences, one user-facing capability described in plain language (`Connect the app to a
   Clowder daemon on another machine over TLS.`), not a CLI surface dump and not a change record. If
   the change is genuinely internal and no user could perceive it — a CI fix, a refactor of the release
-  tooling — add the `no-release-note` label instead of inventing a note; because `labeled` is not
-  among the default `pull_request` activity types `ci.yml` reacts to, adding the label after the fact
-  needs a manual re-run of the `commit-lint` job (and isn't wired to also re-run the macOS build, which
-  would otherwise rebuild on every label toggle). `scripts/check-release-notes.sh` enforces both the
+  tooling — add the `no-release-note` label instead of inventing a note. `labeled` is deliberately not
+  among the `pull_request` activity types `ci.yml` reacts to, since that would re-run the macOS build
+  on every label toggle, so **adding a label does not retrigger CI** — see the label gotcha below for
+  what actually makes it take effect. `scripts/check-release-notes.sh` enforces both the
   requirement and the content: this repo is private and the site is public, so a note that leaks a
   `#123` PR reference, a milestone scope like `m11a`, or a link to the private repo fails the guard —
   see the script's own comments for the full pattern rationale.
+- **A FAQ entry that states a limitation carries `gap: <issue>`** (`site/src/components/Faq.astro`) —
+  a promise that the claim holds only while that issue stays open. `scripts/check-copy-claims.sh`
+  checks the issue's state on every PR and fails the moment it closes, so whoever closes the issue
+  rewrites the FAQ answer in the same change, instead of the site quietly going stale until someone
+  notices. It separately fails when a release-note fragment added in the PR shares distinctive wording
+  with an *open* gap's issue title — not a verdict on the claim itself, but a prompt: that overlap
+  usually means the gap is about to close and the FAQ entry needs the same treatment in the same PR.
+  `no-copy-review` is the escape hatch, read from `PR_LABELS` the same way `no-release-note` is above.
+  Nothing writes `GITHUB_STEP_SUMMARY` for it — a failure is stderr output in the failed `commit-lint`
+  step's own log, not a job summary entry. Adding the label after the fact doesn't retrigger CI either,
+  for the same reason as `no-release-note` — see the label gotcha below. The check watches limitation
+  claims and deliberately not `Features.astro`'s positive ones: a
+  positive claim stays true as the product grows, but a limitation claim is true only until someone
+  fixes the thing — and the
+  person fixing it is deep in Rust, not reading marketing copy. Of the four corrections this site has
+  needed across the two milestones before this check existed, none touched `Features.astro` and both
+  FAQ corrections were limitations — evidence for scoping the gate there rather than "improving" it to
+  cover all copy. The annotation itself only counts alone on its own line inside the `const faqs = [
+  … ]` array literal: prose that mentions `gap:` and a commented-out `gap:` line both don't count, and
+  the array boundary is detected structurally rather than by matching literal `] as const;`, because
+  `Faq.astro`'s `<style>` block legitimately has its own CSS `gap:` declarations that a literal match
+  would misread as annotations. A `gap:` may also carry a `gapWords: '...'` line — plain-language terms
+  a release note would plausibly use about that gap. It exists because issue titles are engineering
+  jargon and release notes are deliberately plain (see the release-note convention above), so the two
+  vocabularies systematically don't overlap; #55 needed it (title-only matching shared zero words with
+  the real note it was meant to catch), #56 doesn't yet. **Whoever opens a new gap issue should pick a
+  distinctive title, or add `gapWords`, and check the annotation against the existing release notes
+  before it lands** — `significant_words`' stopword list is tuned to today's two titles, not evergreen,
+  so a future issue titled with a common 4+ letter word would fire on every unrelated PR.

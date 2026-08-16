@@ -273,7 +273,32 @@ PR-title dumps full of `richardcase/clowder` links and `m11a`-style scopes, so e
 goes through the content guard before it is committed — the backfill is the guard's hardest real
 test.
 
-### Milestone 2 — facts read from the tree
+### Milestone 2 — facts read from the tree *(DROPPED 2026-08-16 — evidence below)*
+
+**Not built, deliberately.** This milestone existed to stop `minMacOS` and `arch` "silently rotting".
+Measured before starting it, they never have:
+
+- `LSMinimumSystemVersion` has changed **once in the project's history** — in the commit that first
+  created `build-app.sh`, when the product was still called Muxy. `site.ts`'s `minMacOS`/`arch` have
+  changed once, in the import commit.
+- Both were verified **correct** against the actually shipped 0.7.0 artifact: mounting the DMG gives
+  `LSMinimumSystemVersion 14.0` and `lipo -archs arm64`, matching `minMacOS: '14'` and
+  `arch: 'Apple silicon'`.
+- Over the same period, four *prose* corrections were needed. Nothing that this milestone guards
+  drifted; everything that drifted was outside its scope. Milestone 3 targets that instead.
+
+It also could not have worked as written for `arch`: `build-app.sh` does a plain
+`cp target/release/$bin` with no `--target`, so "Apple silicon" is an emergent property of which
+runner CI happens to use, not a fact declared anywhere in the tree. The milestone would have had to
+*invent* the declaration rather than read it.
+
+The one real defect in this family was found by a live failure rather than by drift:
+`update-homebrew-tap.sh` accepts any `VERSION` without validation, while `set-version.sh` enforces
+`X.Y.Z[-prerelease]`. Run by hand with `VERSION=v0.7.0`, it produced a `vv0.7.0` tap tag, a cask
+pointing at a non-existent asset, and a broken `brew install`. Worth fixing on its own merits; it is
+not what this milestone was about.
+
+The original design, for the record:
 
 A new `scripts/lib/product.sh` holding `MIN_MACOS=14.0` and `APP_ARCH=arm64`, sourced by
 `build-app.sh` in place of the literal at line 58 — following the `scripts/lib/conventional.sh`
@@ -289,16 +314,67 @@ not.
 
 ### Milestone 3 — make copy drift a blocking check
 
-This is what the merge bought, and it replaces the agent-authored pull request entirely.
+**The original design for this milestone was vacuous, and is replaced.** It required a pull request
+adding a fragment to "also touch one of `Features.astro`, `Faq.astro`, `Architecture.astro`, or
+`site/src/content/`" — but fragments live in `site/src/content/unreleased/`, so adding the fragment
+*is* touching `site/src/content/`. The condition and its satisfaction were the same act: every pull
+request would have passed automatically, reporting green while checking nothing. That is exactly the
+failure mode `site/scripts/audit-selftest.sh`'s header exists to prevent, and it is recorded here
+rather than quietly deleted because the shape of the mistake — a gate whose trigger also satisfies it
+— is easy to reintroduce.
 
-`check-release-notes.sh` gains a second rule: when a pull request adds a fragment — that is, when it
-ships something user-facing — it must **also** touch one of `site/src/components/Features.astro`,
-`Faq.astro`, `Architecture.astro`, or `site/src/content/`, or carry a `no-site-copy` label, again
-reported in the summary.
+**What replaced it follows the evidence.** Four corrections were needed during Milestones 0 and 1,
+every one prose, every one caught by a reviewer rather than a mechanism. `Features.astro`'s *positive*
+claims needed none: a positive claim stays true as a product grows. Both FAQ corrections were
+**limitation** claims, which hold only until someone fixes the thing — and the person fixing it is
+deep in Rust, not reading marketing copy. Drift here is not diffuse; it is concentrated in the
+honest-limitations copy, which is the most valuable copy on the site and the least revisited.
 
-Deliberately coarse. It is a "did you think about this" gate, not a semantic one; it cannot tell good
-copy from bad. What it changes is which outcome is the default: forgetting becomes the effortful
-path, and the reviewer is the author, at the moment they still remember what the feature does.
+**The falsifier already existed.** This repo's issues are written in almost the FAQ's own words —
+#56 "M8 — Linux support" against "Not yet … Clowder is macOS only", #55 "M9c — PTY-host true
+zero-disruption agent survival" against "the underlying process does not survive that", and #87
+"Terminal grid does not reflow when the window is resized" against the reflow claim that went stale.
+#87 closing *is* the event that should have flagged the FAQ.
+
+So `scripts/check-copy-claims.sh`, wired into `commit-lint` beside `check-release-notes.sh`, with two
+checks. Both fail the pull request, with a `no-copy-review` label as the deliberate escape — the same
+shape as the release-note rule, so there is one mechanism to learn rather than two.
+
+1. **A limitation whose issue has closed.** Each limitation entry in `Faq.astro` carries a `gap:`
+   naming the issue that tracks it; the check fails on any that is closed. Entries asserting no
+   limitation need no `gap`. This catches *binary* gaps precisely.
+2. **A release note that contradicts an open limitation.** Check 1 cannot see a *partial* change: the
+   daemon-restart drift happened while #55 was, and remains, legitimately open — what changed is that
+   partial recovery landed while the FAQ described total loss. So for each open `gap:` issue, the
+   significant words of its title are matched against fragments added in the pull request, and a hit
+   fails with both texts side by side. Deliberately keyword-based rather than semantic: it is a prompt
+   for a human, the label is the answer when the prompt is wrong, and the threshold is tuned against
+   the real corpus rather than guessed.
+
+   **Title matching alone does not cover the case above** — that was this milestone's own mistake,
+   caught in the final review rather than before it shipped. v0.4.0's real release note ("the agents
+   that were running come back on their own... with their conversation resumed and their split layout
+   restored") shares **zero** significant words with #55's title ("M9c — PTY-host true zero-disruption
+   agent survival"): `disruption` 0, `survival` 0, `pty` 0. That is not a tuning gap; it is structural.
+   Milestone 1 *requires* release notes to be written in plain, user-facing language, while issue
+   titles are engineering jargon by convention — the two vocabularies are deliberately kept apart, so
+   they systematically don't overlap on the exact cases this check exists to catch. Widening the
+   stopword list cannot fix a problem that isn't about noise words.
+
+   What actually covers it: a `gap:` annotation may carry a second line, `gapWords: '...'`, naming
+   terms a release note would plausibly use about that gap in the product's own plain language. Those
+   terms are matched the same way the title is — concatenated onto it before the significant-words
+   filter runs — so `gapWords: 'resume restore vanish'` on #55 is what actually catches v0.4.0's note,
+   not the title.
+
+The check calls the issues API, so it **retries twice and then fails** rather than passing silently —
+the same reasoning that makes `check-runs-state.sh` treat a check that did not execute as failed. Its
+message names an API error as a possible cause, so nobody reads a blip as a real contradiction.
+
+Deliberately **not** in scope: any gate on `Features.astro`, whose positive claims have never drifted
+— a rule forcing every feature pull request to edit marketing copy is friction with no evidence
+behind it. And no LLM comparison: keyword overlap against a curated set of tracked gaps covers every
+failure that has actually occurred, and it is testable offline.
 
 `Features.astro` and `Faq.astro` both open with headers stating that every claim maps to something
 that ships and that the limitations are stated deliberately. Both get quoted into `AGENTS.md`, so an
