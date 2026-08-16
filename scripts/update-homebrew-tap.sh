@@ -16,6 +16,23 @@ VERSION="${VERSION:-$(tr -d '[:space:]' < "$ROOT/VERSION")}"
 DMG="${DMG:-$ROOT/dist/Clowder-$VERSION-macos.dmg}"
 TAP_REPO="${TAP_REPO:-defiantsoftware/homebrew-clowder}"
 TEMPLATE="$ROOT/scripts/homebrew/clowder.rb.tmpl"
+
+# Validate before deriving anything from it. This script is documented as manually runnable, takes
+# VERSION from the environment, and every artefact below is built by string-substitution — so a
+# malformed value propagates silently rather than failing.
+#
+# That is not hypothetical. Run once with VERSION=v0.7.0 (leading `v`), it produced a `vv0.7.0` tap
+# tag, a cask reading `version "v0.7.0"`, and a download URL pointing at `Clowder-v0.7.0-macos.dmg`
+# while the uploaded asset was `Clowder-0.7.0-macos.dmg` — a live 404 on `brew install --cask`.
+#
+# The pattern is copied verbatim from scripts/set-version.sh so the two cannot disagree about what a
+# version is: whatever set-version.sh will write to VERSION, this must accept, and nothing else.
+if ! [[ $VERSION =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$ ]]; then
+  echo "error: VERSION '$VERSION' is not X.Y.Z[-prerelease]" >&2
+  echo "hint: pass the bare version, not the tag — VERSION=0.7.0, not VERSION=v0.7.0" >&2
+  exit 1
+fi
+
 TAG="v$VERSION"
 
 [ -n "${HOMEBREW_TAP_TOKEN:-}" ] || { echo "HOMEBREW_TAP_TOKEN is required" >&2; exit 1; }
