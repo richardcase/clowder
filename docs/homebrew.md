@@ -71,7 +71,31 @@ does both the DMG release-upload and the cask git push.
 
 > Fine-grained PATs expire in ≤1 year — set a calendar reminder to rotate it (regenerate → update Doppler).
 > A **missing** token warns + skips the bump; an **expired** one (present but invalid) fails the bump step
-> red — a visible signal to rotate. Either way the signed Release itself is already published.
+> red — a visible signal to rotate.
+
+### The grant does not survive an org transfer
+
+A fine-grained PAT is granted against a **specific resource owner and repository**. Moving the tap to a
+different owner does not carry the grant with it: the token keeps authenticating, so it does not look
+expired, but every write returns `403 Resource not accessible by personal access token`.
+
+This has happened once, and the timeline is worth keeping because it is not obvious from the symptom:
+
+```
+2026-08-12 12:25Z   v0.6.0 published to the tap — last release under the old grant
+2026-08-12 12:36Z   main repo moved to the defiantsoftware org
+2026-08-12 12:53Z   tap repo moved
+2026-08-16          v0.7.0 — first release needing the token since — 403
+```
+
+Four days of apparently healthy repos, because nothing had asked the token to write in between. **After any
+org transfer or repo rename, reissue the PAT and update Doppler before the next release** — do not wait for
+the release to tell you.
+
+`release.yml` now checks `repos/<tap>` for `.permissions.push` **before** it signs or tags anything
+(`Verify the Homebrew tap token can still write`), so a bad grant stops the run while it is still cheap. It
+used to surface at the tap publish, which runs *after* the tag and the GitHub Release — stranding a
+signed, notarized, published release with nothing installable and manual cleanup to do.
 
 ### c. Cut a release
 

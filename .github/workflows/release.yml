@@ -550,6 +550,44 @@ jobs:
           doppler-token: ${{ secrets.DOPPLER_TOKEN }}
 
       # ---------- signed path (Doppler token configured) ----------
+
+      # Fail here, not at the tap publish 7 steps later. That step runs AFTER the commit is tagged
+      # and the GitHub Release is published, so a token problem there strands a signed, notarized,
+      # tagged, published release with nothing installable on the tap and a manual cleanup to do.
+      # Here, nothing has been signed or published: the run just stops.
+      #
+      # This is not hypothetical. v0.7.0 failed exactly that way with `403 Resource not accessible by
+      # personal access token`. Root cause: a fine-grained PAT is granted against a specific resource
+      # owner and repository, and that grant does NOT follow a repo across an org transfer. The tap
+      # moved to the defiantsoftware org on 2026-08-12, ten minutes after the last publish that used
+      # the old grant — so the token kept working until the next release needed it, four days later.
+      #
+      # `.permissions.push` reflects what THIS token can actually do on the repo, so it catches a
+      # revoked, re-scoped or org-transferred grant without writing anything.
+      - name: Verify the Homebrew tap token can still write
+        if: ${{ steps.signing.outputs.enabled == 'true' && needs.plan.outputs.prerelease != 'true' }}
+        env:
+          GH_TOKEN: ${{ steps.doppler.outputs.HOMEBREW_TAP_TOKEN }}
+          TAP_REPO: defiantsoftware/homebrew-clowder
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::warning::No HOMEBREW_TAP_TOKEN in Doppler — the tap publish will be skipped."
+            exit 0
+          fi
+          if ! push="$(gh api "repos/$TAP_REPO" --jq .permissions.push 2>&1)"; then
+            echo "::error::cannot read $TAP_REPO with HOMEBREW_TAP_TOKEN: $push"
+            echo "::error::Reissue the fine-grained PAT (resource owner defiantsoftware, only"
+            echo "::error::$TAP_REPO, Contents: Read and write) and update it in Doppler."
+            exit 1
+          fi
+          [ "$push" = true ] || {
+            echo "::error::HOMEBREW_TAP_TOKEN cannot write to $TAP_REPO (permissions.push=$push)."
+            echo "::error::A fine-grained PAT's grant does not survive an org transfer or a scope"
+            echo "::error::change — reissue it with Contents: Read and write and update Doppler."
+            exit 1
+          }
+          echo "tap token OK — can write to $TAP_REPO"
+
       - name: Import Developer ID certificate into a temp keychain
         if: steps.signing.outputs.enabled == 'true'
         env:
