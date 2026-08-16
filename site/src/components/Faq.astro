@@ -20,6 +20,11 @@ const faqs = [
   {
     q: 'Does it work on Linux or Windows?',
     a: 'Not yet. The daemon is cross-platform Rust, but the client is a native SwiftUI app, so today Clowder is macOS only.',
+    // `gap:` ties this claim to the issue that would make it stale. The claim holds only while
+    // that issue stays open — scripts/check-copy-claims.sh checks its state on every PR and fails
+    // CI the moment it closes, so whoever closes it rewrites this answer in the same change,
+    // rather than the site quietly going stale until someone notices.
+    gap: 56,
   },
   {
     q: 'Which agents can it run?',
@@ -32,6 +37,7 @@ const faqs = [
   {
     q: 'What happens to my agents when I close the window?',
     a: 'They keep running. The daemon owns the PTYs and outlives the window, and the app reconnects when you come back. If the daemon itself restarts — a crash, or an app relaunch — the underlying process does not survive that, but the daemon respawns every agent it had recorded in the same worktree, resumes its conversation, and restores the split layout, so in practice you come back to where you left off rather than to nothing. Resizing a window or pane now reflows the terminal grid correctly, and that size is what gets restored on resume rather than the 80x24 default.',
+    gap: 55,
   },
   {
     q: 'How do I update?',

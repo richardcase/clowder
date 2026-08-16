@@ -53,6 +53,10 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      # check-copy-claims.sh below calls `gh issue view` to check gap: issue state — a private
+      # repo's issues API 403s without this, which the script reports indistinguishably from a
+      # real API outage.
+      issues: read
     steps:
       - uses: actions/checkout@v4
         with:
@@ -113,6 +117,17 @@ jobs:
           # pull request, which is correct: the bump commit is `chore:` and requires no note.
           PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
         run: scripts/check-release-notes.sh "$BASE" "$HEAD_REF"
+
+      - name: check-copy-claims.sh self-tests
+        run: scripts/check-copy-claims.sh --self-test
+
+      - name: Site copy claims
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || 'origin/main' }}
+          HEAD_REF: ${{ github.event.pull_request.head.sha || github.sha }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: scripts/check-copy-claims.sh "$BASE" "$HEAD_REF"
 
   build-and-test-macos:
     name: build + test (macOS, unsigned) — full
