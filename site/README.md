@@ -54,18 +54,27 @@ must be set to **GitHub Actions** for the first deploy to publish.
 
 ## Screenshots
 
-`src/assets/screenshots/` holds real captures of Clowder 0.5.0, rendered by
+`src/assets/screenshots/` holds real captures of Clowder 0.7.0, rendered by
 `src/components/AppShot.astro` through Astro's asset pipeline (hashed, WebP, responsive `srcset`,
 base path handled automatically).
 
 The captures already include the app's own window chrome, so `AppShot` deliberately does **not**
 wrap them in a CSS window frame.
 
-To refresh them, capture at 2× against a 1720×900 window and re-run `sips -Z 2400`. Two things to
-watch for:
+To refresh them, run **`site/scripts/capture-screenshots.sh`** from a Terminal window you opened
+yourself — it sizes the window to 1720×900, captures each shot at 2×, and downscales to 2400px. It
+must be your own GUI session: a process with no window-server connection can launch Clowder but the
+app never creates a window, so there is nothing to capture.
 
-- **Claude Code's welcome banner shows the signed-in account's name, email and plan.** Keep it out
-  of frame — drive the agent until the banner has scrolled off, or use a `shell` adapter pane.
+The script only sizes the window and takes the picture; you arrange the app between shots. It
+captures the window rectangle alone, so nothing else on your desktop can end up in the file.
+
+Two things to get right before you start, both of which the script reminds you about:
+
+- **Claude Code's welcome banner shows the signed-in account's name, email and plan.** Use a
+  `shell` adapter pane, which cannot render it at all. Scrolling the banner out of frame also
+  works, but it depends on you noticing it every time — and an email address that reaches the live
+  site is not fixable by editing the image afterwards, because the image has already shipped.
 - **The sidebar lists every registered project.** Unregister anything private with
   `clowder project rm <path>` before capturing, and re-add it afterwards.
 
