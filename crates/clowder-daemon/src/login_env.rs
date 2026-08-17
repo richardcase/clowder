@@ -32,6 +32,15 @@ const CAPTURE_ARTEFACTS: &[&str] =
 /// Also a re-entrancy marker. Stripped from the result — a pane is not a capture.
 pub const CAPTURE_MARKER_VAR: &str = "CLOWDER_LOGIN_ENV_CAPTURE";
 
+/// Used when the daemon's own environment has no `TERM` of its own (the normal GUI-launched case,
+/// since launchd sets none). Every pane is a real PTY rendered by libghostty, which is at least this
+/// capable — `xterm-256color` is universally present in terminfo databases, unlike `xterm-ghostty`.
+const DEFAULT_TERM: &str = "xterm-256color";
+
+/// Used when the daemon's own environment has no `COLORTERM` of its own, for the same reason as
+/// [`DEFAULT_TERM`] — libghostty renders true color, so a pane should be able to say so.
+const DEFAULT_COLORTERM: &str = "truecolor";
+
 /// What [`capture`] needs to run. Separate from `Config` so tests can point it at a fake shell.
 #[derive(Debug, Clone)]
 pub struct CaptureSpec {
@@ -64,8 +73,11 @@ impl PaneEnv {
     /// Lowest layer first:
     /// 1. the captured environment, or the daemon's own when there is nothing captured;
     /// 2. minus [`CAPTURE_ARTEFACTS`];
-    /// 3. `TERM` from the daemon, never from the capture — rc files set it, and the capture child
-    ///    had no tty, so a captured `TERM` describes nothing real;
+    /// 3. `TERM`/`COLORTERM` from the daemon, never from the capture — rc files set them, and the
+    ///    capture child had no tty, so captured values describe nothing real. When the daemon has
+    ///    neither (the normal GUI-launched case), fall back to [`DEFAULT_TERM`]/[`DEFAULT_COLORTERM`]
+    ///    rather than leaving the pane with none — every pane is a real, color-capable PTY rendered
+    ///    by libghostty, regardless of what launchd handed the daemon;
     /// 4. every `CLOWDER_*` key from the daemon wins, so a `clowder` run *inside* a pane reaches
     ///    *this* daemon even if the user's rc exports a stale `CLOWDER_SOCK`;
     /// 5. `PATH` from the capture (falling back to the daemon's if it is absent or empty), with the
@@ -87,11 +99,11 @@ impl PaneEnv {
             vars.remove(*key);
         }
 
-        // 3. TERM: the daemon's or nothing. Never the captured one.
-        match daemon.get("TERM") {
-            Some(term) => vars.insert("TERM".into(), term.clone()),
-            None => vars.remove("TERM"),
-        };
+        // 3. TERM/COLORTERM: the daemon's, or a color-capable default. Never the captured one.
+        let term = daemon.get("TERM").cloned().unwrap_or_else(|| DEFAULT_TERM.to_string());
+        vars.insert("TERM".into(), term);
+        let colorterm = daemon.get("COLORTERM").cloned().unwrap_or_else(|| DEFAULT_COLORTERM.to_string());
+        vars.insert("COLORTERM".into(), colorterm);
 
         // 4. The daemon owns its own namespace.
         for (k, v) in &daemon {
@@ -420,9 +432,27 @@ mod tests {
         );
         assert_eq!(env.get("TERM").unwrap(), "xterm-ghostty");
 
-        // A GUI daemon has no TERM at all — the captured one must not fill the gap.
+        // A GUI daemon has no TERM at all — the captured one must not fill the gap, but the pane
+        // still needs a color-capable TERM, so it gets the default rather than none.
         let env = PaneEnv::resolve(Some(map(&[("TERM", "screen-256color")])), map(&[]), None, "/bin/sh");
-        assert_eq!(env.get("TERM"), None);
+        assert_eq!(env.get("TERM").unwrap(), DEFAULT_TERM);
+    }
+
+    #[test]
+    fn colorterm_comes_from_the_daemon_never_the_capture() {
+        // Same shape as TERM: the daemon's own COLORTERM wins over a captured one.
+        let env = PaneEnv::resolve(
+            Some(map(&[("COLORTERM", "24bit")])),
+            map(&[("COLORTERM", "truecolor")]),
+            None,
+            "/bin/sh",
+        );
+        assert_eq!(env.get("COLORTERM").unwrap(), "truecolor");
+
+        // A GUI daemon has no COLORTERM at all — fall back to the default rather than leaving the
+        // pane with none, since libghostty renders true color regardless.
+        let env = PaneEnv::resolve(Some(map(&[("COLORTERM", "24bit")])), map(&[]), None, "/bin/sh");
+        assert_eq!(env.get("COLORTERM").unwrap(), DEFAULT_COLORTERM);
     }
 
     #[test]
