@@ -54,7 +54,7 @@ must be set to **GitHub Actions** for the first deploy to publish.
 
 ## Screenshots
 
-`src/assets/screenshots/` holds real captures of Clowder 0.5.0, rendered by
+`src/assets/screenshots/` holds real captures of Clowder 0.7.0, rendered by
 `src/components/AppShot.astro` through Astro's asset pipeline (hashed, WebP, responsive `srcset`,
 base path handled automatically).
 
