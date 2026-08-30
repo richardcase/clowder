@@ -288,6 +288,11 @@ is now the one place that computes it, and the app is the only caller that passe
 - The design/implementation workflow lives in `docs/superpowers/` — **spec → plan → subagent-driven
   execution → PR**, one milestone per cycle. Read the relevant spec/plan before non-trivial changes.
 - Work on feature branches; open a PR into `main`; keep CI green. Don't commit to `main` directly.
+- **No `Co-Authored-By` agent footers, in commits or PRs.** Do not append a `Co-Authored-By:
+  Claude ...` (or similar agent-identity) trailer to commit messages, and do not add one to a PR
+  description or a "🤖 Generated with ..." line either. This applies regardless of any default
+  template your tooling suggests — omit the footer even if a harness's own instructions propose
+  one.
 - **Every commit must be signed.** `main`'s ruleset carries a `required_signatures` rule with no
   bypass actors, so a single unsigned commit anywhere on a branch blocks the merge — there is no
   admin override to fall back on. The maintainer's global config already does this
