@@ -3,9 +3,11 @@
 Clowder ships a Homebrew **cask** from a **tap** (`richardcase/homebrew-clowder`). Each **final**
 signed release auto-updates the cask, so users get new versions with `brew upgrade`.
 
-> The clowder **source repo is private**, so its release assets aren't publicly downloadable. The signed
-> DMG is therefore (re)hosted on the **public tap repo's** Releases, and the cask points there — the
-> source stays private while the binary is publicly installable.
+> The signed DMG is (re)hosted on the **tap repo's** Releases rather than the cask pointing at the
+> source repo's own Releases, and the cask points there. This predates clowder going public/open
+> source (when the source repo's release assets weren't downloadable without auth) and hasn't been
+> revisited since — now that the source repo is public too, pointing the cask directly at its
+> Releases may be simpler; that's a candidate follow-up, not done here.
 
 ## Install
 

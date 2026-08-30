@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Publish the DMG + cask to the PUBLIC Homebrew tap. The clowder source repo is private, so its release
-# assets aren't publicly downloadable — the DMG is (re)hosted on the tap repo's Releases, and the cask
-# points there. Called by release.yml on a final (non-pre-release) signed release.
+# Publish the DMG + cask to the PUBLIC Homebrew tap. The DMG is (re)hosted on the tap repo's
+# Releases rather than the cask pointing at the source repo's own Releases — see docs/homebrew.md
+# for why. Called by release.yml on a final (non-pre-release) signed release.
 #
 # Env:
 #   VERSION              (default: the repo VERSION file)

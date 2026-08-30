@@ -75,7 +75,7 @@ brew install --cask richardcase/clowder/clowder
 Installs the signed + notarized `Clowder.app` and puts the `clowder` CLI on `PATH`. See
 [`docs/homebrew.md`](docs/homebrew.md).
 
-### From a release (collaborators)
+### From a release
 
 Download `Clowder-vX.Y.Z-macos.dmg` from the repo's [Releases](https://github.com/richardcase/clowder/releases),
 open it, and drag **Clowder** to **Applications**. Releases are **signed with a Developer ID and

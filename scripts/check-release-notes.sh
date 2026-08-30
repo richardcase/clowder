@@ -5,10 +5,10 @@
 #      site/src/content/unreleased/, or carry the `no-release-note` label. Per PULL REQUEST, not per
 #      commit: three fixes need one note, not three.
 #
-#   2. Guard the content. This repo is PRIVATE and the site is PUBLIC. Today's release bodies are
-#      full of `defiantsoftware/clowder` PR links that 404 for every visitor and scope names like
-#      `m12b` that mean nothing to one. Notes cross that boundary, so they are checked at the
-#      crossing.
+#   2. Guard the content. Release notes are user-facing prose on the PUBLIC site, not engineering
+#      shorthand. Today's release bodies are full of `defiantsoftware/clowder` PR links and scope
+#      names like `m12b` that mean nothing to a visitor. Notes cross that boundary, so they are
+#      checked at the crossing.
 #
 # --self-test exists because a grep that matches nothing exits 0 and looks like a pass. That is the
 # same reasoning that puts next-version.sh --self-test and check-runs-state.sh --self-test in the
@@ -70,9 +70,9 @@ guard_file() {
     echo "$hits" | sed 's/^/  /' >&2
     cat >&2 <<'EOF'
 
-  This repo is private and the site is public. Pull request numbers and links to the source repo
-  404 for every visitor, and milestone scopes like `m12b` mean nothing to one. Describe the change
-  in plain language instead.
+  Release notes are user-facing prose, not engineering shorthand. Pull request numbers, links back
+  to the source repo, and milestone scopes like `m12b` mean nothing to a visitor. Describe the
+  change in plain language instead.
 EOF
     return 1
   fi
