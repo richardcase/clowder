@@ -26,7 +26,7 @@ jobs:
     outputs:
       scope: ${{ steps.classify.outputs.scope }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # merge-base needs real history; the default depth-1 checkout has none.
           fetch-depth: 0
@@ -62,7 +62,7 @@ jobs:
       # (`no-release-note`, `no-copy-review`) become unusable.
       pull-requests: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # merge-base needs real history; the default depth-1 checkout has none.
           fetch-depth: 0
@@ -163,7 +163,7 @@ jobs:
     if: needs.changes.outputs.scope == 'product'
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Lint the Homebrew cask template (rendered with placeholder values) so a cask syntax/style error
       # is caught on the PR, not at release time when the tap bump runs. Homebrew is preinstalled.
@@ -201,7 +201,7 @@ jobs:
 
       - name: Cache libghostty (built once per pin/patch)
         id: libghostty-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             macos/vendor/libghostty/ghostty-internal.a
@@ -226,7 +226,7 @@ jobs:
         run: scripts/build-app.sh
 
       - name: Upload unsigned app artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: Clowder-app-unsigned
           # Upload the `dist` root so the artifact keeps the `Clowder.app/Contents/...` bundle structure
@@ -250,7 +250,7 @@ jobs:
       run:
         working-directory: site
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Before the build, for the reason documented in site/scripts/audit-selftest.sh: audit.sh's
       # dangerous failure mode is a silent pass, so a green build is not evidence the guards ran
@@ -259,7 +259,7 @@ jobs:
         run: ./scripts/audit-selftest.sh
 
       - name: Set up Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version-file: 'site/.nvmrc'
           cache: 'npm'
