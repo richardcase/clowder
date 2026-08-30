@@ -49,7 +49,7 @@ jobs:
     steps:
       # fetch-depth: 0 is mandatory — `git describe` on a depth-1 checkout finds no tag and would
       # silently take next-version.sh's bootstrap path.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with: { fetch-depth: 0 }
 
       # A release must be cut from main. dry_run is exempt so the plan job can be rehearsed from the
@@ -160,7 +160,7 @@ jobs:
       VERSION: ${{ needs.plan.outputs.version }}
       BASE_SHA: ${{ needs.plan.outputs.base_sha }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.plan.outputs.base_sha }}
           fetch-depth: 0
@@ -478,7 +478,7 @@ jobs:
       # The merge commit when `bump` ran; else the exact commit `plan` measured. A skipped job's
       # `outputs` is `{}`, so `merge_sha` is empty and the fallback wins. Both are SHAs on purpose —
       # `main` would re-resolve to whatever the tip is NOW, which is not what was planned.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.bump.outputs.merge_sha || needs.plan.outputs.base_sha }}
           fetch-depth: 0
@@ -512,7 +512,7 @@ jobs:
 
       - name: Cache libghostty (built once per pin/patch)
         id: libghostty-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             macos/vendor/libghostty/ghostty-internal.a
