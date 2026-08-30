@@ -220,7 +220,7 @@ pub async fn capture(spec: &CaptureSpec) -> Result<BTreeMap<String, String>> {
 /// echoed back by one (or left over in a scrollback the shell replays); a random one cannot.
 fn nonce() -> String {
     let mut raw = [0u8; 8];
-    if getrandom::getrandom(&mut raw).is_err() {
+    if getrandom::fill(&mut raw).is_err() {
         // Only reachable if the OS RNG is unavailable, at which point the daemon has bigger
         // problems. A constant marker still parses; it is just guessable.
         return "fallback".into();

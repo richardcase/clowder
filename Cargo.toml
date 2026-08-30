@@ -10,7 +10,7 @@ license = "Apache-2.0"
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec"] }
-portable-pty = "0.8"
+portable-pty = "0.9"
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["use-std"] }
 bytes = "1"
