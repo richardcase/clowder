@@ -17,14 +17,14 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 
 [target.'cfg(unix)'.dependencies]
 # raw-mode terminal control for the interactive binary only
-crossterm = "0.28"
+crossterm = "0.29"
 
 [dev-dependencies]
 clowder-daemon = { path = "../clowder-daemon" }
 clowder-workspace = { path = "../clowder-workspace" }
 tempfile = "3"
 tokio = { workspace = true, features = ["test-util"] }
-rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 
 [[bin]]
 name = "clowder"
