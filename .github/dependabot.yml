@@ -19,6 +19,11 @@ updates:
       npm-dependencies:
         patterns:
           - "*"
+    ignore:
+      # @astrojs/check (via @astrojs/language-server -> @volar/kit) only peer-supports
+      # typescript ^5 || ^6; a ^7 bump breaks `npm ci` with an ERESOLVE conflict. See PR #119.
+      - dependency-name: "typescript"
+        update-types: ["version-update:semver-major"]
     commit-message:
       prefix: "chore(deps)"
 
