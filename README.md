@@ -69,7 +69,7 @@ and survival.
 ### Homebrew (recommended)
 
 ```sh
-brew install --cask richardcase/clowder/clowder
+brew install --cask richardcase/tap/clowder
 ```
 
 Installs the signed + notarized `Clowder.app` and puts the `clowder` CLI on `PATH`. See

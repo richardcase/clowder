@@ -77,7 +77,7 @@ check pass root-absolute-asset '<img src="/favicon.svg"><link href="/style.css">
 
 # --- a wholly clean page must pass -------------------------------------------
 check pass clean-page \
-  '<a href="https://github.com/richardcase/homebrew-clowder">tap</a><img src="/favicon.svg">'
+  '<a href="https://github.com/richardcase/homebrew-tap">tap</a><img src="/favicon.svg">'
 
 # --- check 2: build-secret / source leakage -----------------------------------
 check_file fail leaked-rust    'main.rs'

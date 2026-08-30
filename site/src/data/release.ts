@@ -1,9 +1,11 @@
 /**
  * Latest-release facts, resolved at build time.
  *
- * The signed + notarized DMG is re-hosted on the public Homebrew tap repo rather than read from the
- * Clowder source repo's own Releases (richardcase/clowder) — see docs/homebrew.md for why. That
- * tap is therefore the source of truth here.
+ * Reads the Clowder source repo's own latest GitHub Release (richardcase/clowder) directly. The
+ * signed + notarized DMG used to be re-hosted on the public Homebrew tap repo instead, back when
+ * the source repo was private and its release assets weren't downloadable without auth — see
+ * docs/homebrew.md for that history. Now that the source repo is public, its own Releases are the
+ * source of truth here, same as the Homebrew cask itself points at.
  *
  * A daily scheduled rebuild keeps this current without anyone editing a file.
  *
@@ -25,8 +27,8 @@
  * workflows provide. See fetchOnce for why that matters on a CI runner.
  */
 
-const TAP_REPO = 'richardcase/homebrew-clowder';
-const RELEASES_API = `https://api.github.com/repos/${TAP_REPO}/releases/latest`;
+const SOURCE_REPO = 'richardcase/clowder';
+const RELEASES_API = `https://api.github.com/repos/${SOURCE_REPO}/releases/latest`;
 
 /**
  * Whether to treat a degraded build as fatal. GitHub Actions sets CI=true; the
@@ -34,10 +36,10 @@ const RELEASES_API = `https://api.github.com/repos/${TAP_REPO}/releases/latest`;
  */
 const IS_CI = Boolean(process.env.CI) && process.env.CI !== 'false';
 
-/** Last known-good values. Verified 2026-08-12. */
+/** Last known-good values. Verified 2026-08-30 against SOURCE_REPO's own v0.6.0 release. */
 const FALLBACK = {
   version: '0.6.0',
-  dmgUrl: `https://github.com/${TAP_REPO}/releases/download/v0.6.0/Clowder-0.6.0-macos.dmg`,
+  dmgUrl: `https://github.com/${SOURCE_REPO}/releases/download/v0.6.0/Clowder-0.6.0-macos.dmg`,
   dmgSizeMb: 21,
 } as const;
 
@@ -134,7 +136,7 @@ async function fetchRelease(): Promise<Release> {
   }
 
   console.warn(
-    `[release] Falling back to pinned v${FALLBACK.version} — could not read ${TAP_REPO}: ${
+    `[release] Falling back to pinned v${FALLBACK.version} — could not read ${SOURCE_REPO}: ${
       lastErr instanceof Error ? lastErr.message : lastErr
     }`,
   );
@@ -186,11 +188,11 @@ async function assertPublishable(release: Release): Promise<void> {
 
   if (release.stale) {
     throw new Error(
-      `[release] Refusing to build: could not read the latest release from ${TAP_REPO}, ` +
+      `[release] Refusing to build: could not read the latest release from ${SOURCE_REPO}, ` +
         `and publishing would advertise the pinned v${FALLBACK.version} as current.\n` +
         `  The warning above has the underlying cause.\n` +
         `  The previously deployed site is untouched, so nothing is broken for visitors.\n` +
-        `  If the tap really has changed shape, update FALLBACK in src/data/release.ts.`,
+        `  If the source repo really has changed shape, update FALLBACK in src/data/release.ts.`,
     );
   }
 

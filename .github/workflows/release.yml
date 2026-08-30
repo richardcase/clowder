@@ -553,8 +553,9 @@ jobs:
 
       # Fail here, not at the tap publish 7 steps later. That step runs AFTER the commit is tagged
       # and the GitHub Release is published, so a token problem there strands a signed, notarized,
-      # tagged, published release with nothing installable on the tap and a manual cleanup to do.
-      # Here, nothing has been signed or published: the run just stops.
+      # tagged, published release whose cask never gets bumped (the DMG itself is fine — it lives on
+      # this repo's own Release, not the tap — but `brew upgrade` won't see the new version without
+      # manual cleanup). Here, nothing has been signed or published: the run just stops.
       #
       # This is not hypothetical. v0.7.0 failed exactly that way with `403 Resource not accessible by
       # personal access token`. Root cause: a fine-grained PAT is granted against a specific resource
@@ -562,7 +563,9 @@ jobs:
       # moved to the defiantsoftware org on 2026-08-12, ten minutes after the last publish that used
       # the old grant — so the token kept working until the next release needed it, four days later.
       # It moved again, back to the richardcase account, on 2026-08-30 when clowder went open source
-      # under Apache-2.0 — the PAT was reissued under the new resource owner at that time too.
+      # under Apache-2.0 — the PAT was reissued under the new resource owner at that time too. On
+      # 2026-08-30 the cask also moved off its clowder-specific tap (richardcase/homebrew-clowder)
+      # onto a shared tap (richardcase/homebrew-tap), which needed its own reissued PAT grant.
       #
       # `.permissions.push` reflects what THIS token can actually do on the repo, so it catches a
       # revoked, re-scoped or org-transferred grant without writing anything.
@@ -570,7 +573,7 @@ jobs:
         if: ${{ steps.signing.outputs.enabled == 'true' && needs.plan.outputs.prerelease != 'true' }}
         env:
           GH_TOKEN: ${{ steps.doppler.outputs.HOMEBREW_TAP_TOKEN }}
-          TAP_REPO: richardcase/homebrew-clowder
+          TAP_REPO: richardcase/homebrew-tap
         run: |
           if [ -z "$GH_TOKEN" ]; then
             echo "::warning::No HOMEBREW_TAP_TOKEN in Doppler — the tap publish will be skipped."
@@ -706,7 +709,25 @@ jobs:
             > launch macOS Gatekeeper will quarantine it — right-click the app → **Open**, or run
             > `xattr -dr com.apple.quarantine Clowder.app`.
 
-      - name: Update Homebrew tap (publish DMG + cask bump)
+      # The site reads clowder's own GitHub Release directly (site/src/data/release.ts), which the
+      # steps above already published — so this no longer needs to wait on (or depend on the success
+      # of) the Homebrew tap's cask bump below. Deliberately placed here, right after publishing,
+      # rather than after the tap step.
+      #
+      # `workflow_dispatch` is the documented exception to "refs pushed with GITHUB_TOKEN do not
+      # start workflow runs" — the same reason ci.yml accepts it.
+      #
+      # Deliberately not a failure: the release itself has already succeeded and been published by
+      # this point, and the daily schedule is the backstop. Failing here would report a broken
+      # release that is not broken.
+      - name: Refresh the site (it reads the source repo's release)
+        if: ${{ steps.signing.outputs.enabled == 'true' && needs.plan.outputs.prerelease != 'true' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run deploy-site.yml --ref main
+
+      - name: Update Homebrew tap (cask bump)
         if: ${{ steps.signing.outputs.enabled == 'true' && needs.plan.outputs.prerelease != 'true' }}
         env:
           HOMEBREW_TAP_TOKEN: ${{ steps.doppler.outputs.HOMEBREW_TAP_TOKEN }}
@@ -716,23 +737,6 @@ jobs:
             exit 0
           fi
           scripts/update-homebrew-tap.sh
-
-      # The tap release is what the site reads, and it is only published by the step above — after
-      # the bump PR merged and its own push-triggered deploy already ran against the previous
-      # version. Without this the site advertises the old release until the next daily rebuild.
-      #
-      # `workflow_dispatch` is the documented exception to "refs pushed with GITHUB_TOKEN do not
-      # start workflow runs" — the same reason ci.yml accepts it.
-      #
-      # Deliberately not a failure: the release itself has already succeeded and been published by
-      # this point, and the daily schedule is the backstop. Failing here would report a broken
-      # release that is not broken.
-      - name: Refresh the site (it reads the tap release)
-        if: ${{ steps.signing.outputs.enabled == 'true' && needs.plan.outputs.prerelease != 'true' }}
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh workflow run deploy-site.yml --ref main
 
       - name: Remove temp signing keychain
         if: ${{ always() && steps.signing.outputs.enabled == 'true' }}

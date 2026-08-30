@@ -161,7 +161,7 @@ self_test() {
 
   # Must be accepted — the public repos share a prefix with the private one, and ordinary prose
   # about the product must not trip the guard.
-  check_guard clean tap-link       'Install with the tap at https://github.com/richardcase/homebrew-clowder'
+  check_guard clean tap-link       'Install with the tap at https://github.com/richardcase/homebrew-tap'
   check_guard clean site-link      'https://github.com/richardcase/clowder-site is the old site repo'
   check_guard clean plain-prose    'Connect the app to a Clowder daemon on another machine over TLS.'
   check_guard clean version-number 'Requires macOS 14 or later.'
