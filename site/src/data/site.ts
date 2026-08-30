@@ -11,8 +11,8 @@ export const site = {
   description:
     'Clowder is a native macOS terminal that orchestrates Claude Code, Codex and shell agents — each isolated in its own git worktree — and tells you which one needs your attention.',
   url: 'https://getclowder.app',
-  tapRepo: 'https://github.com/defiantsoftware/homebrew-clowder',
-  installCmd: 'brew install --cask defiantsoftware/clowder/clowder',
+  tapRepo: 'https://github.com/richardcase/homebrew-clowder',
+  installCmd: 'brew install --cask richardcase/clowder/clowder',
   upgradeCmd: 'brew upgrade --cask clowder',
   uninstallCmd: 'brew uninstall --cask clowder',
   /** Matches LSMinimumSystemVersion in the shipped 0.6.0 Info.plist. */

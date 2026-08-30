@@ -1,10 +1,9 @@
 /**
  * Latest-release facts, resolved at build time.
  *
- * The Clowder *source* repo (defiantsoftware/clowder) is private, so its release
- * assets are not publicly downloadable. The signed + notarized DMG is
- * re-hosted on the public Homebrew tap repo so `brew` (and this site) can
- * fetch it unauthenticated. That tap is therefore the source of truth here.
+ * The signed + notarized DMG is re-hosted on the public Homebrew tap repo rather than read from the
+ * Clowder source repo's own Releases (richardcase/clowder) — see docs/homebrew.md for why. That
+ * tap is therefore the source of truth here.
  *
  * A daily scheduled rebuild keeps this current without anyone editing a file.
  *
@@ -26,7 +25,7 @@
  * workflows provide. See fetchOnce for why that matters on a CI runner.
  */
 
-const TAP_REPO = 'defiantsoftware/homebrew-clowder';
+const TAP_REPO = 'richardcase/homebrew-clowder';
 const RELEASES_API = `https://api.github.com/repos/${TAP_REPO}/releases/latest`;
 
 /**

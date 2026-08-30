@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Publish the DMG + cask to the PUBLIC Homebrew tap. The clowder source repo is private, so its release
-# assets aren't publicly downloadable — the DMG is (re)hosted on the tap repo's Releases, and the cask
-# points there. Called by release.yml on a final (non-pre-release) signed release.
+# Publish the DMG + cask to the PUBLIC Homebrew tap. The DMG is (re)hosted on the tap repo's
+# Releases rather than the cask pointing at the source repo's own Releases — see docs/homebrew.md
+# for why. Called by release.yml on a final (non-pre-release) signed release.
 #
 # Env:
 #   VERSION              (default: the repo VERSION file)
 #   DMG                  (default: dist/Clowder-<VERSION>-macos.dmg)
-#   TAP_REPO             owner/name of the tap repo (default: defiantsoftware/homebrew-clowder)
+#   TAP_REPO             owner/name of the tap repo (default: richardcase/homebrew-clowder)
 #   HOMEBREW_TAP_TOKEN   REQUIRED — fine-grained PAT with contents:write on the tap repo. Used for both
 #                        the `gh` release upload and the cask `git push` (https).
 set -euo pipefail
@@ -14,7 +14,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 VERSION="${VERSION:-$(tr -d '[:space:]' < "$ROOT/VERSION")}"
 DMG="${DMG:-$ROOT/dist/Clowder-$VERSION-macos.dmg}"
-TAP_REPO="${TAP_REPO:-defiantsoftware/homebrew-clowder}"
+TAP_REPO="${TAP_REPO:-richardcase/homebrew-clowder}"
 TEMPLATE="$ROOT/scripts/homebrew/clowder.rb.tmpl"
 
 # Validate before deriving anything from it. This script is documented as manually runnable, takes

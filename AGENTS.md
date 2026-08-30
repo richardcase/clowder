@@ -23,7 +23,7 @@ socket drives the app's sidebar, spawning, and splits.
 | `crates/clowder-vt` | Headless scanner for terminal attention signals (BEL, OSC 9, OSC 777) via `vte` — signal detection only, no cell grid | lib |
 | `crates/clowder-workspace` | Per-agent worktree provisioning: `WorkspaceDriver` (`GitWorktreeDriver` / jj), `WorkspaceKind {Git, Jj}`, provision/land/discard; `WorktreeLayout` owns where worktrees go (outside the project) | lib |
 | `macos/` | SwiftPM package: `ClowderCore` (lib, libghostty-free, unit-tested) + `clowder-app` (exe, links vendored libghostty via `GhosttyKit`). The Settings window (⌘,) has two panes: `SettingsView` → `HostsSettingsView` (list + editor) → `HostEditorView` → `PairingSheet`, and `SettingsView` → `AgentsSettingsView` → `AgentEditorView`. All of them render only — every decision (validation, add/edit/remove/pair, argument parsing) lives in `ClowderCore`'s `HostsViewModel` / `AgentsViewModel` / `AgentArgs`, since `clowder-app` has no test target | — |
-| `site/` | The public marketing site for `getclowder.app` (Astro, deployed to GitHub Pages). Ubuntu-only CI; **never** link to this repo from it — it is private and `site/scripts/audit.sh` fails the build on such a link | — |
+| `site/` | The public marketing site for `getclowder.app` (Astro, deployed to GitHub Pages). Ubuntu-only CI; `site/scripts/audit.sh` guards against product-source/CI-secret leakage into the build | — |
 | `scripts/` | `build-app.sh`, `build-libghostty.sh`, `set-version.sh`, `gen-icon.swift` | — |
 | `docs/` | `superpowers/` (design specs + plans), `versioning.md`, `building-libghostty.md`, `code-signing.md` | — |
 
@@ -301,7 +301,7 @@ is now the one place that computes it, and the app is the only caller that passe
     `gpg.ssh.allowedSignersFile` is configured — with SSH signing, git cannot verify without it, and
     reports the signature as absent rather than unverifiable. Do not trust `%G?` here. Check for the
     header directly (`git cat-file commit <sha> | grep -q gpgsig`), or ask GitHub
-    (`gh api repos/defiantsoftware/clowder/commits/<sha> --jq .commit.verification`).
+    (`gh api repos/richardcase/clowder/commits/<sha> --jq .commit.verification`).
 - **Commit messages are Conventional Commits** — `type(scope): subject`, with `type` one of `feat`,
   `fix`, `docs`, `test`, `refactor`, `perf`, `ci`, `chore`, `build`, `style`, `revert`; scope
   optional and free-form (`daemon`, `app`, `m10c`, `proto,daemon` are all fine); `!` before the colon
@@ -319,9 +319,10 @@ is now the one place that computes it, and the app is the only caller that passe
   among the `pull_request` activity types `ci.yml` reacts to, since that would re-run the macOS build
   on every label toggle, so **adding a label does not retrigger CI** — see the label gotcha below for
   what actually makes it take effect. `scripts/check-release-notes.sh` enforces both the
-  requirement and the content: this repo is private and the site is public, so a note that leaks a
-  `#123` PR reference, a milestone scope like `m11a`, or a link to the private repo fails the guard —
-  see the script's own comments for the full pattern rationale.
+  requirement and the content: release notes are user-facing, plain-language prose, not engineering
+  shorthand, so a note that leaks a `#123` PR reference, a milestone scope like `m11a`, or a link
+  back to the source repo fails the guard — see the script's own comments for the full pattern
+  rationale.
 - **A FAQ entry that states a limitation carries `gap: <issue>`** (`site/src/components/Faq.astro`) —
   a promise that the claim holds only while that issue stays open. `scripts/check-copy-claims.sh`
   checks the issue's state on every PR and fails the moment it closes, so whoever closes the issue

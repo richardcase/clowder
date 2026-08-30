@@ -1,6 +1,6 @@
 name: Deploy site to GitHub Pages
 
-# NOTE: until the domain cutover, defiantsoftware/clowder-site still serves getclowder.app. This
+# NOTE: until the domain cutover, richardcase/clowder-site still serves getclowder.app. This
 # workflow can be dispatched to verify the build, but Pages is not yet enabled on this repo, so the
 # `deploy` job will fail until it is. That is expected and is the cutover's first step.
 on:

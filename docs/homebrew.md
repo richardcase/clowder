@@ -1,18 +1,20 @@
 # Homebrew distribution (cask + tap)
 
-Clowder ships a Homebrew **cask** from an organization **tap** (`defiantsoftware/homebrew-clowder`). Each **final**
+Clowder ships a Homebrew **cask** from a **tap** (`richardcase/homebrew-clowder`). Each **final**
 signed release auto-updates the cask, so users get new versions with `brew upgrade`.
 
-> The clowder **source repo is private**, so its release assets aren't publicly downloadable. The signed
-> DMG is therefore (re)hosted on the **public tap repo's** Releases, and the cask points there — the
-> source stays private while the binary is publicly installable.
+> The signed DMG is (re)hosted on the **tap repo's** Releases rather than the cask pointing at the
+> source repo's own Releases, and the cask points there. This predates clowder going public/open
+> source (when the source repo's release assets weren't downloadable without auth) and hasn't been
+> revisited since — now that the source repo is public too, pointing the cask directly at its
+> Releases may be simpler; that's a candidate follow-up, not done here.
 
 ## Install
 
 ```sh
-brew install --cask defiantsoftware/clowder/clowder
+brew install --cask richardcase/clowder/clowder
 # or:
-brew tap defiantsoftware/clowder
+brew tap richardcase/clowder
 brew install --cask clowder
 ```
 
@@ -42,11 +44,11 @@ fails the run if a real push fails (so cask drift is visible).
 
 ### a. Create the tap repo
 
-A public repo named `homebrew-<tap>` — here `defiantsoftware/homebrew-clowder` (installed as
-`defiantsoftware/clowder`). The first final release seeds `Casks/clowder.rb`; no manual cask commit needed.
+A public repo named `homebrew-<tap>` — here `richardcase/homebrew-clowder` (installed as
+`richardcase/clowder`). The first final release seeds `Casks/clowder.rb`; no manual cask commit needed.
 
 ```sh
-gh repo create defiantsoftware/homebrew-clowder --public --add-readme
+gh repo create richardcase/homebrew-clowder --public --add-readme
 ```
 
 ### b. Create a fine-grained PAT and store it in Doppler
@@ -56,13 +58,14 @@ asset), which an SSH deploy key can't do — so use a **fine-grained personal ac
 the tap repo:
 
 1. GitHub → **Settings → Developer settings → Fine-grained tokens → Generate new token**. Resource owner
-   **defiantsoftware**; **Only select repositories → `homebrew-clowder`**; Repository permissions →
+   **richardcase**; **Only select repositories → `homebrew-clowder`**; Repository permissions →
    **Contents: Read and write**. (Metadata read is added automatically.)
 
-   > Fine-grained PATs are bound to their **resource owner**, so a token issued under a personal account
-   > stops working the moment the tap moves to the org — it must be re-minted with `defiantsoftware` as
-   > the owner. The org must also permit fine-grained tokens (Organization settings → **Personal access
-   > tokens**), which has no personal-account equivalent; without it the token is created but denied.
+   > Fine-grained PATs are bound to their **resource owner**, so a token stops working the moment the tap
+   > moves to a different owner — it must be re-minted against whichever owner holds the repo now. (If
+   > the tap ever moves to an organization, note that orgs must separately permit fine-grained tokens
+   > under Organization settings → **Personal access tokens**, which has no personal-account equivalent —
+   > without it the token is created but denied.)
 2. Put the token in the Doppler **release config** as `HOMEBREW_TAP_TOKEN` (alongside the signing
    secrets — see [`code-signing.md`](code-signing.md)).
 
@@ -73,24 +76,27 @@ does both the DMG release-upload and the cask git push.
 > A **missing** token warns + skips the bump; an **expired** one (present but invalid) fails the bump step
 > red — a visible signal to rotate.
 
-### The grant does not survive an org transfer
+### The grant does not survive an owner transfer
 
 A fine-grained PAT is granted against a **specific resource owner and repository**. Moving the tap to a
 different owner does not carry the grant with it: the token keeps authenticating, so it does not look
 expired, but every write returns `403 Resource not accessible by personal access token`.
 
-This has happened once, and the timeline is worth keeping because it is not obvious from the symptom:
+This has happened twice now, and the timeline is worth keeping because it is not obvious from the symptom:
 
 ```
 2026-08-12 12:25Z   v0.6.0 published to the tap — last release under the old grant
 2026-08-12 12:36Z   main repo moved to the defiantsoftware org
 2026-08-12 12:53Z   tap repo moved
 2026-08-16          v0.7.0 — first release needing the token since — 403
+2026-08-30          clowder open-sourced under Apache-2.0; main repo and tap repo both moved from
+                     the defiantsoftware org back to the richardcase account. The PAT was reissued
+                     under the new resource owner as part of the same change.
 ```
 
-Four days of apparently healthy repos, because nothing had asked the token to write in between. **After any
-org transfer or repo rename, reissue the PAT and update Doppler before the next release** — do not wait for
-the release to tell you.
+Four days of apparently healthy repos in 2026-08, because nothing had asked the token to write in between.
+**After any owner transfer or repo rename, reissue the PAT and update Doppler before the next release** —
+do not wait for the release to tell you.
 
 `release.yml` now checks `repos/<tap>` for `.permissions.push` **before** it signs or tags anything
 (`Verify the Homebrew tap token can still write`), so a bad grant stops the run while it is still cheap. It
@@ -110,6 +116,6 @@ git push && git push origin vX.Y.Z
 
 ```sh
 brew style Casks/clowder.rb            # cask lint (also enforced on every PR in ci.yml)
-brew info --cask defiantsoftware/clowder/clowder
+brew info --cask richardcase/clowder/clowder
 brew livecheck --cask clowder          # should report the latest final version
 ```
