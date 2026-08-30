@@ -123,7 +123,7 @@ distinct causes the workflow reports:
 
 **A tag exists but no release was published.** Possible if the tag push succeeded and publishing then
 failed. `gh release delete --cleanup-tag` does not work in that state — delete the ref directly:
-`gh api -X DELETE repos/defiantsoftware/clowder/git/refs/tags/vX.Y.Z`.
+`gh api -X DELETE repos/richardcase/clowder/git/refs/tags/vX.Y.Z`.
 
 **The workflow refuses to start.** The guard rails in `plan` fail loudly rather than doing something
 surprising:
@@ -182,7 +182,7 @@ The workflow depends on two settings that are easy to lose and hard to diagnose:
 
 ```sh
 # Actions must be allowed to open the bump PR, or `POST /pulls` returns 403.
-gh api -X PUT repos/defiantsoftware/clowder/actions/permissions/workflow \
+gh api -X PUT repos/richardcase/clowder/actions/permissions/workflow \
   -F default_workflow_permissions=read -F can_approve_pull_request_reviews=true
 
 # The `release` label marks the bump PR so it is excluded from its own release notes

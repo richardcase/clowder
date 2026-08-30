@@ -6,8 +6,9 @@
 #      commit: three fixes need one note, not three.
 #
 #   2. Guard the content. This repo is PRIVATE and the site is PUBLIC. Today's release bodies are
-#      full of `richardcase/clowder` PR links that 404 for every visitor and scope names like `m12b`
-#      that mean nothing to one. Notes cross that boundary, so they are checked at the crossing.
+#      full of `defiantsoftware/clowder` PR links that 404 for every visitor and scope names like
+#      `m12b` that mean nothing to one. Notes cross that boundary, so they are checked at the
+#      crossing.
 #
 # --self-test exists because a grep that matches nothing exits 0 and looks like a pass. That is the
 # same reasoning that puts next-version.sh --self-test and check-runs-state.sh --self-test in the
@@ -24,20 +25,20 @@ LABEL='no-release-note'
 # Patterns that must never reach a public page, split into two groups that need DIFFERENT case
 # handling — see the case-insensitive/-sensitive split in guard_file below:
 #
-#   - FORBIDDEN_LINK: the private repo under either owner (the org moved; both forms exist in old
-#     release bodies). Case-INsensitive: a URL is a URL whether or not a client-side link-checker
-#     or a human typo'd the host/owner casing (`GitHub.com`, `DefiantSoftware`) — there is no
-#     legitimate reason for case to matter here.
-#     Boundary: `github\.com/defiantsoftware/clowder` must be rejected as a bare mention (end of
+#   - FORBIDDEN_LINK: the private repo under either owner (the org moved back; both forms exist in
+#     old release bodies). Case-INsensitive: a URL is a URL whether or not a client-side
+#     link-checker or a human typo'd the host/owner casing (`GitHub.com`, `RichardCase`) — there is
+#     no legitimate reason for case to matter here.
+#     Boundary: `github\.com/richardcase/clowder` must be rejected as a bare mention (end of
 #     string), inside a markdown link `[text](url)` (next char `)`), and followed by ordinary
 #     prose punctuation (`.`, `,`) or whitespace — but NOT when it is a prefix of a longer,
 #     legitimate repo name (`clowder-site`, and by construction `homebrew-clowder` never matches
-#     the literal at all since "clowder" there isn't preceded by "defiantsoftware/"). A negated
+#     the literal at all since "clowder" there isn't preceded by "richardcase/"). A negated
 #     word-or-hyphen class captures exactly that: reject unless the next char continues a
 #     path/word segment. This replaces an earlier `([/"?#]|$)` boundary that was copied from
 #     site/scripts/audit.sh, which scans *built HTML* where a link is always followed by `"` —
 #     right for that medium, wrong for markdown prose, where the terminators are `)`, `.`, `,`,
-#     and whitespace. The old owner (`richardcase`) is deliberately left with NO boundary: that
+#     and whitespace. The old owner (`defiantsoftware`) is deliberately left with NO boundary: that
 #     org has no legitimate public repos left to false-positive on, so any mention at all — with
 #     any suffix — is suspicious.
 #   - FORBIDDEN_OTHER: `#123` PR/issue references (which resolve to nothing public) and internal
@@ -50,7 +51,7 @@ LABEL='no-release-note'
 #     guarantee: nothing distinguishes a genuine 6-digit issue number from a hex colour by pattern
 #     alone, and this repo is nowhere near 100,000 PRs. Accepted trade-off, not a design to defend
 #     past this repo's scale.
-FORBIDDEN_LINK='github\.com/richardcase/clowder|github\.com/defiantsoftware/clowder([^A-Za-z0-9_-]|$)'
+FORBIDDEN_LINK='github\.com/defiantsoftware/clowder|github\.com/richardcase/clowder([^A-Za-z0-9_-]|$)'
 FORBIDDEN_OTHER='#[0-9]{1,5}([^0-9]|$)|\bm[0-9]+[a-z]?\b'
 
 die() { echo "error: $*" >&2; exit 2; }
@@ -140,28 +141,28 @@ self_test() {
   echo "check-release-notes: verifying the content guard"
 
   # Must be rejected — these are the exact shapes today's release bodies contain.
-  check_guard violation old-owner-link   'See https://github.com/richardcase/clowder/pull/72 for detail.'
-  check_guard violation new-owner-link   'Source: https://github.com/defiantsoftware/clowder'
-  check_guard violation owner-link-path  'https://github.com/defiantsoftware/clowder/issues/1'
+  check_guard violation old-owner-link   'See https://github.com/defiantsoftware/clowder/pull/72 for detail.'
+  check_guard violation new-owner-link   'Source: https://github.com/richardcase/clowder'
+  check_guard violation owner-link-path  'https://github.com/richardcase/clowder/issues/1'
   check_guard violation pr-reference     'Fixed the pane resize bug (#82).'
   check_guard violation milestone-scope  'Landed as part of m11a.'
   check_guard violation milestone-plain  'The m7d work is complete.'
 
   # Case-insensitivity on the link patterns only (fix round 1, Finding 2). Verified against the
   # unfixed script before this fix landed: both passed clean.
-  check_guard violation link-case-domain 'https://GitHub.com/defiantsoftware/clowder/issues/1'
-  check_guard violation link-case-owner  'https://github.com/DefiantSoftware/Clowder/issues/1'
+  check_guard violation link-case-domain 'https://GitHub.com/richardcase/clowder/issues/1'
+  check_guard violation link-case-owner  'https://github.com/RichardCase/Clowder/issues/1'
 
   # Boundary widening (fix round 1, Finding 3) — markdown's actual terminators, not built-HTML's.
   # Verified against the unfixed script before this fix landed: all three passed clean.
-  check_guard violation markdown-link  'See [the repo](https://github.com/defiantsoftware/clowder).'
-  check_guard violation trailing-period 'Read more at https://github.com/defiantsoftware/clowder.'
-  check_guard violation trailing-comma  'Source: https://github.com/defiantsoftware/clowder, more soon.'
+  check_guard violation markdown-link  'See [the repo](https://github.com/richardcase/clowder).'
+  check_guard violation trailing-period 'Read more at https://github.com/richardcase/clowder.'
+  check_guard violation trailing-comma  'Source: https://github.com/richardcase/clowder, more soon.'
 
   # Must be accepted — the public repos share a prefix with the private one, and ordinary prose
   # about the product must not trip the guard.
-  check_guard clean tap-link       'Install with the tap at https://github.com/defiantsoftware/homebrew-clowder'
-  check_guard clean site-link      'https://github.com/defiantsoftware/clowder-site is the old site repo'
+  check_guard clean tap-link       'Install with the tap at https://github.com/richardcase/homebrew-clowder'
+  check_guard clean site-link      'https://github.com/richardcase/clowder-site is the old site repo'
   check_guard clean plain-prose    'Connect the app to a Clowder daemon on another machine over TLS.'
   check_guard clean version-number 'Requires macOS 14 or later.'
   # A markdown heading is `#` followed by a space, not digits — must not trip the `#[0-9]+` rule.

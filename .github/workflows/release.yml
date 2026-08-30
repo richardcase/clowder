@@ -561,6 +561,8 @@ jobs:
       # owner and repository, and that grant does NOT follow a repo across an org transfer. The tap
       # moved to the defiantsoftware org on 2026-08-12, ten minutes after the last publish that used
       # the old grant — so the token kept working until the next release needed it, four days later.
+      # It moved again, back to the richardcase account, on 2026-08-30 when clowder went open source
+      # under Apache-2.0 — the PAT was reissued under the new resource owner at that time too.
       #
       # `.permissions.push` reflects what THIS token can actually do on the repo, so it catches a
       # revoked, re-scoped or org-transferred grant without writing anything.
@@ -568,7 +570,7 @@ jobs:
         if: ${{ steps.signing.outputs.enabled == 'true' && needs.plan.outputs.prerelease != 'true' }}
         env:
           GH_TOKEN: ${{ steps.doppler.outputs.HOMEBREW_TAP_TOKEN }}
-          TAP_REPO: defiantsoftware/homebrew-clowder
+          TAP_REPO: richardcase/homebrew-clowder
         run: |
           if [ -z "$GH_TOKEN" ]; then
             echo "::warning::No HOMEBREW_TAP_TOKEN in Doppler — the tap publish will be skipped."
@@ -576,7 +578,7 @@ jobs:
           fi
           if ! push="$(gh api "repos/$TAP_REPO" --jq .permissions.push 2>&1)"; then
             echo "::error::cannot read $TAP_REPO with HOMEBREW_TAP_TOKEN: $push"
-            echo "::error::Reissue the fine-grained PAT (resource owner defiantsoftware, only"
+            echo "::error::Reissue the fine-grained PAT (resource owner richardcase, only"
             echo "::error::$TAP_REPO, Contents: Read and write) and update it in Doppler."
             exit 1
           fi

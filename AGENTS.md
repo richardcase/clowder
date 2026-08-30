@@ -301,7 +301,7 @@ is now the one place that computes it, and the app is the only caller that passe
     `gpg.ssh.allowedSignersFile` is configured — with SSH signing, git cannot verify without it, and
     reports the signature as absent rather than unverifiable. Do not trust `%G?` here. Check for the
     header directly (`git cat-file commit <sha> | grep -q gpgsig`), or ask GitHub
-    (`gh api repos/defiantsoftware/clowder/commits/<sha> --jq .commit.verification`).
+    (`gh api repos/richardcase/clowder/commits/<sha> --jq .commit.verification`).
 - **Commit messages are Conventional Commits** — `type(scope): subject`, with `type` one of `feat`,
   `fix`, `docs`, `test`, `refactor`, `perf`, `ci`, `chore`, `build`, `style`, `revert`; scope
   optional and free-form (`daemon`, `app`, `m10c`, `proto,daemon` are all fine); `!` before the colon

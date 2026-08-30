@@ -6,7 +6,7 @@
 # Env:
 #   VERSION              (default: the repo VERSION file)
 #   DMG                  (default: dist/Clowder-<VERSION>-macos.dmg)
-#   TAP_REPO             owner/name of the tap repo (default: defiantsoftware/homebrew-clowder)
+#   TAP_REPO             owner/name of the tap repo (default: richardcase/homebrew-clowder)
 #   HOMEBREW_TAP_TOKEN   REQUIRED — fine-grained PAT with contents:write on the tap repo. Used for both
 #                        the `gh` release upload and the cask `git push` (https).
 set -euo pipefail
@@ -14,7 +14,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 VERSION="${VERSION:-$(tr -d '[:space:]' < "$ROOT/VERSION")}"
 DMG="${DMG:-$ROOT/dist/Clowder-$VERSION-macos.dmg}"
-TAP_REPO="${TAP_REPO:-defiantsoftware/homebrew-clowder}"
+TAP_REPO="${TAP_REPO:-richardcase/homebrew-clowder}"
 TEMPLATE="$ROOT/scripts/homebrew/clowder.rb.tmpl"
 
 # Validate before deriving anything from it. This script is documented as manually runnable, takes
