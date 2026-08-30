@@ -13,6 +13,8 @@ struct ContentView: View {
     let onRetry: () -> Void
 
     @State private var expanded: Set<String> = ContentView.loadExpanded()
+    @State private var showCopiedToast = false
+    @State private var copiedToastWorkItem: DispatchWorkItem?
 
     var body: some View {
         NavigationSplitView {
@@ -44,6 +46,13 @@ struct ContentView: View {
             }
         }
         .safeAreaInset(edge: .bottom) { statusBar }
+        .overlay(alignment: .bottom) {
+            if showCopiedToast {
+                copiedToast
+                    .padding(.bottom, 40)
+                    .transition(.opacity.combined(with: .scale(scale: 0.95)))
+            }
+        }
         // A landed/discarded/lost worktree's SurfaceView (and its ghostty surface) would
         // otherwise stay cached for the app's lifetime — evict it once the worktree is gone from
         // the store, whatever removed it (land, discard, or the daemon losing track of it).
@@ -290,6 +299,35 @@ struct ContentView: View {
         .frame(maxWidth: .infinity)
         .background(color.opacity(0.15))
         .foregroundStyle(color)
+        .contentShape(Rectangle())
+        .onTapGesture { copyBanner(text) }
+        .onHover { hovering in
+            if hovering { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+        }
+        .help("Click to copy")
+    }
+
+    /// Copies a banner's message to the system clipboard and shows a transient confirmation. The
+    /// dismiss button (when present) consumes mouse-down before this row's tap gesture sees it, so
+    /// dismissing an error never also copies it.
+    private func copyBanner(_ text: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+
+        copiedToastWorkItem?.cancel()
+        withAnimation { showCopiedToast = true }
+        let workItem = DispatchWorkItem { withAnimation { showCopiedToast = false } }
+        copiedToastWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: workItem)
+    }
+
+    private var copiedToast: some View {
+        Text("Copied to clipboard")
+            .font(.callout)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .background(.regularMaterial, in: Capsule())
+            .shadow(radius: 2)
     }
 
     private func color(for state: AttentionState) -> Color {
