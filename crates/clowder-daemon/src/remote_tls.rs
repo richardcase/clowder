@@ -34,11 +34,11 @@ pub fn load_or_generate() -> Result<RemoteCreds> {
     let cert = rcgen::generate_simple_self_signed(vec!["clowder".to_string()])
         .context("generate self-signed cert")?;
     let cert_pem = cert.cert.pem();
-    let key_pem = cert.key_pair.serialize_pem();
+    let key_pem = cert.signing_key.serialize_pem();
     let cert_der = cert.cert.der().to_vec();
 
     let mut raw = [0u8; 32];
-    getrandom::getrandom(&mut raw).map_err(|e| anyhow::anyhow!("getrandom: {e}"))?;
+    getrandom::fill(&mut raw).map_err(|e| anyhow::anyhow!("getrandom: {e}"))?;
     let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw);
 
     if let Some(dir) = cert_p.parent() {

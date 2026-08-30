@@ -18,9 +18,7 @@ impl Screen {
     }
 
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<AttentionSignal> {
-        for &b in bytes {
-            self.parser.advance(&mut self.inner, b);
-        }
+        self.parser.advance(&mut self.inner, bytes);
         std::mem::take(&mut self.inner.signals)
     }
 

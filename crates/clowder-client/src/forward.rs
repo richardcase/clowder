@@ -226,7 +226,7 @@ mod tests {
         let ck = rcgen::generate_simple_self_signed(vec!["clowder".to_string()]).unwrap();
         let cert_der = ck.cert.der().to_vec();
         let fp = clowder_proto::cert_fingerprint_hex(&cert_der);
-        let key_der = ck.key_pair.serialize_der();
+        let key_der = ck.signing_key.serialize_der();
         let provider = Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
         let config = ServerConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()
