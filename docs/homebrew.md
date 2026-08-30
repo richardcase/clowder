@@ -1,20 +1,29 @@
 # Homebrew distribution (cask + tap)
 
-Clowder ships a Homebrew **cask** from a **tap** (`richardcase/homebrew-clowder`). Each **final**
-signed release auto-updates the cask, so users get new versions with `brew upgrade`.
+Clowder ships a Homebrew **cask** from a shared **tap** (`richardcase/homebrew-tap`) — one tap repo
+for all of richardcase's casks/formulae, not a clowder-specific one. Each **final** signed release
+auto-updates the cask, so users get new versions with `brew upgrade`.
 
-> The signed DMG is (re)hosted on the **tap repo's** Releases rather than the cask pointing at the
-> source repo's own Releases, and the cask points there. This predates clowder going public/open
-> source (when the source repo's release assets weren't downloadable without auth) and hasn't been
-> revisited since — now that the source repo is public too, pointing the cask directly at its
-> Releases may be simpler; that's a candidate follow-up, not done here.
+> Clowder used to ship from its own tap, `richardcase/homebrew-clowder` (installed as
+> `richardcase/clowder/clowder`). That repo is left as-is — old install links and release history
+> still work — but it no longer receives updates. If you installed from it, switch over:
+> ```sh
+> brew untap richardcase/clowder
+> brew install --cask richardcase/tap/clowder
+> ```
+
+> The cask points at `clowder`'s **own** GitHub Releases for the DMG, not the tap's. It used to
+> re-host the DMG on the tap repo's Releases instead — that predated clowder going public, back when
+> the source repo's release assets weren't downloadable without auth and `brew` (unauthenticated)
+> couldn't fetch them directly. Now that the source repo is public, that workaround is gone: the tap
+> holds only `Casks/clowder.rb`.
 
 ## Install
 
 ```sh
-brew install --cask richardcase/clowder/clowder
+brew install --cask richardcase/tap/clowder
 # or:
-brew tap richardcase/clowder
+brew tap richardcase/tap
 brew install --cask clowder
 ```
 
@@ -26,39 +35,39 @@ notarized, so **no Gatekeeper workaround is needed**.
 
 ## How the auto-bump works
 
-On a **final** `vX.Y.Z` tag, `release.yml` builds + signs + notarizes the DMG, publishes the GitHub
-Release (on the private repo, as the internal record), then runs
+On a **final** `vX.Y.Z` tag, `release.yml` builds + signs + notarizes the DMG, publishes it as a
+GitHub Release on `clowder` itself (the DMG attached as a release asset — this is what `brew`
+downloads from, directly), then runs
 [`scripts/update-homebrew-tap.sh`](../scripts/update-homebrew-tap.sh):
 
 1. computes the DMG's `sha256`,
-2. **uploads the DMG to the public tap repo's Releases** (`gh release`, so `brew` can fetch it unauthenticated),
-3. renders [`scripts/homebrew/clowder.rb.tmpl`](../scripts/homebrew/clowder.rb.tmpl) with the version + sha,
-4. pushes the rendered `Casks/clowder.rb` to the tap repo.
+2. renders [`scripts/homebrew/clowder.rb.tmpl`](../scripts/homebrew/clowder.rb.tmpl) with the version + sha,
+3. pushes the rendered `Casks/clowder.rb` to the tap repo.
 
-Both steps use the same fine-grained PAT (`HOMEBREW_TAP_TOKEN`) over https. Pre-release tags (anything with
-a `-`, e.g. `v0.3.0-rc1`) are published as GitHub **pre-releases** and do **not** touch the cask — so `brew`
-only ever sees final versions. The step is a no-op (with a warning) if the token isn't configured yet, and
-fails the run if a real push fails (so cask drift is visible).
+The fine-grained PAT (`HOMEBREW_TAP_TOKEN`) is used only for that last `git push` over https, to the
+tap. Pre-release tags (anything with a `-`, e.g. `v0.3.0-rc1`) are published as GitHub **pre-releases**
+and do **not** touch the cask — so `brew` only ever sees final versions. The step is a no-op (with a
+warning) if the token isn't configured yet, and fails the run if a real push fails (so cask drift is
+visible).
 
 ## One-time setup
 
-### a. Create the tap repo
+### a. The tap repo
 
-A public repo named `homebrew-<tap>` — here `richardcase/homebrew-clowder` (installed as
-`richardcase/clowder`). The first final release seeds `Casks/clowder.rb`; no manual cask commit needed.
-
-```sh
-gh repo create richardcase/homebrew-clowder --public --add-readme
-```
+A public repo named `homebrew-<tap>` — here `richardcase/homebrew-tap` (installed as
+`richardcase/tap`), shared across richardcase's casks/formulae rather than clowder-specific. It
+already exists; adding a new cask to it is just the first final release seeding `Casks/clowder.rb` —
+no manual cask commit needed, and no repo-creation step for clowder specifically. (A fresh shared
+tap, if one didn't exist yet, would be created the same way as before: `gh repo create
+richardcase/homebrew-tap --public --add-readme`.)
 
 ### b. Create a fine-grained PAT and store it in Doppler
 
-`GITHUB_TOKEN` can't touch another repo, and the release job needs the GitHub **API** (to upload the DMG
-asset), which an SSH deploy key can't do — so use a **fine-grained personal access token** scoped to *only*
-the tap repo:
+`GITHUB_TOKEN` can't touch another repo, so pushing the cask commit to the tap needs its own
+credential — use a **fine-grained personal access token** scoped to *only* the tap repo:
 
 1. GitHub → **Settings → Developer settings → Fine-grained tokens → Generate new token**. Resource owner
-   **richardcase**; **Only select repositories → `homebrew-clowder`**; Repository permissions →
+   **richardcase**; **Only select repositories → `homebrew-tap`**; Repository permissions →
    **Contents: Read and write**. (Metadata read is added automatically.)
 
    > Fine-grained PATs are bound to their **resource owner**, so a token stops working the moment the tap
@@ -70,7 +79,8 @@ the tap repo:
    secrets — see [`code-signing.md`](code-signing.md)).
 
 That's it — GitHub still holds only the `DOPPLER_TOKEN` secret; the tap PAT lives in Doppler. The token
-does both the DMG release-upload and the cask git push.
+does only the cask git push — the DMG itself is published separately, to `clowder`'s own Releases,
+using the workflow's ambient `GITHUB_TOKEN`.
 
 > Fine-grained PATs expire in ≤1 year — set a calendar reminder to rotate it (regenerate → update Doppler).
 > A **missing** token warns + skips the bump; an **expired** one (present but invalid) fails the bump step
@@ -101,7 +111,8 @@ do not wait for the release to tell you.
 `release.yml` now checks `repos/<tap>` for `.permissions.push` **before** it signs or tags anything
 (`Verify the Homebrew tap token can still write`), so a bad grant stops the run while it is still cheap. It
 used to surface at the tap publish, which runs *after* the tag and the GitHub Release — stranding a
-signed, notarized, published release with nothing installable and manual cleanup to do.
+signed, notarized, published release whose cask never gets bumped, needing manual cleanup (the DMG
+itself would still be fine, since it lives on `clowder`'s own Release, not the tap).
 
 ### c. Cut a release
 
@@ -116,6 +127,6 @@ git push && git push origin vX.Y.Z
 
 ```sh
 brew style Casks/clowder.rb            # cask lint (also enforced on every PR in ci.yml)
-brew info --cask richardcase/clowder/clowder
+brew info --cask richardcase/tap/clowder
 brew livecheck --cask clowder          # should report the latest final version
 ```

@@ -26,8 +26,8 @@ that catches one. CI runs it on every pull request.
 
 ## How it stays current
 
-`src/data/release.ts` reads the latest release from the **public Homebrew tap**
-(`richardcase/homebrew-clowder`) at build time and exports the version, the direct `.dmg` URL and
+`src/data/release.ts` reads the latest release directly from **clowder's own GitHub Releases**
+(`richardcase/clowder`) at build time and exports the version, the direct `.dmg` URL and
 its size. A daily `schedule:` trigger in
 [`.github/workflows/deploy-site.yml`](../.github/workflows/deploy-site.yml) — at the repo root, not
 in this directory — rebuilds the site, so a new Clowder release propagates here without anyone
