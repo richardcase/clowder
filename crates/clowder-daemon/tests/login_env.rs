@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! End-to-end tests for the login-environment capture (issue #76).
 //!
 //! Every test drives a **fake shell** written into a tempdir, never the developer's real login

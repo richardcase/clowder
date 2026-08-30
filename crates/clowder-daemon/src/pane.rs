@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::login_env::PaneEnv;
 use anyhow::Result;
 use clowder_proto::PaneId;

@@ -1,11 +1,8 @@
 /**
  * Site-wide constants.
  *
- * IMPORTANT: `github.com/defiantsoftware/clowder` is a PRIVATE repo. Linking to it
- * anywhere on this site gives every visitor a 404. All public-facing links go
- * to the public Homebrew tap instead. There is deliberately no "view source"
- * link, and the build asserts on this (see the private-link audit in the
- * verification steps).
+ * clowder is public and Apache-2.0 licensed. Public-facing install links go to the Homebrew tap;
+ * there is deliberately no separate "view source" link on the marketing site itself.
  */
 
 export const site = {
@@ -23,7 +20,7 @@ export const site = {
   minMacOSName: 'Sonoma',
   /** Verified with `lipo -archs` against the shipped 0.6.0 binaries. */
   arch: 'Apple silicon',
-  copyrightHolder: 'Defiant Software',
+  copyrightHolder: 'Richard Case',
 } as const;
 
 /** Join a public/ asset path onto the configured GitHub Pages base path. */

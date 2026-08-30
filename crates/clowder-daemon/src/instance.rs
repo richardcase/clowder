@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Single-instance guard: an advisory `flock` on a PID file. The OS releases the lock on process
 //! death, so a crashed daemon's lock is reclaimable by the next start.
 

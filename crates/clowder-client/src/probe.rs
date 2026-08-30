@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Reach a daemon, report what it presented, and persist nothing.
 
 use crate::forward::RemoteTarget;

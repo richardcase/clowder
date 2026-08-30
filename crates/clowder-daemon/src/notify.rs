@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use clowder_proto::{AttentionState, PaneId};
 use parking_lot::Mutex;
 

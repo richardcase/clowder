@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Trust-on-first-use verification of the remote daemon's self-signed cert (SSH host-key style).
 
 use std::path::{Path, PathBuf};

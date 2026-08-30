@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 import Foundation
 
 /// A source/sink of newline-delimited JSON control lines. The real Unix-socket

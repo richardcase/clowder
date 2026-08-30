@@ -49,7 +49,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 <dict>
     <key>CFBundleName</key>            <string>Clowder</string>
     <key>CFBundleDisplayName</key>     <string>Clowder</string>
-    <key>CFBundleIdentifier</key>      <string>com.defiantsoftware.clowder</string>
+    <key>CFBundleIdentifier</key>      <string>com.richardcase.clowder</string>
     <key>CFBundleExecutable</key>      <string>clowder-app</string>
     <key>CFBundlePackageType</key>     <string>APPL</string>
     <key>CFBundleShortVersionString</key> <string>$SHORT_VERSION</string>

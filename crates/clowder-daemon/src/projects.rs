@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::store::JsonStore;
 use anyhow::{bail, Context, Result};
 use clowder_workspace::{detect_kind, WorktreeLayout};

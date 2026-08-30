@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 import Foundation
 
 /// A host's nickname — its identity in the registry. Wrapped rather than a bare `String` so a host

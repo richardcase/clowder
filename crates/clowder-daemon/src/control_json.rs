@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::build_adapter;
 use crate::server::Daemon;
 use anyhow::{anyhow, Result};

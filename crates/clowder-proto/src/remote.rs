@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use anyhow::{bail, Result};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 

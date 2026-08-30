@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! `clowder agent …` — manage the daemon's agent profiles.
 //!
 //! `plan` is pure so the argument shapes are tested without a daemon; `run` dials the control

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::{ClientToDaemon, DaemonToClient, PaneId};
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};

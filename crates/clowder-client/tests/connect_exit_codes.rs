@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! `clowder connect` exit codes are a contract with the macOS app's DaemonSupervisor:
 //! 4 = the first dial never landed (stop and show the user), anything else = relaunchable.
 //!

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 import Foundation
 
 /// What the sidebar has selected. A project resolves to its terminal's pane (once open);

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::server::Daemon;
 use anyhow::{anyhow, bail, Result};
 use clowder_proto::Channel;

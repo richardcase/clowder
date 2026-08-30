@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 import Foundation
 
 /// Accumulates bytes and yields complete newline-terminated lines (newline stripped),

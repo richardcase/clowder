@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use anyhow::Result;
 use clowder_daemon::instance::{remove_files, InstanceLock};
 use clowder_daemon::server::Daemon;

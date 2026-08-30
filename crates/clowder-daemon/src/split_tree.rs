@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Pure algebra over a per-agent binary split tree (no daemon state / I/O).
 
 use clowder_proto::{Axis, PaneId, PaneTree, SplitDirection, SplitId};

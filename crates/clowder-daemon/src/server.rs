@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::agent::AgentAdapter;
 use crate::notify::{Notifier, OsNotifier};
 use crate::{Pane, PaneCommand, SpawnSpec};

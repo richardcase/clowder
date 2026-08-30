@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! The environment the daemon hands to every PTY child.
 //!
 //! A GUI-launched `Clowder.app` is started by launchd, whose environment is `PATH=/usr/bin:/bin:

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 import Foundation
 
 /// A running daemon process the supervisor controls. The real implementation (ClowderApp) wraps a
