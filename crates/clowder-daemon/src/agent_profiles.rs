@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::store::JsonStore;
 use anyhow::{bail, Result};
 use clowder_config::agents::{merged_profiles, validate_profile, AgentProfile, EffectiveProfile};

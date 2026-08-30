@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! The `clowder remote …` subcommand tree: manage the host registry, probe a daemon, and record
 //! a pairing decision. Everything here works with NO daemon running — that is the point.
 

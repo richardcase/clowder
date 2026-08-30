@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Agent profiles: named, enable-able wrappers around the daemon's built-in adapters, each
 //! carrying an argument template appended to the adapter's own launch arguments.
 

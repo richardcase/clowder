@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::server::Daemon;
 use anyhow::Result;
 use clowder_proto::{AttentionState, HookEvent, HookKind, MsgStream};

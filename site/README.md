@@ -5,10 +5,10 @@ agent-orchestrator terminal for macOS.
 
 Built with [Astro](https://astro.build) and deployed to GitHub Pages.
 
-This site lives inside the private `clowder` repo under `site/`. It has its own `package.json` and
-CI job and needs no Rust, Swift or libghostty toolchain. The two rules below are enforced by
-`scripts/audit.sh`, which also refuses to publish product source files or private marker strings —
-see `scripts/audit-selftest.sh` for exactly what that means.
+This site lives inside the `clowder` repo (public, Apache-2.0 licensed) under `site/`. It has its
+own `package.json` and CI job and needs no Rust, Swift or libghostty toolchain. The rule below is
+enforced by `scripts/audit.sh`, which also refuses to publish product source files or CI secret
+marker strings — see `scripts/audit-selftest.sh` for exactly what that means.
 
 ## Develop
 
@@ -36,16 +36,14 @@ editing a file.
 If the GitHub API call fails, the build falls back to a pinned version and logs a warning rather
 than failing the deploy.
 
-## Two rules for anyone editing this directory
+## One rule for anyone editing this directory
 
-1. **Never link to `github.com/defiantsoftware/clowder`.** That repository is private — the link
-   404s for every visitor. Public-facing links go to the Homebrew tap instead.
-2. **Never hardcode a `/clowder-site/` path prefix.** The site moved from a GitHub Pages project
-   subpath to the apex domain `getclowder.app`, so it is now served from the root and any surviving
-   base-path prefix 404s. Reference public assets through the `asset()` helper in
-   `src/data/site.ts`, which derives the prefix from Astro's `BASE_URL`.
+**Never hardcode a `/clowder-site/` path prefix.** The site moved from a GitHub Pages project
+subpath to the apex domain `getclowder.app`, so it is now served from the root and any surviving
+base-path prefix 404s. Reference public assets through the `asset()` helper in `src/data/site.ts`,
+which derives the prefix from Astro's `BASE_URL`.
 
-Both are checked by `scripts/audit.sh`, which runs against `dist/` after a build.
+This is checked by `scripts/audit.sh`, which runs against `dist/` after a build.
 
 ## Deploying
 

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Where a worktree goes, and what its branch and jj workspace are called.
 //!
 //! Before issue #65 the destination was `<project>/.clowder/worktrees/<name>`, spelled out inline in

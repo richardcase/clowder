@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Curated matcher: does a rendered line look like a program blocking on interactive input?
 //! Conservative — unknown prompts simply don't match (no false alarm), and bare shell prompts
 //! are deliberately excluded so an idle shell never reads as "needs input".

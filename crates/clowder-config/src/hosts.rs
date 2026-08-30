@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! The remote host registry: a nicknamed list of remote daemons, owned by the CLI (not the daemon)
 //! so it stays readable and writable when nothing is reachable.
 

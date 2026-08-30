@@ -11,8 +11,7 @@
 agents — each isolated in its own git worktree or jj workspace — with attention routing, while a
 native SwiftUI macOS app renders every agent's live terminal via [libghostty](https://ghostty.org).
 
-> This repository is **private**. The status badges above render for collaborators. clowder is
-> proprietary — see [License](#license).
+> clowder is open source under the **Apache License 2.0** — see [License](#license).
 
 ## Features
 
@@ -173,4 +172,4 @@ across a daemon restart.
 
 ## License
 
-Proprietary. © Defiant Software. **All rights reserved.** No open-source license is granted.
+Apache License 2.0. © 2026 Richard Case. See [`LICENSE`](LICENSE).

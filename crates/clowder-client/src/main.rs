@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use anyhow::{anyhow, Result};
 use clowder_client::{
     add_project_via_control, attach, list_projects_via_control, remove_project_via_control,

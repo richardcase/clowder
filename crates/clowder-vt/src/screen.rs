@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Headless visible-screen cell grid driven by the `vte` parser. Chars-only (no SGR); tracks
 //! glyphs + cursor + alternate-screen state — enough to read the bottom-of-screen prompt.
 

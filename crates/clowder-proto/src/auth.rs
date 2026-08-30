@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Small auth primitives shared by the remote daemon (token check) and the client (cert TOFU).
 
 use sha2::{Digest, Sha256};

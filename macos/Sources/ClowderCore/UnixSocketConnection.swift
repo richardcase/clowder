@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 import Foundation
 
 /// A ControlTransport over a POSIX Unix-domain stream socket. The read loop runs on a

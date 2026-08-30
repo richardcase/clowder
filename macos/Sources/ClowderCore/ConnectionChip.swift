@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 import Foundation
 
 /// How urgent the chip looks. Mapped to colours by the view, so the decision stays testable.

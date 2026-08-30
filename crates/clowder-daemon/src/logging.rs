@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Structured logging setup + a testable helper for connection-task error reporting.
 
 use anyhow::Result;

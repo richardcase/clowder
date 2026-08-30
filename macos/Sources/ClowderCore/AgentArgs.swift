@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 import Foundation
 
 /// The Swift half of the agent-argument rules, mirroring `clowder_config::agents`.

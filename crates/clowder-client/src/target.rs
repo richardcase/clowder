@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Turning a user's selector ("studio", "10.0.0.5:7777", or nothing at all) into a dialable target.
 
 use crate::forward::RemoteTarget;

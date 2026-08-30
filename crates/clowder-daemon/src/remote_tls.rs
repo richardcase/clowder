@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Remote TLS credential lifecycle: load-or-generate a self-signed cert + a bearer token in the
 //! daemon state dir. Generation is idempotent; files are 0600.
 

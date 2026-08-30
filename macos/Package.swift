@@ -1,4 +1,6 @@
 // swift-tools-version:6.0
+// SPDX-License-Identifier: Apache-2.0
+
 import PackageDescription
 import Foundation
 

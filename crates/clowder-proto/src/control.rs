@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::{AdapterInfo, AttentionState, PaneId, WorktreeInfo};
 use serde::{Deserialize, Serialize};
 

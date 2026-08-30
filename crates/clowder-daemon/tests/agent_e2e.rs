@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use clowder_daemon::server::Daemon;
 use clowder_daemon::{FakeNotifier, PaneCommand, SpawnSpec, SyntheticAdapter};
 use clowder_proto::{AttentionState, HookEvent, HookKind, MsgStream, PaneId};

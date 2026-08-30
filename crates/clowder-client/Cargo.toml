@@ -2,6 +2,7 @@
 name = "clowder-client"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 clowder-proto = { path = "../clowder-proto" }

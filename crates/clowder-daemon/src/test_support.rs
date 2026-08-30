@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //! Shared helpers for this crate's tests. Compiled only under `cfg(test)`.
 
 use std::process::Command;

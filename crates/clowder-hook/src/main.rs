@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use anyhow::{anyhow, Result};
 use clowder_hook::send_hook;
 use clowder_proto::{HookEvent, HookKind, PaneId};

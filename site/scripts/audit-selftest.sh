@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
 #
-# Tests the tests. audit.sh guards two invariants that are invisible locally,
-# and its dangerous failure mode is not a false alarm but a SILENT PASS — a
+# Tests the tests. audit.sh guards invariants that are invisible locally, and
+# its dangerous failure mode is not a false alarm but a SILENT PASS — a
 # pattern that matches nothing still exits 0 and prints `ok`.
 #
-# That is not hypothetical. Check 1 hardcodes the GitHub org in its pattern; it
+# That is not hypothetical: this file used to also guard against links to the
+# private clowder source repo, hardcoding the GitHub org in its pattern. It
 # reported `ok` while checking nothing at all after the repo moved from
 # richardcase/* to defiantsoftware/*, because the old owner no longer appeared
-# in the built HTML. A green build proved nothing.
+# in the built HTML — a green build proved nothing. That check (and its
+# fixtures below) was removed when clowder went public and Apache-2.0
+# licensed, rather than carried forward checking nothing.
 #
-# So each check is exercised against a fixture that MUST fail, and one that MUST
-# pass. Run via `npm test`.
+# So each remaining check is exercised against a fixture that MUST fail, and
+# one that MUST pass. Run via `npm test`.
 set -euo pipefail
 
 AUDIT="$(cd "$(dirname "$0")" && pwd)/audit.sh"
@@ -64,21 +67,7 @@ check_file() {
 
 echo "audit-selftest: verifying audit.sh actually detects violations"
 
-# --- check 1: private source repo links --------------------------------------
-check fail private-repo-link \
-  '<a href="https://github.com/defiantsoftware/clowder">source</a>'
-check fail private-repo-subpath \
-  '<a href="https://github.com/defiantsoftware/clowder/issues/1">issue</a>'
-
-# The two public repos share a prefix with the private one. If these trip the
-# guard, the pattern lost its trailing boundary class and the build breaks on
-# legitimate links.
-check pass public-tap-link \
-  '<a href="https://github.com/defiantsoftware/homebrew-clowder">tap</a>'
-check pass public-site-link \
-  '<a href="https://github.com/defiantsoftware/clowder-site">site</a>'
-
-# --- check 2: stale base-path prefixes ---------------------------------------
+# --- check 1: stale base-path prefixes ---------------------------------------
 check fail stale-base-src  '<img src="/clowder-site/favicon.svg">'
 check fail stale-base-href '<link href="/clowder-site/style.css">'
 
@@ -90,7 +79,7 @@ check pass root-absolute-asset '<img src="/favicon.svg"><link href="/style.css">
 check pass clean-page \
   '<a href="https://github.com/defiantsoftware/homebrew-clowder">tap</a><img src="/favicon.svg">'
 
-# --- check 3: private-source leakage -----------------------------------------
+# --- check 2: build-secret / source leakage -----------------------------------
 check_file fail leaked-rust    'main.rs'
 check_file fail leaked-swift   'App.swift'
 check_file fail leaked-cargo   'Cargo.toml'
