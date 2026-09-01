@@ -320,7 +320,7 @@ checksum = "fd16c4719339c4530435d38e511904438d07cce7950afa3718a84ac36c10e89e"
 
 [[package]]
 name = "clowder-client"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "clowder-config",
@@ -340,7 +340,7 @@ dependencies = [
 
 [[package]]
 name = "clowder-config"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "libc",
@@ -353,7 +353,7 @@ dependencies = [
 
 [[package]]
 name = "clowder-daemon"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -380,7 +380,7 @@ dependencies = [
 
 [[package]]
 name = "clowder-hook"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "clowder-proto",
@@ -390,7 +390,7 @@ dependencies = [
 
 [[package]]
 name = "clowder-proto"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -406,7 +406,7 @@ dependencies = [
 
 [[package]]
 name = "clowder-vt"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "unicode-width",
  "vte",
@@ -414,7 +414,7 @@ dependencies = [
 
 [[package]]
 name = "clowder-workspace"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "serde",
