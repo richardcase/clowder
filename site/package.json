@@ -11,10 +11,10 @@
     "test": "./scripts/audit-selftest.sh"
   },
   "devDependencies": {
-    "@astrojs/check": "^0.9.10",
-    "@astrojs/sitemap": "^3.7.3",
-    "@types/node": "^26.4.0",
-    "astro": "^7.2.9",
+    "@astrojs/check": "^0.9.12",
+    "@astrojs/sitemap": "^3.7.4",
+    "@types/node": "^26.6.5",
+    "astro": "^7.4.2",
     "typescript": "^6.0.3"
   }
 }
